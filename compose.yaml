@@ -1,0 +1,25 @@
+name: tsuzuri
+
+services:
+  postgres:
+    build:
+      context: ./docker/postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tsuzuri}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tsuzuri}
+      POSTGRES_DB: ${POSTGRES_DB:-tsuzuri}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18+ images keep data in a major-version subdirectory, so the
+      # mount belongs at /var/lib/postgresql rather than .../data.
+      # https://github.com/docker-library/postgres/pull/1259
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tsuzuri} -d ${POSTGRES_DB:-tsuzuri}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres-data:
