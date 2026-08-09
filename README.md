@@ -1,0 +1,142 @@
+# tsuzuri
+
+A self-hosted feed reader built for a CLI and for AI agents, with first-class support for sites that do not publish a feed at all.
+
+> Status: early. Phase 1 (ingest + CLI) works end to end. Search, MCP, AI processing, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
+
+## Why another reader
+
+Most readers treat AI as an add-on and the browser as the only way in. tsuzuri inverts both:
+
+- The CLI and an MCP server are the primary interfaces. The web UI comes second, and there is no mobile app.
+- Summarisation, relevance scoring, tagging and deduplication are meant to be the normal way you read, not a plugin.
+- Sites without RSS are a first-class subscription type, extended by declarative rules you can write and share.
+- Japanese and other non-English content is expected to work properly, not to fall out of an English-first design.
+
+**AI is entirely optional.** With no model configured, tsuzuri is a plain, fast feed reader. Everything AI-related is off until you turn it on, and you can turn on just the parts you want.
+
+## Requirements
+
+- [Bun](https://bun.sh) 1.2+
+- Docker (for PostgreSQL)
+
+PostgreSQL needs two extensions, so the bundled image is not interchangeable with a stock one:
+
+- **PGroonga** — full-text search that segments Japanese and other CJK text. PostgreSQL's built-in `tsvector` tokenizer splits on whitespace, so searching for `機械学習` inside `機械学習の論文` finds nothing.
+- **pgvector** — embedding storage for relevance scoring.
+
+Managed PostgreSQL (RDS, Neon, Supabase) is **not supported**, because PGroonga cannot be installed there.
+
+## Quick start
+
+```bash
+git clone https://github.com/TakashiAihara/tsuzuri
+cd tsuzuri
+bun install
+
+# PostgreSQL with PGroonga + pgvector
+docker compose up -d postgres
+
+# The daemon migrates on boot and starts polling
+DATABASE_URL=postgres://tsuzuri:tsuzuri@localhost:5432/tsuzuri \
+  bun run apps/daemon/src/index.ts
+```
+
+In another shell:
+
+```bash
+alias tsuzuri="bun run apps/cli/src/index.ts"
+
+tsuzuri feed add https://news.ycombinator.com/rss
+tsuzuri feed import subscriptions.opml   # from Inoreader, Feedly, …
+tsuzuri fetch --all
+tsuzuri read
+tsuzuri show <id>
+tsuzuri mark <id>
+tsuzuri doctor                            # what is enabled, what is not
+```
+
+Every command takes `--json` for scripting. Data goes to stdout, logs to stderr.
+
+## Configuration
+
+All settings are environment variables. Only `DATABASE_URL` is required.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DATABASE_URL` | — | PostgreSQL connection string |
+| `HOST` | `127.0.0.1` | Daemon bind address |
+| `PORT` | `8787` | Daemon port |
+| `USER_AGENT` | `tsuzuri/0.1 (+…)` | Sent on every request so site owners can identify the crawler |
+| `FETCH_TIMEOUT_MS` | `20000` | Per-request timeout |
+| `HOST_MIN_INTERVAL_MS` | `1000` | Minimum gap between requests to the same host |
+| `FETCH_CONCURRENCY` | `20` | Feeds fetched at once |
+| `DEFAULT_FETCH_INTERVAL_SECONDS` | `3600` | Polling interval for new subscriptions |
+| `DEGRADE_AFTER_FAILURES` | `5` | Consecutive failures before a source is marked degraded |
+
+The CLI reads `TSUZURI_ENDPOINT` (default `http://127.0.0.1:8787`), so it works against a daemon on another machine.
+
+## How it is put together
+
+```text
+CLI ─┐
+Web ─┼─ HTTP/JSON ─→ daemon ─┬─ ingest  ─→ source layer (feed / rule / plugin / external)
+MCP ─┘                       └─ enrich  ─→ LLM + embedding providers (optional)
+                                   │
+                             PostgreSQL + pgvector + PGroonga
+```
+
+Two decisions shape everything else:
+
+**The daemon is the only writer.** Every interface talks to the same JSON API, so no one of them can grow behaviour the others lack.
+
+**Ingest and enrichment are separate.** Fetching is responsible only for storing articles reliably. Summaries and scores are recomputed asynchronously, which is why an LLM outage cannot cost you articles, why prompt changes can be replayed over history, and why the reader works with no AI configured at all.
+
+Some details that exist because feeds are a hostile input:
+
+- Item identity is the SHA-256 of a canonicalised URL, not the feed's `<guid>`. Plenty of feeds mutate their own guid on every fetch, which would make every poll look like a batch of new articles.
+- Conditional GET is backed by a body hash, because many servers ignore `If-None-Match` and CDNs rewrite ETags.
+- Encoding is taken from the document's own declaration before the `Content-Type` header, because servers routinely send `text/xml` with no charset while the document declares Shift_JIS.
+- Dates parse from RFC 822, RFC 3339, Japanese notation and relative phrases, then reject anything more than 24 hours in the future or before 2000 — publisher clock drift otherwise pins an item to the top of the timeline forever.
+
+## Crawling policy
+
+tsuzuri fetches on behalf of one person, but it is software other people run, so the defaults are conservative:
+
+- A descriptive `User-Agent` with a link back to the project.
+- Per-host rate limiting on by default.
+- No bot-detection evasion: no TLS fingerprint spoofing, no stealth plugins, no CAPTCHA solving. If a site does not want to be read this way, that is an answer.
+- No republishing. tsuzuri is a personal reader and will not gain a feature that serves fetched full text to the public.
+
+`robots.txt` handling arrives with the scraping layer in P5, where it becomes relevant.
+
+## Roadmap
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| P1 | Ingest (RSS/Atom/JSON Feed), storage, CLI, OPML import | done |
+| P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | next |
+| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | |
+| P4 | Web UI (React + TanStack + shadcn/ui), packaging | |
+| P5 | Source plugins: declarative YAML rules (CSS/XPath), TypeScript plugins, external generators | |
+| P6 | Headless rendering, LLM-based extraction and rule repair | |
+
+Not planned: a mobile app (the web UI can become a PWA), multi-user accounts, hosting for other people, bot-detection evasion.
+
+## Development
+
+```bash
+bun test                    # unit tests; database tests skip without a DB
+bun run typecheck
+bun run lint
+
+# with the database tests
+docker compose up -d postgres
+TSUZURI_TEST_DATABASE_URL=postgres://tsuzuri:tsuzuri@localhost:5432/tsuzuri bun test
+```
+
+Migrations are hand-written SQL in `packages/db/migrations`, and `packages/db/src/schema.ts` is a Drizzle mirror of them. `schema.test.ts` runs the SQL and then queries every table through the mirror, so the two cannot drift apart silently.
+
+## License
+
+MIT

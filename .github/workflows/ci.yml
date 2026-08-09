@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run typecheck
+
+      # PostgreSQL is started by hand rather than as a `services:` container
+      # because the image needs building: no published image carries both
+      # PGroonga and pgvector.
+      - name: Build the PostgreSQL image
+        run: docker build -t tsuzuri-postgres ./docker/postgres
+
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name tsuzuri-postgres \
+            -e POSTGRES_USER=tsuzuri \
+            -e POSTGRES_PASSWORD=tsuzuri \
+            -e POSTGRES_DB=tsuzuri \
+            -p 5432:5432 \
+            tsuzuri-postgres
+          for i in $(seq 1 60); do
+            if docker exec tsuzuri-postgres pg_isready -U tsuzuri -d tsuzuri >/dev/null 2>&1; then
+              echo "ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready"; docker logs tsuzuri-postgres; exit 1
+
+      - name: Test
+        env:
+          TSUZURI_TEST_DATABASE_URL: postgres://tsuzuri:tsuzuri@localhost:5432/tsuzuri
+        run: bun test
+
+      - name: PostgreSQL logs on failure
+        if: failure()
+        run: docker logs tsuzuri-postgres
