@@ -122,14 +122,26 @@ export async function runEmbedPass(options: EmbedWorkerOptions): Promise<EmbedPa
   // carried on in the background. The caller treats a thrown pass as finished
   // and starts another, so the same items would be embedded twice and the
   // requests doubled against whatever had just failed. Wait for every batch to
-  // settle, and drop the ones that have not started yet.
+  // settle instead.
+  //
+  // Batches that have not started when a failure lands return immediately
+  // rather than being removed with queue.clear(): clear() discards pending
+  // tasks without settling the promises add() handed out, which would leave
+  // allSettled waiting forever.
+  //
+  // That is currently unreachable -- a pass claims batchSize * concurrency
+  // items, so there are never more batches than slots and nothing ever waits
+  // in the queue -- but the trap is one line away from being real if that
+  // sizing changes, and the flag costs nothing.
   const results = await Promise.allSettled(
     batches.map((batch) =>
-      Promise.resolve(queue.add(() => embedBatch(batch, options))).catch((error: unknown) => {
-        if (firstError === undefined) {
-          firstError = error;
-          queue.clear();
-        }
+      Promise.resolve(
+        queue.add(async () => {
+          if (firstError !== undefined) return { embedded: 0, failed: 0 };
+          return embedBatch(batch, options);
+        }),
+      ).catch((error: unknown) => {
+        firstError ??= error;
         throw error;
       }),
     ),
