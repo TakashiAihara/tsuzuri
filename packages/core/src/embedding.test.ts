@@ -182,6 +182,34 @@ describe("createEmbeddingProvider", () => {
     await expect(provider().embed(["a", "b"])).rejects.toThrow(/inconsistent vector lengths/);
   });
 
+  test("asserts a requested dimension against what came back", async () => {
+    // A server is free to ignore the dimensions parameter, and a model that
+    // does not support it answers at its native width without complaint. That
+    // width would otherwise become the column definition.
+    respondWith([[1, 2, 3, 4, 5, 6, 7, 8]]);
+    await expect(provider({ dimensions: 4 }).embed(["a"])).rejects.toThrow(
+      /does not honour the dimensions parameter/,
+    );
+  });
+
+  test("accepts a requested dimension the model honours", async () => {
+    respondWith([[1, 2, 3, 4]]);
+    expect(await provider({ dimensions: 4 }).embed(["a"])).toEqual([[1, 2, 3, 4]]);
+  });
+
+  test("gives up on a server that accepts the connection and never answers", async () => {
+    // fetch() has no timeout of its own, so without a deadline the backfill and
+    // the daemon's shutdown would both wait forever on a wedged local runtime.
+    handler = () => new Promise<Response>(() => {});
+    const slow = createEmbeddingProvider({
+      provider: "openai-compatible",
+      baseUrl,
+      model: "m",
+      requestTimeoutMs: 100,
+    });
+    await expect(slow?.embed(["a"])).rejects.toMatchObject({ retryable: true });
+  });
+
   test("reports an unreachable endpoint as retryable", async () => {
     const unreachable = createEmbeddingProvider({
       provider: "openai-compatible",

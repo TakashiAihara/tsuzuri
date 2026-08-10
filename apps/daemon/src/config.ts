@@ -56,12 +56,37 @@ const configSchema = z.object({
   EMBEDDING_CONCURRENCY: z.coerce.number().int().positive().max(32).default(2),
   /** Characters of an article sent for embedding. See embeddingInput(). */
   EMBEDDING_MAX_INPUT_CHARS: z.coerce.number().int().positive().default(8_000),
+  /** Per-request deadline for the embedding endpoint. */
+  EMBEDDING_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+});
+
+/**
+ * A provider without a model or a base URL is a configuration error, not a
+ * disabled feature.
+ *
+ * The daemon tolerates embeddings failing to start so that a broken optional
+ * feature cannot stop the reader. That tolerance would otherwise turn a typo
+ * into silence: someone sets EMBEDDING_PROVIDER, embeddings never run, and
+ * nothing says why. Catching it in the schema makes it a startup error with
+ * the missing variable named.
+ */
+const configSchemaWithEmbeddingRules = configSchema.superRefine((config, ctx) => {
+  if (config.EMBEDDING_PROVIDER === "none") return;
+  for (const key of ["EMBEDDING_BASE_URL", "EMBEDDING_MODEL"] as const) {
+    if (!config[key]) {
+      ctx.addIssue({
+        code: "custom",
+        path: [key],
+        message: `required when EMBEDDING_PROVIDER is "${config.EMBEDDING_PROVIDER}"`,
+      });
+    }
+  }
 });
 
 export type Config = z.infer<typeof configSchema>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const parsed = configSchema.safeParse(env);
+  const parsed = configSchemaWithEmbeddingRules.safeParse(env);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)

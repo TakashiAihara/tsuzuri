@@ -14,6 +14,15 @@ import type postgres from "postgres";
  * plain number is the difference between a schema and an injection point.
  */
 
+/**
+ * Either a pool handle or a transaction handle.
+ *
+ * The helpers below are called both directly and from inside
+ * rebuildItemEmbeddings' transaction, and postgres.js gives those two different
+ * types.
+ */
+type SqlLike = postgres.Sql | postgres.TransactionSql;
+
 const TABLE = "item_embeddings";
 const INDEX = "item_embeddings_hnsw";
 
@@ -94,7 +103,7 @@ export async function writeEmbeddingModel(
  * returns normalised vectors is not something this code can know, and cosine is
  * the operator that does not care.
  */
-export async function createEmbeddingTable(sql: postgres.Sql, dimensions: number): Promise<void> {
+export async function createEmbeddingTable(sql: SqlLike, dimensions: number): Promise<void> {
   const n = assertDimension(dimensions);
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS ${TABLE} (
@@ -111,7 +120,7 @@ export async function ensureItemEmbeddings(sql: postgres.Sql, dimensions: number
 }
 
 /** Whether the vector table exists yet. */
-export async function itemEmbeddingsExists(sql: postgres.Sql): Promise<boolean> {
+export async function itemEmbeddingsExists(sql: SqlLike): Promise<boolean> {
   const rows = await sql<{ exists: boolean }[]>`
     SELECT to_regclass(${TABLE}) IS NOT NULL AS exists
   `;
@@ -119,7 +128,7 @@ export async function itemEmbeddingsExists(sql: postgres.Sql): Promise<boolean> 
 }
 
 /** The dimension the table is actually built at, or null when it does not exist. */
-export async function itemEmbeddingsDimension(sql: postgres.Sql): Promise<number | null> {
+export async function itemEmbeddingsDimension(sql: SqlLike): Promise<number | null> {
   const rows = await sql<{ dimension: number | null }[]>`
     SELECT atttypmod AS dimension
     FROM pg_attribute
@@ -140,37 +149,46 @@ export async function itemEmbeddingsDimension(sql: postgres.Sql): Promise<number
  * the reader has ever stored, so the caller creates it again once the backfill
  * finishes -- see ensureItemEmbeddings().
  *
+ * All of it in one transaction. PostgreSQL is happy to roll DDL back, and the
+ * intermediate states are ones nothing should ever observe: an index dropped
+ * but the column not yet widened, or rows discarded while the recorded model
+ * still claims the old dimension.
+ *
  * Idempotent, so an interrupted rebuild is resumable: the table is already
  * empty and already at the target dimension, and running this again is a no-op
  * that leaves the backfill to continue.
  */
 export async function rebuildItemEmbeddings(sql: postgres.Sql, dimensions: number): Promise<void> {
   const n = assertDimension(dimensions);
-  await sql.unsafe(`DROP INDEX IF EXISTS ${INDEX}`);
 
-  if (await itemEmbeddingsExists(sql)) {
-    // TRUNCATE before ALTER: altering the dimension of a populated column fails
-    // ("expected N dimensions, not M"), and every row is being discarded anyway.
-    await sql.unsafe(`TRUNCATE ${TABLE}`);
-    await sql.unsafe(`ALTER TABLE ${TABLE} ALTER COLUMN embedding TYPE vector(${n})`);
-  } else {
-    await createEmbeddingTable(sql, n);
-  }
+  await sql.begin(async (tx) => {
+    await tx.unsafe(`DROP INDEX IF EXISTS ${INDEX}`);
 
-  // Past failures belong to the model being discarded. Carrying their retry
-  // schedule forward would hold items back from a model that might embed them
-  // without complaint.
-  await sql`TRUNCATE embedding_failures`;
+    if (await itemEmbeddingsExists(tx)) {
+      // TRUNCATE before ALTER: altering the dimension of a populated column
+      // fails ("expected N dimensions, not M"), and every row is being
+      // discarded anyway.
+      await tx.unsafe(`TRUNCATE ${TABLE}`);
+      await tx.unsafe(`ALTER TABLE ${TABLE} ALTER COLUMN embedding TYPE vector(${n})`);
+    } else {
+      await createEmbeddingTable(tx, n);
+    }
+
+    // Past failures belong to the model being discarded. Carrying their retry
+    // schedule forward would hold items back from a model that might embed
+    // them without complaint.
+    await tx`TRUNCATE embedding_failures`;
+  });
 }
 
 /** Build the HNSW index if the rebuild left it off. */
-export async function createEmbeddingIndex(sql: postgres.Sql): Promise<void> {
+export async function createEmbeddingIndex(sql: SqlLike): Promise<void> {
   await sql.unsafe(`
     CREATE INDEX IF NOT EXISTS ${INDEX} ON ${TABLE} USING hnsw (embedding vector_cosine_ops)
   `);
 }
 
-export async function embeddingIndexExists(sql: postgres.Sql): Promise<boolean> {
+export async function embeddingIndexExists(sql: SqlLike): Promise<boolean> {
   const rows = await sql<{ exists: boolean }[]>`
     SELECT to_regclass(${INDEX}) IS NOT NULL AS exists
   `;

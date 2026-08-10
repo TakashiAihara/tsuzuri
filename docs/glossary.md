@@ -64,7 +64,7 @@ These are the ones to be careful with. Each pair is two genuinely different thin
 - active model is the one embedding model an instance is using. There is exactly one, recorded in `embedding_model`. Vectors from two models must never share a column, even when their dimensions happen to match, because the spaces are unrelated and distances between them are meaningless.
 - backfill is embedding items that have no vector yet. It is incremental, resumable, and destroys nothing. An item needs backfilling exactly when it has no row in `item_embeddings`, so newly ingested items are picked up without any queue.
 - reindex is switching the active model: drop the index, clear the vectors, change the dimension, backfill, rebuild. It destroys every existing vector by definition. `tsuzuri reindex --embedding-model <name>`.
-- The distinction matters because `tsuzuri reindex` with no flag backfills and `tsuzuri reindex --embedding-model` rebuilds. One is safe to run at any time and the other is not.
+- The distinction matters at the command line. The daemon backfills on its own, continuously, so `tsuzuri reindex` with no flag only reports how far along it is; `tsuzuri reindex --embedding-model` rebuilds. One is safe to run at any time and the other destroys every vector.
 
 ## Search
 

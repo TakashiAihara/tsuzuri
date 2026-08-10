@@ -1,4 +1,9 @@
-import { type EmbeddingProvider, embeddingInput, toVectorLiteral } from "@tsuzuri/core";
+import {
+  EmbeddingError,
+  type EmbeddingProvider,
+  embeddingInput,
+  toVectorLiteral,
+} from "@tsuzuri/core";
 import {
   insertEmbeddings,
   type PendingItem,
@@ -67,6 +72,13 @@ async function embedBatch(
     );
     return { embedded: batch.length, failed: 0 };
   } catch (error) {
+    // A retryable failure describes the endpoint, not the articles. Splitting
+    // the batch would fire up to batchSize more requests at a provider that is
+    // already down, and would then blame every item for it by writing a failure
+    // row and backing each one off. Letting it propagate leaves them pending,
+    // so they are picked up unchanged once the provider returns.
+    if (error instanceof EmbeddingError && error.retryable) throw error;
+
     if (batch.length === 1) {
       const item = batch[0] as PendingItem;
       await recordEmbeddingFailure(
@@ -136,6 +148,26 @@ export type EmbedWorker = {
  */
 export function startEmbedWorker(options: EmbedWorkerOptions): EmbedWorker {
   let stopping = false;
+  let wake: (() => void) | null = null;
+
+  /**
+   * Sleep that stop() can cut short.
+   *
+   * A plain Bun.sleep would make shutdown wait out the idle interval, because
+   * stop() only sets a flag and the loop is not looking at it. Everything that
+   * awaits the worker -- the daemon's signal handler, the start of a reindex --
+   * would block for up to that long with nothing happening.
+   */
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(finish, ms);
+      function finish() {
+        clearTimeout(timer);
+        wake = null;
+        resolve();
+      }
+      wake = finish;
+    });
 
   const done = (async () => {
     while (!stopping) {
@@ -148,13 +180,15 @@ export function startEmbedWorker(options: EmbedWorkerOptions): EmbedWorker {
         // keeps working and embeddings catch up when it comes back.
         console.error("embedding pass failed:", error);
       }
-      await Bun.sleep(idle ? IDLE_INTERVAL_MS : BUSY_INTERVAL_MS);
+      if (stopping) break;
+      await sleep(idle ? IDLE_INTERVAL_MS : BUSY_INTERVAL_MS);
     }
   })();
 
   return {
     stop: () => {
       stopping = true;
+      wake?.();
     },
     done,
   };
