@@ -157,7 +157,25 @@ export function createEmbeddingProvider(config: EmbeddingProviderConfig): Embedd
         );
       }
 
-      const parsed = embeddingResponseSchema.safeParse(await response.json().catch(() => null));
+      // The deadline also aborts the response body, so a provider that sends
+      // headers and then stalls fails here. Swallowing that would report it as
+      // a malformed response -- permanent, and therefore blamed on the article
+      // rather than on the endpoint that was merely slow.
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "";
+        const aborted = name === "AbortError" || name === "TimeoutError";
+        throw new EmbeddingError(
+          `embedding response body could not be read: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          aborted,
+        );
+      }
+
+      const parsed = embeddingResponseSchema.safeParse(payload);
       if (!parsed.success) {
         throw new EmbeddingError("embedding response was not in the expected shape", false);
       }

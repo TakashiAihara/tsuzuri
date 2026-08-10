@@ -104,7 +104,9 @@ One implementation ships: `openai-compatible`, posting to `{baseUrl}/embeddings`
 
 The dimension is probed, not configured: embed one short string at first enablement and take the length of the result. A configured dimension that disagrees with the model is a mismatch nobody notices until search quality is quietly wrong, and the probe costs one request, once.
 
-`EMBEDDING_DIMENSIONS` remains available because some models accept a `dimensions` request parameter and genuinely produce shorter vectors on request. When set, it is sent with the request and then asserted against what came back.
+`EMBEDDING_DIMENSIONS` remains available because some models accept a `dimensions` request parameter and genuinely produce shorter vectors on request. When set, it is sent with the request and then asserted against what came back, since a server is free to ignore it and answer at its native width.
+
+The probed width must be at most 2,000, which is pgvector's ceiling for an HNSW index over the `vector` type. Past that the table would be created and the index would not, leaving no recorded model and a state the next boot would try to reach again. Refusing at that point names the limit and points at `EMBEDDING_DIMENSIONS`.
 
 ### Schema
 
@@ -178,7 +180,7 @@ Newest first, so a fresh install becomes useful for current articles immediately
 
 Embedded text is `title` and `search_text` joined, truncated to `EMBEDDING_MAX_INPUT_CHARS`. Truncation is by characters, which only approximates the model's token limit; the default is set low enough that the approximation is safe for CJK, where characters-per-token is worst.
 
-Failures record a row with exponential backoff. A batch failure retries individually so one bad item does not condemn thirty-one good ones.
+Failures record a row with exponential backoff. A batch rejected permanently by the provider is retried one item at a time, so one bad item does not condemn thirty-one good ones. A retryable outage is not split: it says nothing about the articles, and splitting would multiply requests against something already down. Neither is an abort or a database error, which describe the run rather than the corpus.
 
 ### Reindex
 
@@ -337,7 +339,7 @@ Search, retrieval, listing, state updates and `add_source` all work with no prov
 
 ### Testing
 
-Existing suite is 74 passing, skipping database tests when `TSUZURI_TEST_DATABASE_URL` is unset. That split is preserved.
+The suite stood at 74 passing when this document was written, skipping database tests when `TSUZURI_TEST_DATABASE_URL` is unset. That split is preserved; the count is not kept current here.
 
 - Pure unit: RRF fusion, term extraction and escaping, duration parsing for `since`, the mismatch guard as a decision function, backoff arithmetic.
 - Provider: the OpenAI-compatible client against a stub HTTP server started in-process. Covers batch ordering, the `dimensions` parameter, a dimension that disagrees with the probe, HTTP errors, and a malformed response. No network.
