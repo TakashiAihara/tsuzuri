@@ -161,6 +161,16 @@ describeIfDb("hybridSearch", () => {
       expect((await search({ terms: [] })).hits).toEqual([]);
     });
 
+    test("publishedAt is ISO 8601, matching every other endpoint", async () => {
+      // Drizzle replaces the client's type parsers, so raw queries on the same
+      // client get PostgreSQL's text format instead. Two shapes for one field
+      // across two endpoints is a trap for anything consuming the API.
+      const { hits } = await search({ terms: ["Rust"] });
+      const publishedAt = hits[0]?.publishedAt as string;
+      expect(publishedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(Number.isNaN(new Date(publishedAt).getTime())).toBe(false);
+    });
+
     test("returns a highlighted snippet for text matches", async () => {
       const { hits } = await search({ terms: ["Rust"] });
       const hit = hits.find((h) => h.id === "short-rust");
