@@ -76,6 +76,8 @@ export function createEmbeddingService(deps: {
   let worker: EmbedWorker | null = null;
   let reindexing = false;
   let lastReindexError: string | null = null;
+  /** In-flight rebuild, so stop() can wait for it instead of racing it. */
+  let running: Promise<void> | null = null;
   /** Set once stop() has been called, so nothing starts the worker again. */
   let stopped = false;
 
@@ -139,6 +141,10 @@ export function createEmbeddingService(deps: {
       // Before stopWorker(), so that a reindex finishing concurrently cannot
       // start a fresh worker from its finally block and outlive shutdown.
       stopped = true;
+      // A rebuild checks this flag between passes, so awaiting it here is
+      // bounded by one pass. Without the wait, shutdown closes the connection
+      // pool underneath a backfill that is still writing.
+      await running?.catch(() => {});
       await stopWorker();
     },
 
@@ -185,6 +191,10 @@ export function createEmbeddingService(deps: {
 
       reindexing = true;
       lastReindexError = null;
+      let settle: (() => void) | undefined;
+      running = new Promise<void>((resolve) => {
+        settle = resolve;
+      });
       try {
         await stopWorker();
 
@@ -204,6 +214,10 @@ export function createEmbeddingService(deps: {
 
         // Backfill with the index off, then build it once over the full table.
         for (;;) {
+          // Checked between passes so shutdown does not have to wait out a
+          // full re-embed. What is left stays pending and the next start
+          // picks it up; the rebuild is resumable by design.
+          if (stopped) throw new Error("reindex stopped before it finished");
           const pass = await runEmbedPass(workerOptions(provider));
           if (pass.idle) break;
         }
@@ -213,6 +227,8 @@ export function createEmbeddingService(deps: {
         throw error;
       } finally {
         reindexing = false;
+        settle?.();
+        running = null;
         startWorker();
       }
     },

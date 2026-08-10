@@ -31,7 +31,11 @@ describeIfDb("runEmbedPass", () => {
       calls,
       async embed(texts) {
         calls.push(texts);
-        if (options.failFor?.(texts)) throw new Error("provider refused this batch");
+        // Permanent and provider-side, which is the only shape of failure that
+        // is evidence about the articles themselves.
+        if (options.failFor?.(texts)) {
+          throw new EmbeddingError("provider refused this batch", false);
+        }
         return texts.map((_, i) => Array.from({ length: width }, (_, j) => (i + j) / 10));
       },
     };
@@ -190,6 +194,72 @@ describeIfDb("runEmbedPass", () => {
     expect(failures[0]?.n).toBe(0);
   });
 
+  test("a shutdown does not get recorded as the articles' fault", async () => {
+    // An abort arrives as a DOMException, not an EmbeddingError. Treating
+    // anything non-retryable as article-specific would write a failure row and
+    // a backoff for every item in flight, so each restart would park recent
+    // articles for a minute apiece.
+    await seed(3);
+    const aborting: EmbeddingProvider = {
+      id: "openai-compatible",
+      model: "fake",
+      async embed() {
+        throw new DOMException("The operation was aborted.", "AbortError");
+      },
+    };
+    await expect(runEmbedPass(options(aborting, { batchSize: 3, concurrency: 1 }))).rejects.toThrow(
+      /aborted/,
+    );
+
+    const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
+    expect(failures[0]?.n).toBe(0);
+    expect(await pendingEmbeddingItems(handle.sql, 10)).toHaveLength(3);
+  });
+
+  test("a database failure is not the articles' fault either", async () => {
+    // insertEmbeddings throwing means storage is unhappy, not that the corpus
+    // is full of unembeddable text.
+    await seed(2);
+    await handle.sql.unsafe("DROP TABLE item_embeddings");
+    await expect(
+      runEmbedPass(options(fakeProvider({}), { batchSize: 2, concurrency: 1 })),
+    ).rejects.toThrow();
+    const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
+    expect(failures[0]?.n).toBe(0);
+    await ensureItemEmbeddings(handle.sql, 4);
+  });
+
+  test("a failing pass waits for its other batches instead of leaving them running", async () => {
+    // Promise.all returned at the first rejection while the rest carried on.
+    // The caller treats a thrown pass as finished and starts another, so the
+    // same items were embedded twice and the requests doubled.
+    await seed(3);
+    let inFlight = 0;
+    const flaky: EmbeddingProvider = {
+      id: "openai-compatible",
+      model: "fake",
+      async embed(texts) {
+        inFlight += 1;
+        try {
+          await Bun.sleep(30);
+          if (texts.some((t) => t.includes("title 2"))) {
+            throw new EmbeddingError("provider is down", true);
+          }
+          return texts.map(() => [0, 0, 0, 1]);
+        } finally {
+          inFlight -= 1;
+        }
+      },
+    };
+
+    await expect(runEmbedPass(options(flaky, { batchSize: 1, concurrency: 3 }))).rejects.toThrow(
+      /provider is down/,
+    );
+
+    // Every batch has settled by the time the pass throws.
+    expect(inFlight).toBe(0);
+  });
+
   test("a permanent failure still falls back to per-item attribution", async () => {
     await seed(2);
     const rejecting: EmbeddingProvider = {
@@ -224,9 +294,12 @@ describeIfDb("runEmbedPass", () => {
     expect(rows[0]?.dims).toBe(4);
   });
 
-  test("a provider whose width disagrees with the column fails the item rather than the pass", async () => {
+  test("a provider whose width disagrees with the column fails the pass, not the article", async () => {
+    // The same mismatch would hit every article, so backing each one off in
+    // turn would be both wrong and slow. It is a configuration problem.
     await seed(1);
-    const result = await runEmbedPass(options(fakeProvider({ width: 8 })));
-    expect(result).toMatchObject({ embedded: 0, failed: 1 });
+    await expect(runEmbedPass(options(fakeProvider({ width: 8 })))).rejects.toThrow();
+    const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
+    expect(failures[0]?.n).toBe(0);
   });
 });

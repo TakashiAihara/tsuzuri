@@ -59,9 +59,30 @@ function instant(at: Date): string {
   return at.toISOString();
 }
 
+/**
+ * Widest vector pgvector will build an HNSW index over.
+ *
+ * The `vector` type stores up to 16,000 dimensions but indexes at most 2,000;
+ * past that, CREATE INDEX fails with "column cannot have more than 2000
+ * dimensions for hnsw index". The table would be created and the index would
+ * not, which is a state worth refusing rather than reaching.
+ *
+ * This is not hypothetical: OpenAI's text-embedding-3-large is 3,072
+ * dimensions natively.
+ */
+export const HNSW_MAX_DIMENSIONS = 2_000;
+
 function assertDimension(dimensions: number): number {
-  if (!Number.isInteger(dimensions) || dimensions <= 0 || dimensions > 16_000) {
+  if (!Number.isInteger(dimensions) || dimensions <= 0) {
     throw new Error(`refusing to build a vector column with dimension ${dimensions}`);
+  }
+  if (dimensions > HNSW_MAX_DIMENSIONS) {
+    throw new Error(
+      `this model produces ${dimensions}-dimensional vectors, but pgvector indexes at most ` +
+        `${HNSW_MAX_DIMENSIONS}. Choose a model with fewer dimensions, or set ` +
+        "EMBEDDING_DIMENSIONS if the model supports shortening its output " +
+        "(OpenAI's text-embedding-3 family does).",
+    );
   }
   return dimensions;
 }

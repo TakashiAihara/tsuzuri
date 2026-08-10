@@ -83,15 +83,17 @@ Off by default, and there is no default model: choosing one commits the database
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `EMBEDDING_PROVIDER` | `none` | `none`, or `openai-compatible` |
-| `EMBEDDING_BASE_URL` | — | e.g. `http://localhost:11434/v1` for Ollama |
+| `EMBEDDING_BASE_URL` | — | Required once a provider is set. e.g. `http://localhost:11434/v1` for Ollama |
 | `EMBEDDING_API_KEY` | — | Optional; local runtimes usually need none |
 | `EMBEDDING_MODEL` | — | Required once a provider is set |
-| `EMBEDDING_DIMENSIONS` | — | Only for models that accept a `dimensions` parameter |
+| `EMBEDDING_DIMENSIONS` | — | Only for models that accept a `dimensions` parameter. Checked against what the model returns |
 | `EMBEDDING_BATCH_SIZE` | `32` | Texts per request |
 | `EMBEDDING_CONCURRENCY` | `2` | Concurrent requests |
 | `EMBEDDING_MAX_INPUT_CHARS` | `8000` | Article text sent per embedding |
 
 `openai-compatible` covers Ollama, LM Studio, vLLM, OpenRouter and OpenAI itself. Pick a multilingual model if you read anything other than English.
+
+The model must produce at most 2,000 dimensions, which is pgvector's ceiling for an HNSW index. Wider models are refused at startup with that explanation rather than failing later at index creation — OpenAI's `text-embedding-3-large` is 3,072 natively, and needs `EMBEDDING_DIMENSIONS` set to something within the limit.
 
 ```bash
 EMBEDDING_PROVIDER=openai-compatible \

@@ -6,6 +6,7 @@ import {
   embeddingCounts,
   embeddingIndexExists,
   ensureItemEmbeddings,
+  HNSW_MAX_DIMENSIONS,
   insertEmbeddings,
   itemEmbeddingsDimension,
   itemEmbeddingsExists,
@@ -107,7 +108,22 @@ describeIfDb("embeddings", () => {
     // be trusted from a caller.
     await expect(ensureItemEmbeddings(handle.sql, 0)).rejects.toThrow(/refusing/);
     await expect(ensureItemEmbeddings(handle.sql, 1.5)).rejects.toThrow(/refusing/);
-    await expect(ensureItemEmbeddings(handle.sql, 99_999)).rejects.toThrow(/refusing/);
+    await expect(ensureItemEmbeddings(handle.sql, -1)).rejects.toThrow(/refusing/);
+  });
+
+  test("refuses a model too wide for pgvector to index, before creating anything", async () => {
+    // text-embedding-3-large is 3072 dimensions natively. The table would be
+    // created and CREATE INDEX would then fail with "column cannot have more
+    // than 2000 dimensions for hnsw index", leaving an unindexed table and no
+    // recorded model -- a state the next boot would try to reach again.
+    await expect(ensureItemEmbeddings(handle.sql, 3072)).rejects.toThrow(/at most 2000/);
+    await expect(ensureItemEmbeddings(handle.sql, 3072)).rejects.toThrow(/EMBEDDING_DIMENSIONS/);
+    expect(await itemEmbeddingsExists(handle.sql)).toBe(false);
+  });
+
+  test("accepts the widest dimension pgvector will index", async () => {
+    await ensureItemEmbeddings(handle.sql, HNSW_MAX_DIMENSIONS);
+    expect(await embeddingIndexExists(handle.sql)).toBe(true);
   });
 
   test("stores vectors and finds the nearest by cosine distance", async () => {
@@ -264,9 +280,16 @@ describeIfDb("embeddings", () => {
       await ensureItemEmbeddings(handle.sql, 4);
       await insertEmbeddings(handle.sql, [{ itemId: "a", vector: "[1,0,0,0]" }]);
 
-      // 99_999 passes assertDimension's shape check but pgvector refuses it, so
-      // the failure lands mid-transaction rather than before it starts.
-      await expect(rebuildItemEmbeddings(handle.sql, 20_000)).rejects.toThrow();
+      // The failure has to land *inside* the transaction, after DROP INDEX and
+      // during TRUNCATE, or this tests nothing: a rejected dimension fails in
+      // assertDimension before the transaction opens. A foreign key pointing at
+      // the table makes TRUNCATE fail, which is exactly the shape of an
+      // interruption partway through.
+      await handle.sql.unsafe(
+        "CREATE TABLE fk_probe (item_id text REFERENCES item_embeddings (item_id))",
+      );
+      await expect(rebuildItemEmbeddings(handle.sql, 8)).rejects.toThrow();
+      await handle.sql.unsafe("DROP TABLE fk_probe");
 
       expect(await itemEmbeddingsDimension(handle.sql)).toBe(4);
       expect(await embeddingCounts(handle.sql)).toMatchObject({ embedded: 1 });

@@ -20,7 +20,7 @@ These are the ones to be careful with. Each pair is two genuinely different thin
 
 ### model
 
-- embedding model turns text into a vector. Its identity fixes the vector dimension, so it is recorded in `embedding_model` and can only be changed by re-embedding everything.
+- embedding model turns text into a vector. Together with any requested output width (`EMBEDDING_DIMENSIONS`), its identity fixes the vector dimension, so both are recorded in `embedding_model` and changing either means re-embedding everything.
 - chat model produces text: summaries, translations, tags. It can be changed freely, because nothing on disk is shaped by it. Phase P3.
 - "model" alone is ambiguous and should not appear in code or docs. Configuration says so too: `EMBEDDING_MODEL`, and later `CHAT_MODEL`.
 
@@ -60,7 +60,7 @@ These are the ones to be careful with. Each pair is two genuinely different thin
 ## Embeddings
 
 - embedding is a fixed-length vector representing an article's meaning. Two articles about the same thing have vectors close together, which is what makes paraphrase searchable. Table `item_embeddings`.
-- dimension is the length of that vector, fixed by the embedding model. pgvector fixes it in the column definition, which is the root of every constraint below.
+- dimension is the length of that vector: the model's native width, or the narrower width it was asked for. pgvector fixes it in the column definition, which is the root of every constraint below, and indexes at most 2,000 of them.
 - active model is the one embedding model an instance is using. There is exactly one, recorded in `embedding_model`. Vectors from two models must never share a column, even when their dimensions happen to match, because the spaces are unrelated and distances between them are meaningless.
 - backfill is embedding items that have no vector yet. It is incremental, resumable, and destroys nothing. An item needs backfilling exactly when it has no row in `item_embeddings`, so newly ingested items are picked up without any queue.
 - reindex is switching the active model: drop the index, clear the vectors, change the dimension, backfill, rebuild. It destroys every existing vector by definition. `tsuzuri reindex --embedding-model <name>`.
@@ -91,5 +91,5 @@ Phase P3. Defined here so the terms are fixed before anything implements them.
 - daemon is the only writer. Every interface is a client of its JSON API, which is what stops one of them growing behaviour the others lack.
 - CLI, web UI and MCP server are those clients. The web UI is P4.
 - MCP server is the agent-facing interface. It is designed rather than transliterated from the CLI, because an agent's useful granularity is not a human's.
-- list response is any MCP result carrying more than one item. It contains id, title, summary and score, never body text. Full text costs a deliberate `get_article` call, so that a broad query cannot exhaust an agent's context before it has chosen what to read.
+- list response is any MCP result carrying more than one article. Article lists contain id, title, summary and score, never body text; `list_sources` carries subscription fields instead. Full text costs a deliberate `get_article` call, so that a broad query cannot exhaust an agent's context before it has chosen what to read.
 - doctor reports what is enabled and what is not. On a self-hosted product, not knowing which half of the system you turned on is the largest source of friction, so it is a first-class command rather than a diagnostic afterthought.

@@ -72,12 +72,15 @@ async function embedBatch(
     );
     return { embedded: batch.length, failed: 0 };
   } catch (error) {
-    // A retryable failure describes the endpoint, not the articles. Splitting
-    // the batch would fire up to batchSize more requests at a provider that is
-    // already down, and would then blame every item for it by writing a failure
-    // row and backing each one off. Letting it propagate leaves them pending,
-    // so they are picked up unchanged once the provider returns.
-    if (error instanceof EmbeddingError && error.retryable) throw error;
+    // Only a permanent, provider-side rejection is evidence about the articles.
+    // Everything else describes the run: a retryable outage, a shutdown arriving
+    // as an AbortError, a database error from insertEmbeddings. Blaming the
+    // articles for those writes a failure row and a backoff against each one, so
+    // a restart would park recent articles for a minute apiece, and a database
+    // hiccup would look like a corpus full of unembeddable text.
+    //
+    // Letting those propagate leaves the items pending, which is what they are.
+    if (!(error instanceof EmbeddingError) || error.retryable) throw error;
 
     if (batch.length === 1) {
       const item = batch[0] as PendingItem;
@@ -113,14 +116,32 @@ export async function runEmbedPass(options: EmbedWorkerOptions): Promise<EmbedPa
   }
 
   const queue = new PQueue({ concurrency: options.concurrency });
-  const results = await Promise.all(
-    batches.map((batch) => queue.add(() => embedBatch(batch, options))),
+  let firstError: unknown;
+
+  // Promise.all would return at the first rejection while the other batches
+  // carried on in the background. The caller treats a thrown pass as finished
+  // and starts another, so the same items would be embedded twice and the
+  // requests doubled against whatever had just failed. Wait for every batch to
+  // settle, and drop the ones that have not started yet.
+  const results = await Promise.allSettled(
+    batches.map((batch) =>
+      Promise.resolve(queue.add(() => embedBatch(batch, options))).catch((error: unknown) => {
+        if (firstError === undefined) {
+          firstError = error;
+          queue.clear();
+        }
+        throw error;
+      }),
+    ),
   );
+
+  if (firstError !== undefined) throw firstError;
 
   return results.reduce<EmbedPassResult>(
     (total, result) => ({
-      embedded: total.embedded + (result?.embedded ?? 0),
-      failed: total.failed + (result?.failed ?? 0),
+      embedded:
+        total.embedded + (result.status === "fulfilled" ? (result.value?.embedded ?? 0) : 0),
+      failed: total.failed + (result.status === "fulfilled" ? (result.value?.failed ?? 0) : 0),
       idle: false,
     }),
     { embedded: 0, failed: 0, idle: false },

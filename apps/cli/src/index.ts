@@ -272,13 +272,16 @@ program
     for (;;) {
       const status = await call<EmbeddingStatus>(globals(), "/embeddings/status");
       if (!status.reindexing) {
-        if (globals().json) return printJson(status);
         // The rebuild runs detached from the request that started it, so
-        // "no longer running" is not the same as "finished".
+        // "no longer running" is not the same as "finished". Decided before
+        // the output format is chosen, or --json would report the failure in
+        // its body and still exit 0, and a script would see success.
         if (status.lastReindexError) {
-          log(`reindex failed: ${status.lastReindexError}`);
+          if (globals().json) printJson(status);
+          else log(`reindex failed: ${status.lastReindexError}`);
           process.exit(1);
         }
+        if (globals().json) return printJson(status);
         log(
           `done: ${status.counts.embedded}/${status.counts.total} embedded, ` +
             `${status.counts.failed} failed, index ${status.indexBuilt ? "built" : "not built"}`,
