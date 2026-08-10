@@ -59,6 +59,7 @@ export type SearchHit = {
   id: string;
   url: string;
   title: string | null;
+  /** ISO 8601, formatted in SQL. See ISO_PUBLISHED_AT. */
   publishedAt: string;
   summary: string | null;
   /** Highlighted excerpt, absent for items only the vector arm found. */
@@ -75,6 +76,20 @@ export type SearchResult = {
 
 /** Reciprocal Rank Fusion constant. Mirrors RRF_K in @tsuzuri/core. */
 const RRF_K = 60;
+
+/**
+ * Format a timestamp as ISO 8601 in SQL rather than relying on the driver.
+ *
+ * Once drizzle() wraps a postgres.js client it replaces the client's type
+ * parsers, because it maps values itself. Raw queries on that same client then
+ * receive timestamps as PostgreSQL's own text format -- `2026-08-08
+ * 11:23:34.994689+00` -- while every endpoint built with Drizzle returns
+ * `2026-08-08T11:23:34.994Z`. Two shapes for one field across two endpoints is
+ * a trap for anything consuming the API, and an agent gets it wrong quietly.
+ *
+ * Formatting here makes the output the same whatever the driver is doing.
+ */
+const ISO_PUBLISHED_AT = `to_char(i.published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
 
 /** Default cosine distance ceiling for the vector arm. */
 export const DEFAULT_MAX_DISTANCE = 0.6;
@@ -185,7 +200,7 @@ export async function hybridSearch(
           i.id,
           i.url,
           i.title,
-          i.published_at AS "publishedAt",
+          ${sql.unsafe(ISO_PUBLISHED_AT)} AS "publishedAt",
           i.summary,
           (pgroonga_snippet_html(
             i.search_text, pgroonga_query_extract_keywords(${query})
@@ -229,7 +244,7 @@ export async function hybridSearch(
           i.id,
           i.url,
           i.title,
-          i.published_at AS "publishedAt",
+          ${sql.unsafe(ISO_PUBLISHED_AT)} AS "publishedAt",
           i.summary,
           (pgroonga_snippet_html(
             i.search_text, pgroonga_query_extract_keywords(${query})
