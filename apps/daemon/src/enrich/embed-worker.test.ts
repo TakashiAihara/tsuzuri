@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { EmbeddingProvider } from "@tsuzuri/core";
+import { EmbeddingError } from "@tsuzuri/core";
 import { createDatabase, ensureItemEmbeddings, migrate, pendingEmbeddingItems } from "@tsuzuri/db";
 
-import { runEmbedPass } from "./embed-worker.ts";
+import { runEmbedPass, startEmbedWorker } from "./embed-worker.ts";
 
 /**
  * The worker is tested against a real database and a fake provider.
@@ -161,6 +162,57 @@ describeIfDb("runEmbedPass", () => {
       VALUES ('late', 'https://example.com/late', 'https://example.com/late', 'late', now(), 'late body')
     `;
     expect(await runEmbedPass(options(provider))).toMatchObject({ embedded: 1, idle: false });
+  });
+
+  test("a retryable failure does not fan out into per-item retries", async () => {
+    // The provider being down is about the endpoint, not the articles.
+    // Splitting would fire batchSize more requests at something already
+    // unreachable, and would blame every item by backing it off.
+    await seed(4);
+    let calls = 0;
+    const downProvider: EmbeddingProvider = {
+      id: "openai-compatible",
+      model: "fake",
+      async embed() {
+        calls += 1;
+        throw new EmbeddingError("connection refused", true);
+      },
+    };
+
+    await expect(
+      runEmbedPass({ ...options(downProvider, { batchSize: 4, concurrency: 1 }) }),
+    ).rejects.toThrow(/connection refused/);
+
+    expect(calls).toBe(1);
+    // Nothing was blamed, so everything is still pending for when it returns.
+    expect(await pendingEmbeddingItems(handle.sql, 10)).toHaveLength(4);
+    const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
+    expect(failures[0]?.n).toBe(0);
+  });
+
+  test("a permanent failure still falls back to per-item attribution", async () => {
+    await seed(2);
+    const rejecting: EmbeddingProvider = {
+      id: "openai-compatible",
+      model: "fake",
+      async embed() {
+        throw new EmbeddingError("that input is not acceptable", false);
+      },
+    };
+    const result = await runEmbedPass(options(rejecting, { batchSize: 2, concurrency: 1 }));
+    expect(result).toMatchObject({ embedded: 0, failed: 2 });
+  });
+
+  test("stop() returns promptly instead of waiting out the idle interval", async () => {
+    // stop() used to only set a flag, so anything awaiting the worker -- the
+    // daemon's signal handler, the start of a reindex -- waited for the
+    // 30-second sleep to elapse.
+    const worker = startEmbedWorker(options(fakeProvider({})));
+    await Bun.sleep(50);
+    const started = Date.now();
+    worker.stop();
+    await worker.done;
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 
   test("stores vectors at the provider's width", async () => {

@@ -232,6 +232,7 @@ type EmbeddingStatus = {
   message?: string;
   indexBuilt: boolean;
   reindexing: boolean;
+  lastReindexError: string | null;
   counts: { total: number; embedded: number; pending: number; failed: number };
 };
 
@@ -272,6 +273,12 @@ program
       const status = await call<EmbeddingStatus>(globals(), "/embeddings/status");
       if (!status.reindexing) {
         if (globals().json) return printJson(status);
+        // The rebuild runs detached from the request that started it, so
+        // "no longer running" is not the same as "finished".
+        if (status.lastReindexError) {
+          log(`reindex failed: ${status.lastReindexError}`);
+          process.exit(1);
+        }
         log(
           `done: ${status.counts.embedded}/${status.counts.total} embedded, ` +
             `${status.counts.failed} failed, index ${status.indexBuilt ? "built" : "not built"}`,

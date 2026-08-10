@@ -48,7 +48,19 @@ export type EmbeddingProviderConfig = {
    * native size is used and discovered by probing.
    */
   dimensions?: number | undefined;
+  /**
+   * Per-request deadline.
+   *
+   * Not optional in practice: the common target is a local inference server,
+   * and one that accepts a connection and then stops answering would otherwise
+   * hang the backfill and the daemon's shutdown with it. fetch() has no default
+   * timeout of its own.
+   */
+  requestTimeoutMs?: number | undefined;
 };
+
+/** Default per-request deadline. Generous, because a cold local model is slow. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * OpenAI's response shape, which every compatible server reproduces.
@@ -97,6 +109,7 @@ export function createEmbeddingProvider(config: EmbeddingProviderConfig): Embedd
   const model = config.model;
   const dimensions = config.dimensions;
   const apiKey = config.apiKey;
+  const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
   return {
     id: "openai-compatible",
@@ -118,7 +131,11 @@ export function createEmbeddingProvider(config: EmbeddingProviderConfig): Embedd
             ...(dimensions ? { dimensions } : {}),
             encoding_format: "float",
           }),
-          signal: signal ?? null,
+          // The caller's signal still cancels; the deadline is added to it
+          // rather than replacing it.
+          signal: signal
+            ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
+            : AbortSignal.timeout(requestTimeoutMs),
         });
       } catch (error) {
         // Connection refused, DNS failure, timeout: the endpoint is a local
@@ -168,6 +185,18 @@ export function createEmbeddingProvider(config: EmbeddingProviderConfig): Embedd
       const width = vectors[0]?.length ?? 0;
       if (width === 0 || vectors.some((vector) => vector.length !== width)) {
         throw new EmbeddingError("embedding response had inconsistent vector lengths", false);
+      }
+
+      // Servers are free to ignore the `dimensions` parameter, and a model that
+      // does not support it answers at its native width without complaint. Left
+      // unchecked, that width silently becomes the column definition and the
+      // operator runs a different model than they configured.
+      if (dimensions !== undefined && width !== dimensions) {
+        throw new EmbeddingError(
+          `EMBEDDING_DIMENSIONS is ${dimensions} but ${model} returned ${width} dimensions; ` +
+            "this model does not honour the dimensions parameter",
+          false,
+        );
       }
 
       return vectors;

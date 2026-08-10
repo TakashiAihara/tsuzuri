@@ -256,6 +256,23 @@ describeIfDb("embeddings", () => {
       expect(await itemEmbeddingsDimension(handle.sql)).toBe(6);
     });
 
+    test("leaves nothing half-done when the rebuild fails partway", async () => {
+      // DROP INDEX, TRUNCATE and ALTER used to run as separate statements, so a
+      // failure between them left the table indexless, empty, and still at the
+      // old dimension while embedding_model claimed otherwise.
+      await seedItems([item("a", "2026-08-01", "one")]);
+      await ensureItemEmbeddings(handle.sql, 4);
+      await insertEmbeddings(handle.sql, [{ itemId: "a", vector: "[1,0,0,0]" }]);
+
+      // 99_999 passes assertDimension's shape check but pgvector refuses it, so
+      // the failure lands mid-transaction rather than before it starts.
+      await expect(rebuildItemEmbeddings(handle.sql, 20_000)).rejects.toThrow();
+
+      expect(await itemEmbeddingsDimension(handle.sql)).toBe(4);
+      expect(await embeddingCounts(handle.sql)).toMatchObject({ embedded: 1 });
+      expect(await embeddingIndexExists(handle.sql)).toBe(true);
+    });
+
     test("clears failures belonging to the discarded model", async () => {
       await seedItems([item("a", "2026-08-01", "one")]);
       await ensureItemEmbeddings(handle.sql, 4);

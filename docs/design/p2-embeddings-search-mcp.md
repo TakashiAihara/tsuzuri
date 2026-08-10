@@ -2,7 +2,7 @@
 
 Covers issues #1 (embedding provider abstraction), #2 (hybrid search), #3 (MCP server).
 
-Status: draft, awaiting approval. No implementation until this is approved.
+Status: approved 2026-08-10. Being implemented as three chained pull requests; see Delivery.
 
 ## Scope
 
@@ -78,8 +78,6 @@ export type EmbeddingProvider = {
   id: "openai-compatible";
   /** Model name as the endpoint knows it. */
   model: string;
-  /** Vector length. Discovered once, then read from the database. */
-  dimensions: number;
   /** Embed a batch. Order of the result matches order of the input. */
   embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
 };
@@ -195,7 +193,7 @@ The rebuild: drop the HNSW index, truncate `item_embeddings` and `embedding_fail
 
 It is resumable. An interrupted rebuild leaves an empty or partial table whose dimension already matches the record, so restarting continues the backfill rather than starting over.
 
-`POST /embeddings/reindex` drives it; `GET /embeddings/status` reports `{ provider, model, dimensions, total, embedded, pending, failed }`, which the CLI polls to print progress and `doctor` embeds in its report.
+`POST /embeddings/reindex` drives it; `GET /embeddings/status` reports `{ state, provider, model, dimensions, indexBuilt, reindexing, lastReindexError, counts: { total, embedded, pending, failed } }`, which the CLI polls to print progress and `doctor` embeds in its report. `lastReindexError` is there because a rebuild outlives the request that started it, so `reindexing: false` alone cannot distinguish finished from failed.
 
 ## Part 2: hybrid search (#2)
 

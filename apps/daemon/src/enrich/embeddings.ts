@@ -33,6 +33,14 @@ export type EmbeddingStatus = {
   message?: string;
   indexBuilt: boolean;
   reindexing: boolean;
+  /**
+   * Why the last rebuild stopped, when it did not finish.
+   *
+   * A rebuild runs detached from the request that asked for it, so without
+   * this a failure is visible only in the daemon's log: status would flip
+   * reindexing back to false and every caller would read that as success.
+   */
+  lastReindexError: string | null;
   counts: EmbeddingCounts;
 };
 
@@ -58,6 +66,7 @@ export function createEmbeddingService(deps: {
     apiKey: config.EMBEDDING_API_KEY,
     model: config.EMBEDDING_MODEL,
     dimensions: config.EMBEDDING_DIMENSIONS,
+    requestTimeoutMs: config.EMBEDDING_REQUEST_TIMEOUT_MS,
   });
 
   const configured = provider ? { provider: provider.id, model: provider.model } : null;
@@ -66,6 +75,9 @@ export function createEmbeddingService(deps: {
   let dimensions: number | null = null;
   let worker: EmbedWorker | null = null;
   let reindexing = false;
+  let lastReindexError: string | null = null;
+  /** Set once stop() has been called, so nothing starts the worker again. */
+  let stopped = false;
 
   const workerOptions = (active: EmbeddingProvider) => ({
     sql,
@@ -106,7 +118,7 @@ export function createEmbeddingService(deps: {
   }
 
   function startWorker(): void {
-    if (state.status !== "ready" || !provider || worker) return;
+    if (stopped || state.status !== "ready" || !provider || worker) return;
     worker = startEmbedWorker(workerOptions(provider));
   }
 
@@ -124,6 +136,9 @@ export function createEmbeddingService(deps: {
     },
 
     async stop() {
+      // Before stopWorker(), so that a reindex finishing concurrently cannot
+      // start a fresh worker from its finally block and outlive shutdown.
+      stopped = true;
       await stopWorker();
     },
 
@@ -141,6 +156,7 @@ export function createEmbeddingService(deps: {
         ...(state.status === "mismatch" ? { message: describeMismatch(state) } : {}),
         indexBuilt: await embeddingIndexExists(sql),
         reindexing,
+        lastReindexError,
         counts: await embeddingCounts(sql),
       };
     },
@@ -168,6 +184,7 @@ export function createEmbeddingService(deps: {
       if (reindexing) throw new Error("a reindex is already running");
 
       reindexing = true;
+      lastReindexError = null;
       try {
         await stopWorker();
 
@@ -191,6 +208,9 @@ export function createEmbeddingService(deps: {
           if (pass.idle) break;
         }
         await createEmbeddingIndex(sql);
+      } catch (error) {
+        lastReindexError = error instanceof Error ? error.message : String(error);
+        throw error;
       } finally {
         reindexing = false;
         startWorker();
