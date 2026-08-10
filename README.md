@@ -138,6 +138,42 @@ tsuzuri reindex --embedding-model <the-new-model>
 
 That discards every existing vector, which is why it takes the model name: the flag confirms what is being rebuilt, it does not select it. `tsuzuri reindex` with no flag just reports backfill progress, since the daemon fills gaps on its own.
 
+## MCP server
+
+Agents are a first-class way in, not a wrapper over the CLI. Their useful granularity is not a human's, so the tools are designed rather than transliterated.
+
+```bash
+bun run apps/mcp/src/index.ts       # speaks MCP over stdio, talks to the daemon over HTTP
+```
+
+Point a host at it. For Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "tsuzuri": {
+      "command": "bun",
+      "args": ["run", "/path/to/tsuzuri/apps/mcp/src/index.ts"],
+      "env": { "TSUZURI_ENDPOINT": "http://127.0.0.1:8787" }
+    }
+  }
+}
+```
+
+| Tool | Purpose |
+| --- | --- |
+| `search_articles` | Hybrid search, filtered by period, subscription or unread |
+| `get_article` | One article's body, as markdown, plain text or summary |
+| `list_sources` | Subscriptions and their health |
+| `mark_read` / `star` | State updates, several ids at a time |
+| `add_source` | Subscribe to a feed |
+
+Recent unread is also exposed as the resource `tsuzuri://unread/recent`, so a host can put current articles in context without spending a tool call.
+
+**List responses never carry article text.** Anything that can return more than one article returns id, title, summary and score; the body costs a deliberate `get_article`. A broad query would otherwise spend the context window before the agent had decided what was worth reading.
+
+It works with no AI configured. Search degrades to full text and says so in its `mode`, and summaries are whatever the feed supplied. The natural arrangement then is that the host agent does the summarising, which is a reason to expose MCP rather than a gap in it.
+
 ## How it is put together
 
 ```text
