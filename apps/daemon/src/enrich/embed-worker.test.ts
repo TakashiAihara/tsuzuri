@@ -221,12 +221,17 @@ describeIfDb("runEmbedPass", () => {
     // is full of unembeddable text.
     await seed(2);
     await handle.sql.unsafe("DROP TABLE item_embeddings");
-    await expect(
-      runEmbedPass(options(fakeProvider({}), { batchSize: 2, concurrency: 1 })),
-    ).rejects.toThrow();
-    const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
-    expect(failures[0]?.n).toBe(0);
-    await ensureItemEmbeddings(handle.sql, 4);
+    try {
+      await expect(
+        runEmbedPass(options(fakeProvider({}), { batchSize: 2, concurrency: 1 })),
+      ).rejects.toThrow();
+      const failures = await handle.sql`SELECT count(*)::int AS n FROM embedding_failures`;
+      expect(failures[0]?.n).toBe(0);
+    } finally {
+      // Restored even if an assertion fails, or every later test in this file
+      // fails against a missing table and the real cause is buried.
+      await ensureItemEmbeddings(handle.sql, 4);
+    }
   });
 
   test("a failing pass waits for its other batches instead of leaving them running", async () => {
@@ -258,6 +263,30 @@ describeIfDb("runEmbedPass", () => {
 
     // Every batch has settled by the time the pass throws.
     expect(inFlight).toBe(0);
+  });
+
+  test("a failing pass settles rather than hanging", async () => {
+    // A guard, not a reproduction: a pass claims batchSize * concurrency items,
+    // so today there are never more batches than slots and nothing waits in the
+    // queue. If that sizing ever changes, cancelling with p-queue's clear()
+    // would discard pending tasks without settling the promises add() returned,
+    // and this pass would never finish. This test would catch that.
+    await seed(6);
+    const downProvider: EmbeddingProvider = {
+      id: "openai-compatible",
+      model: "fake",
+      async embed() {
+        await Bun.sleep(20);
+        throw new EmbeddingError("provider is down", true);
+      },
+    };
+
+    const pass = runEmbedPass(options(downProvider, { batchSize: 1, concurrency: 2 })).then(
+      () => "resolved" as const,
+      () => "rejected" as const,
+    );
+    const outcome = await Promise.race([pass, Bun.sleep(5000).then(() => "hung" as const)]);
+    expect(outcome).toBe("rejected");
   });
 
   test("a permanent failure still falls back to per-item attribution", async () => {

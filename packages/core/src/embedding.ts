@@ -165,13 +165,18 @@ export function createEmbeddingProvider(config: EmbeddingProviderConfig): Embedd
       try {
         payload = await response.json();
       } catch (error) {
-        const name = error instanceof Error ? error.name : "";
-        const aborted = name === "AbortError" || name === "TimeoutError";
+        // Only malformed JSON is the provider's final answer. Everything else
+        // here is transport -- a deadline firing mid-body, a connection
+        // dropping -- and the runtime is not consistent about what it names
+        // those, so they are classified by what they are not. Getting this
+        // backwards charges a slow or flaky endpoint to the article, which
+        // then carries a backoff it did nothing to earn.
+        const permanent = error instanceof SyntaxError;
         throw new EmbeddingError(
           `embedding response body could not be read: ${
             error instanceof Error ? error.message : String(error)
           }`,
-          aborted,
+          !permanent,
         );
       }
 
