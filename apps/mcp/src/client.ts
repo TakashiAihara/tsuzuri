@@ -87,7 +87,23 @@ export function createClient(options: ClientOptions) {
     }
 
     const text = await response.text();
-    const body: unknown = text ? JSON.parse(text) : {};
+
+    // A reverse proxy in front of the daemon answers 502 with HTML, and a bare
+    // JSON.parse would throw a SyntaxError that loses both the status code and
+    // the fact that this was the daemon at all.
+    let body: unknown = {};
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        throw new DaemonError(
+          `the tsuzuri daemon at ${endpoint} answered with a non-JSON body: ` +
+            `${text.slice(0, 200)}`,
+          response.status,
+        );
+      }
+    }
+
     if (!response.ok) {
       const message =
         typeof body === "object" && body !== null && "error" in body

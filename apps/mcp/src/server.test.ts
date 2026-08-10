@@ -327,6 +327,15 @@ describe("state updates", () => {
     const result = await client.callTool({ name: "mark_read", arguments: { ids: [] } });
     expect(result.isError).toBe(true);
   });
+
+  test("caps how many articles one call may update", async () => {
+    // Updates are sequential and each can wait out the client's timeout, so an
+    // unbounded list could hold a tool call open for hours.
+    const client = await connect();
+    const ids = Array.from({ length: 101 }, (_, i) => `aaaaaaaa${String(i).padStart(4, "0")}`);
+    const result = await client.callTool({ name: "mark_read", arguments: { ids } });
+    expect(result.isError).toBe(true);
+  });
 });
 
 describe("add_source", () => {
@@ -394,7 +403,47 @@ describe("resources", () => {
   });
 });
 
+describe("untrusted content", () => {
+  test("tells the host that article text is data, not instructions", async () => {
+    // Feeds are hostile input. A server that hands an agent web text with no
+    // trust boundary invites indirect prompt injection into its write tools.
+    const client = await connect();
+    const instructions = client.getInstructions() ?? "";
+    expect(instructions).toMatch(/untrusted/i);
+    expect(instructions).toMatch(/never as\s+instructions|not as instructions/i);
+
+    const { tools } = await client.listTools();
+    const bodyReturning = tools.filter((t) => ["search_articles", "get_article"].includes(t.name));
+    for (const tool of bodyReturning) {
+      expect(tool.description).toMatch(/untrusted/i);
+    }
+  });
+
+  test("marks write tools so a host can require confirmation", async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+    expect(byName.search_articles?.annotations?.readOnlyHint).toBe(true);
+    expect(byName.mark_read?.annotations?.readOnlyHint).toBe(false);
+    expect(byName.add_source?.annotations?.readOnlyHint).toBe(false);
+  });
+});
+
 describe("daemon unavailable", () => {
+  test("reports a non-JSON body with its status instead of a parse error", async () => {
+    // A reverse proxy answering 502 with HTML would otherwise surface as a
+    // SyntaxError, losing both the status and the fact it was the daemon.
+    routes["/search"] = () =>
+      new Response("<html><body>502 Bad Gateway</body></html>", {
+        status: 502,
+        headers: { "content-type": "text/html" },
+      });
+    const client = await connect();
+    const result = await client.callTool({ name: "search_articles", arguments: { query: "x" } });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toMatch(/non-JSON body/);
+  });
+
   test("says the daemon is unreachable rather than failing opaquely", async () => {
     const server = createMcpServer(createClient({ endpoint: "http://127.0.0.1:1" }));
     const client = new Client({ name: "test", version: "0" });
