@@ -4,6 +4,15 @@ export {
   timeZoneOffsetMinutes,
   tryParseFeedDate,
 } from "./date.ts";
+export {
+  createEmbeddingProvider,
+  EmbeddingError,
+  type EmbeddingProvider,
+  type EmbeddingProviderConfig,
+  embeddingInput,
+  probeDimensions,
+  toVectorLiteral,
+} from "./embedding.ts";
 export { contentHash, itemIdentity, sha256 } from "./hash.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export {

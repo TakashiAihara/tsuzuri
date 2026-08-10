@@ -34,6 +34,28 @@ const configSchema = z.object({
 
   /** Consecutive failures before a source is marked degraded. */
   DEGRADE_AFTER_FAILURES: z.coerce.number().int().positive().default(5),
+
+  /**
+   * Embeddings. Off by default, and there is deliberately no default model:
+   * a model cannot be chosen on someone's behalf when choosing one commits
+   * their database to a vector dimension.
+   */
+  EMBEDDING_PROVIDER: z.enum(["none", "openai-compatible"]).default("none"),
+  /** OpenAI-compatible base URL, e.g. http://localhost:11434/v1 for Ollama. */
+  EMBEDDING_BASE_URL: z.string().optional(),
+  /** Optional; local runtimes usually want no key at all. */
+  EMBEDDING_API_KEY: z.string().optional(),
+  EMBEDDING_MODEL: z.string().optional(),
+  /**
+   * Requested output width, for models that accept a `dimensions` parameter.
+   * Left unset, the model's native width is discovered by probing.
+   */
+  EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().optional(),
+  EMBEDDING_BATCH_SIZE: z.coerce.number().int().positive().max(512).default(32),
+  /** Concurrent requests. Low, because the common target is one local GPU. */
+  EMBEDDING_CONCURRENCY: z.coerce.number().int().positive().max(32).default(2),
+  /** Characters of an article sent for embedding. See embeddingInput(). */
+  EMBEDDING_MAX_INPUT_CHARS: z.coerce.number().int().positive().default(8_000),
 });
 
 export type Config = z.infer<typeof configSchema>;

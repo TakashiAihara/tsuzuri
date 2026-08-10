@@ -12,6 +12,7 @@ import PQueue from "p-queue";
 import { z } from "zod";
 
 import type { Config } from "./config.ts";
+import type { EmbeddingService } from "./enrich/embeddings.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
 import { parseOpml } from "./opml.ts";
@@ -28,6 +29,7 @@ export type ApiDeps = {
   db: Database;
   fetcher: Fetcher;
   config: Config;
+  embeddings: EmbeddingService;
 };
 
 const addSourceSchema = z.object({
@@ -44,7 +46,7 @@ const listItemsSchema = z.object({
 });
 
 export function createApi(deps: ApiDeps) {
-  const { db, fetcher, config } = deps;
+  const { db, fetcher, config, embeddings } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -216,6 +218,39 @@ export function createApi(deps: ApiDeps) {
     return c.json({ state: row });
   });
 
+  app.get("/embeddings/status", async (c) => c.json(await embeddings.status()));
+
+  /**
+   * Re-embed everything into the configured model.
+   *
+   * Answers immediately rather than holding the request open: a full rebuild
+   * runs for as long as the corpus takes, which is minutes on a real install.
+   * Progress is read from /embeddings/status, which is also where an
+   * interrupted rebuild is visible.
+   */
+  app.post("/embeddings/reindex", async (c) => {
+    const parsed = z
+      .object({ model: z.string().min(1) })
+      .safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
+
+    try {
+      // Deliberately not awaited. Errors surface through the status endpoint.
+      const running = embeddings.reindex({ model: parsed.data.model });
+      // Give it long enough to fail on its preconditions, so an obviously wrong
+      // call answers with the reason instead of a cheerful 202.
+      const outcome = await Promise.race([
+        running.then(() => "done" as const),
+        Bun.sleep(250).then(() => "running" as const),
+      ]);
+      if (outcome === "running")
+        void running.catch((error) => console.error("reindex failed:", error));
+      return c.json({ status: outcome, ...(await embeddings.status()) }, 202);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+
   /** What is configured and what is not, so nobody debugs a component they never enabled. */
   app.get("/doctor", async (c) => {
     const extensions = await db.execute<{ extname: string; extversion: string }>(
@@ -229,13 +264,18 @@ export function createApi(deps: ApiDeps) {
       })
       .from(sql`(SELECT 1) AS t`);
 
+    const embeddingStatus = await embeddings.status();
+
     return c.json({
       database: { extensions: [...extensions] },
       counts,
       features: {
+        embeddings: {
+          enabled: embeddingStatus.state === "ready",
+          ...embeddingStatus,
+        },
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.
-        embeddings: { enabled: false, reason: "not implemented until P2" },
         llm: { enabled: false, reason: "not implemented until P3" },
         headless: { enabled: false, reason: "not implemented until P6" },
       },

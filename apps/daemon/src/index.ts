@@ -3,6 +3,7 @@ import PQueue from "p-queue";
 
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
+import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
 
@@ -63,7 +64,20 @@ async function scheduler(): Promise<void> {
   }
 }
 
-const app = createApi({ db, fetcher, config });
+/**
+ * Embeddings are resolved before serving, so that /doctor tells the truth from
+ * the first request. A failure here is reported and then tolerated: the reader
+ * works without embeddings, and refusing to start over an optional feature
+ * would be a worse outcome than starting without it.
+ */
+const embeddings = createEmbeddingService({ sql, config });
+try {
+  await embeddings.start();
+} catch (error) {
+  console.error("embeddings could not be started:", error);
+}
+
+const app = createApi({ db, fetcher, config, embeddings });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
@@ -73,6 +87,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     stopping = true;
     await server.stop();
+    await embeddings.stop();
     await close();
     process.exit(0);
   });

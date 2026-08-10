@@ -122,6 +122,35 @@ export const itemState = pgTable(
   (table) => [primaryKey({ columns: [table.userId, table.itemId] })],
 );
 
+/**
+ * The active embedding model. At most one row, enforced by the CHECK in the
+ * migration that this mirror cannot express.
+ *
+ * There is no mirror for item_embeddings: its column type carries a dimension
+ * that is only known once a model is configured, which no static definition can
+ * state. That table is created and queried in raw SQL; see ./embeddings.ts.
+ */
+export const embeddingModel = pgTable("embedding_model", {
+  id: boolean("id").primaryKey().default(true),
+  provider: text("provider").notNull(),
+  model: text("model").notNull(),
+  dimensions: integer("dimensions").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const embeddingFailures = pgTable(
+  "embedding_failures",
+  {
+    itemId: text("item_id")
+      .primaryKey()
+      .references(() => items.id, { onDelete: "cascade" }),
+    failures: integer("failures").notNull().default(1),
+    lastError: text("last_error"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [index("embedding_failures_next_attempt").on(table.nextAttemptAt)],
+);
+
 export type SourceRow = typeof sources.$inferSelect;
 export type NewSourceRow = typeof sources.$inferInsert;
 export type ItemRow = typeof items.$inferSelect;

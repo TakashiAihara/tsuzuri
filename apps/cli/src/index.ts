@@ -224,6 +224,65 @@ program
     log(`starred ${ids.length}`);
   });
 
+type EmbeddingStatus = {
+  state: string;
+  provider: string | null;
+  model: string | null;
+  dimensions: number | null;
+  message?: string;
+  indexBuilt: boolean;
+  reindexing: boolean;
+  counts: { total: number; embedded: number; pending: number; failed: number };
+};
+
+program
+  .command("reindex")
+  .description("embed items that have no vector yet")
+  .option(
+    "--embedding-model <name>",
+    "rebuild every vector into this model; must match the configured EMBEDDING_MODEL. Destroys all existing vectors",
+  )
+  .action(async (opts: { embeddingModel?: string }) => {
+    // Without the flag this is a plain backfill, which the daemon is doing
+    // anyway; the command exists so that "fill the gaps" and "throw everything
+    // away and start again" are visibly different requests.
+    if (!opts.embeddingModel) {
+      const status = await call<EmbeddingStatus>(globals(), "/embeddings/status");
+      if (globals().json) return printJson(status);
+      if (status.state !== "ready") {
+        log(`embeddings are ${status.state}${status.message ? `: ${status.message}` : ""}`);
+        return;
+      }
+      log(
+        `backfill runs continuously: ${status.counts.embedded}/${status.counts.total} embedded, ` +
+          `${status.counts.pending} pending, ${status.counts.failed} failed`,
+      );
+      log("to rebuild every vector into a different model, pass --embedding-model <name>");
+      return;
+    }
+
+    log(`rebuilding every vector into ${opts.embeddingModel}. Existing vectors are discarded.`);
+    await call<EmbeddingStatus>(globals(), "/embeddings/reindex", {
+      method: "POST",
+      raw: JSON.stringify({ model: opts.embeddingModel }),
+    });
+
+    // Poll rather than hold a request open for the length of a full re-embed.
+    for (;;) {
+      const status = await call<EmbeddingStatus>(globals(), "/embeddings/status");
+      if (!status.reindexing) {
+        if (globals().json) return printJson(status);
+        log(
+          `done: ${status.counts.embedded}/${status.counts.total} embedded, ` +
+            `${status.counts.failed} failed, index ${status.indexBuilt ? "built" : "not built"}`,
+        );
+        return;
+      }
+      log(`  ${status.counts.embedded}/${status.counts.total} embedded…`);
+      await Bun.sleep(2000);
+    }
+  });
+
 program
   .command("doctor")
   .description("report what is configured and what is not")
