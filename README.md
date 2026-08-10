@@ -76,6 +76,43 @@ All settings are environment variables. Only `DATABASE_URL` is required.
 
 The CLI reads `TSUZURI_ENDPOINT` (default `http://127.0.0.1:8787`), so it works against a daemon on another machine.
 
+### Embeddings
+
+Off by default, and there is no default model: choosing one commits the database to a vector width, so it is not a choice to make on someone's behalf. With none configured, everything else works and `doctor` says embeddings are disabled.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EMBEDDING_PROVIDER` | `none` | `none`, or `openai-compatible` |
+| `EMBEDDING_BASE_URL` | — | e.g. `http://localhost:11434/v1` for Ollama |
+| `EMBEDDING_API_KEY` | — | Optional; local runtimes usually need none |
+| `EMBEDDING_MODEL` | — | Required once a provider is set |
+| `EMBEDDING_DIMENSIONS` | — | Only for models that accept a `dimensions` parameter |
+| `EMBEDDING_BATCH_SIZE` | `32` | Texts per request |
+| `EMBEDDING_CONCURRENCY` | `2` | Concurrent requests |
+| `EMBEDDING_MAX_INPUT_CHARS` | `8000` | Article text sent per embedding |
+
+`openai-compatible` covers Ollama, LM Studio, vLLM, OpenRouter and OpenAI itself. Pick a multilingual model if you read anything other than English.
+
+```bash
+EMBEDDING_PROVIDER=openai-compatible \
+EMBEDDING_BASE_URL=http://localhost:11434/v1 \
+EMBEDDING_MODEL=bge-m3 \
+  bun run apps/daemon/src/index.ts
+```
+
+On first start the daemon asks the model how wide its vectors are, builds the vector column to fit, and backfills in the background, newest articles first. Progress shows up in `tsuzuri doctor`.
+
+**One model per installation.** pgvector fixes the vector width in the column definition, so vectors from two models cannot share it — and even at equal widths their spaces are unrelated, which would make the distances between them meaningless rather than merely inaccurate. Point the configuration at a different model and the daemon keeps serving, but leaves vector search switched off and tells you why, rather than comparing vectors that are not comparable.
+
+Switching means re-embedding everything:
+
+```bash
+# Change EMBEDDING_MODEL in the environment first, restart, then:
+tsuzuri reindex --embedding-model <the-new-model>
+```
+
+That discards every existing vector, which is why it takes the model name: the flag confirms what is being rebuilt, it does not select it. `tsuzuri reindex` with no flag just reports backfill progress, since the daemon fills gaps on its own.
+
 ## How it is put together
 
 ```text

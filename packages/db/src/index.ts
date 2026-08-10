@@ -1,7 +1,28 @@
 export { type CreateDatabaseOptions, createDatabase, type Database } from "./client.ts";
+export {
+  createEmbeddingIndex,
+  createEmbeddingTable,
+  type EmbeddingCounts,
+  type EmbeddingModelRow,
+  embeddingCounts,
+  embeddingIndexExists,
+  ensureItemEmbeddings,
+  insertEmbeddings,
+  itemEmbeddingsDimension,
+  itemEmbeddingsExists,
+  type PendingItem,
+  pendingEmbeddingItems,
+  readEmbeddingModel,
+  rebuildItemEmbeddings,
+  recordEmbeddingFailure,
+  retryBackoffSeconds,
+  writeEmbeddingModel,
+} from "./embeddings.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
   DEFAULT_USER_ID,
+  embeddingFailures,
+  embeddingModel,
   type ItemRow,
   type ItemStateRow,
   itemSources,
