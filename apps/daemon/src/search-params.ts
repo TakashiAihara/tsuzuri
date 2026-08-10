@@ -36,7 +36,14 @@ export function parseSince(value: string | undefined | null, now = new Date()): 
   const duration = DURATION.exec(trimmed);
   if (duration?.[1] && duration[2]) {
     const unit = UNIT_MS[duration[2].toLowerCase()];
-    if (unit) return new Date(now.getTime() - Number(duration[1]) * unit);
+    if (unit) {
+      // A long enough run of digits parses to Infinity, which makes an invalid
+      // Date. That would survive this function and fail much later, where
+      // toISOString() throws and the request becomes a 500 instead of the 400
+      // it is.
+      const relative = new Date(now.getTime() - Number(duration[1]) * unit);
+      if (!Number.isNaN(relative.getTime())) return relative;
+    }
   }
 
   const absolute = new Date(trimmed);
