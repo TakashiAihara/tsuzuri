@@ -58,6 +58,15 @@ const configSchema = z.object({
   EMBEDDING_MAX_INPUT_CHARS: z.coerce.number().int().positive().default(8_000),
   /** Per-request deadline for the embedding endpoint. */
   EMBEDDING_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+
+  /**
+   * Cosine distance beyond which a vector candidate is not a result.
+   *
+   * The vector arm returns its nearest N however far away they are, so without
+   * a ceiling a query few documents match textually fills its tail with
+   * whatever happens to exist. Tune per corpus and per model.
+   */
+  SEARCH_MAX_DISTANCE: z.coerce.number().positive().max(2).default(0.6),
 });
 
 /**

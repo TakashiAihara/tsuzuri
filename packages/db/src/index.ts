@@ -34,3 +34,12 @@ export {
   sources,
   users,
 } from "./schema.ts";
+export {
+  DEFAULT_MAX_DISTANCE,
+  hybridSearch,
+  type SearchFilters,
+  type SearchHit,
+  type SearchOptions,
+  type SearchResult,
+  textScores,
+} from "./search.ts";

@@ -175,6 +175,59 @@ program
   });
 
 program
+  .command("search <query...>")
+  .description("hybrid search over everything stored")
+  .option("--limit <n>", "how many", "20")
+  .option("--since <when>", "only items newer than this, e.g. 7d or an ISO date")
+  .option("--source <id>", "restrict to one subscription")
+  .option("--unread", "exclude items already read")
+  .action(
+    async (
+      query: string[],
+      opts: { limit: string; since?: string; source?: string; unread?: boolean },
+    ) => {
+      type Result = {
+        id: string;
+        title: string | null;
+        url: string;
+        publishedAt: string;
+        snippet: string | null;
+        score?: unknown;
+      };
+      const params = new URLSearchParams({ q: query.join(" "), limit: opts.limit });
+      if (opts.since) params.set("since", opts.since);
+      if (opts.source) params.set("sourceId", opts.source);
+      if (opts.unread) params.set("unreadOnly", "true");
+
+      const response = await call<{ mode: string; reason?: string; results: Result[] }>(
+        globals(),
+        `/search?${params}`,
+      );
+      if (globals().json) return printJson(response);
+
+      // Say when half the search was switched off. An empty list otherwise
+      // looks the same as a corpus that genuinely had no match.
+      if (response.mode === "text-only" && response.reason) {
+        log(`full-text only: ${response.reason}`);
+      }
+      if (response.results.length === 0) return log("no matches");
+
+      for (const hit of response.results) {
+        out(
+          `${hit.id.slice(0, 8)}  ${formatAge(hit.publishedAt).padEnd(5)} ${hit.title ?? hit.url}`,
+        );
+        // pgroonga_snippet_html marks matches with a span; the terminal wants
+        // the text, not the markup.
+        const snippet = hit.snippet
+          ?.replace(/<[^>]+>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (snippet) out(`          ${snippet.slice(0, 160)}`);
+      }
+    },
+  );
+
+program
   .command("show <id>")
   .description("print one item")
   .action(async (id: string) => {
