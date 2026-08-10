@@ -53,11 +53,16 @@ describeIfDb("api", () => {
 
   const get = (path: string) => app.fetch(new Request(`http://test${path}`));
 
+  /** Response.json() is typed unknown, so tests say what they expect back. */
+  async function json<T>(response: Response): Promise<T> {
+    return (await response.json()) as T;
+  }
+
   describe("item id resolution", () => {
     test("accepts a full id", async () => {
       const response = await get(`/items/${idC}`);
       expect(response.status).toBe(200);
-      expect((await response.json()).item.id).toBe(idC);
+      expect((await json<{ item: { id: string } }>(response)).item.id).toBe(idC);
     });
 
     test("accepts the abbreviation the CLI prints", async () => {
@@ -65,7 +70,7 @@ describeIfDb("api", () => {
       // `tsuzuri show` returned 404, so the two commands did not compose.
       const response = await get(`/items/${idC.slice(0, 8)}`);
       expect(response.status).toBe(200);
-      expect((await response.json()).item.id).toBe(idC);
+      expect((await json<{ item: { id: string } }>(response)).item.id).toBe(idC);
     });
 
     test("refuses an ambiguous prefix instead of guessing", async () => {
@@ -73,7 +78,7 @@ describeIfDb("api", () => {
       // marking it read would hide the wrong one.
       const response = await get(`/items/${idA.slice(0, 8)}`);
       expect(response.status).toBe(400);
-      expect((await response.json()).error).toMatch(/more than one/);
+      expect((await json<{ error: string }>(response)).error).toMatch(/more than one/);
     });
 
     test("refuses an abbreviation shorter than the one displayed", async () => {
@@ -98,7 +103,7 @@ describeIfDb("api", () => {
         }),
       );
       expect(response.status).toBe(200);
-      expect((await response.json()).state.itemId).toBe(idC);
+      expect((await json<{ state: { itemId: string } }>(response)).state.itemId).toBe(idC);
     });
   });
 
@@ -106,10 +111,12 @@ describeIfDb("api", () => {
     test("reports text-only mode and why, with no model configured", async () => {
       // An empty list cannot distinguish "nothing matched" from "half the
       // search was switched off", so the response has to say.
-      const body = await (await get("/search?q=Rust")).json();
+      const body = await json<{ mode: string; reason: string; results: { id: string }[] }>(
+        await get("/search?q=Rust"),
+      );
       expect(body.mode).toBe("text-only");
       expect(body.reason).toMatch(/no embedding model is configured/);
-      expect(body.results.map((r: { id: string }) => r.id)).toContain(idC);
+      expect(body.results.map((r) => r.id)).toContain(idC);
     });
 
     test("rejects a since it cannot read rather than ignoring it", async () => {
