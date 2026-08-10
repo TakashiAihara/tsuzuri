@@ -1,6 +1,8 @@
+import { searchTerms } from "@tsuzuri/core";
 import {
   type Database,
   DEFAULT_USER_ID,
+  hybridSearch,
   itemSources,
   itemState,
   items,
@@ -9,6 +11,7 @@ import {
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import PQueue from "p-queue";
+import type postgres from "postgres";
 import { z } from "zod";
 
 import type { Config } from "./config.ts";
@@ -16,6 +19,7 @@ import type { EmbeddingService } from "./enrich/embeddings.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
 import { parseOpml } from "./opml.ts";
+import { parseSince } from "./search-params.ts";
 
 /**
  * The daemon's JSON API.
@@ -27,6 +31,8 @@ import { parseOpml } from "./opml.ts";
 
 export type ApiDeps = {
   db: Database;
+  /** Raw driver handle. Search is written in SQL that Drizzle cannot express. */
+  sql: postgres.Sql;
   fetcher: Fetcher;
   config: Config;
   embeddings: EmbeddingService;
@@ -39,6 +45,14 @@ const addSourceSchema = z.object({
   fetchIntervalSeconds: z.number().int().min(60).optional(),
 });
 
+/**
+ * Shortest abbreviation accepted for an item id.
+ *
+ * Eight is what the CLI prints, so anything it shows can be pasted back. Below
+ * that, collisions stop being theoretical.
+ */
+const MIN_ID_PREFIX = 8;
+
 const listItemsSchema = z.object({
   unread: z.stringbool().default(true),
   limit: z.coerce.number().int().min(1).max(500).default(50),
@@ -46,7 +60,8 @@ const listItemsSchema = z.object({
 });
 
 export function createApi(deps: ApiDeps) {
-  const { db, fetcher, config, embeddings } = deps;
+  // Aliased: `sql` in this file is Drizzle's template tag, imported above.
+  const { db, sql: rawSql, fetcher, config, embeddings } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -180,11 +195,47 @@ export function createApi(deps: ApiDeps) {
     return c.json({ items: rows });
   });
 
-  app.get("/items/:id", async (c) => {
-    const [row] = await db
-      .select()
+  /**
+   * Resolve an item id that may have been abbreviated.
+   *
+   * Item ids are 64 hex characters, which nothing displays in full: the CLI
+   * prints the first eight, and an agent pays for every one it repeats. Without
+   * this, `tsuzuri read` and `tsuzuri show` did not compose at all -- the id you
+   * were shown was not an id the next command accepted.
+   *
+   * Ambiguity is an error rather than a guess. Two articles sharing a prefix is
+   * vanishingly unlikely at this length, but resolving to whichever one sorted
+   * first would silently show the wrong article, and marking it read would
+   * silently hide the wrong one.
+   */
+  async function resolveItemId(
+    idOrPrefix: string,
+  ): Promise<{ id: string } | { error: string; status: 404 | 400 }> {
+    const candidate = idOrPrefix.trim().toLowerCase();
+    if (!/^[0-9a-f]+$/.test(candidate)) return { error: "not found", status: 404 };
+    if (candidate.length === 64) return { id: candidate };
+    if (candidate.length < MIN_ID_PREFIX) {
+      return { error: `id prefix must be at least ${MIN_ID_PREFIX} characters`, status: 400 };
+    }
+
+    const matches = await db
+      .select({ id: items.id })
       .from(items)
-      .where(eq(items.id, c.req.param("id")));
+      .where(sql`${items.id} LIKE ${`${candidate}%`}`)
+      .limit(2);
+
+    if (matches.length === 0) return { error: "not found", status: 404 };
+    if (matches.length > 1) {
+      return { error: `id prefix "${candidate}" matches more than one item`, status: 400 };
+    }
+    return { id: (matches[0] as { id: string }).id };
+  }
+
+  app.get("/items/:id", async (c) => {
+    const resolved = await resolveItemId(c.req.param("id"));
+    if ("error" in resolved) return c.json({ error: resolved.error }, resolved.status);
+
+    const [row] = await db.select().from(items).where(eq(items.id, resolved.id));
     if (!row) return c.json({ error: "not found" }, 404);
     return c.json({ item: row });
   });
@@ -200,6 +251,9 @@ export function createApi(deps: ApiDeps) {
       .safeParse(await c.req.json());
     if (!body.success) return c.json({ error: z.treeifyError(body.error) }, 400);
 
+    const resolved = await resolveItemId(c.req.param("id"));
+    if ("error" in resolved) return c.json({ error: resolved.error }, resolved.status);
+
     const now = new Date();
     const patch: Record<string, Date | null> = {};
     if (body.data.read !== undefined) patch.readAt = body.data.read ? now : null;
@@ -208,7 +262,7 @@ export function createApi(deps: ApiDeps) {
 
     const [row] = await db
       .insert(itemState)
-      .values({ userId: DEFAULT_USER_ID, itemId: c.req.param("id"), ...patch })
+      .values({ userId: DEFAULT_USER_ID, itemId: resolved.id, ...patch })
       .onConflictDoUpdate({
         target: [itemState.userId, itemState.itemId],
         set: { ...patch, updatedAt: now },
@@ -216,6 +270,54 @@ export function createApi(deps: ApiDeps) {
       .returning();
 
     return c.json({ state: row });
+  });
+
+  const searchSchema = z.object({
+    q: z.string().min(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+    since: z.string().optional(),
+    sourceId: z.uuid().optional(),
+    unreadOnly: z.stringbool().default(false),
+  });
+
+  /**
+   * Hybrid search.
+   *
+   * Answers with a `mode` because degrading is normal here rather than
+   * exceptional: an install with no embedding model is a supported
+   * configuration, not a broken one. A caller cannot tell "nothing matched"
+   * from "half the search was switched off" by looking at an empty list, so the
+   * response says which, and why.
+   */
+  app.get("/search", async (c) => {
+    const parsed = searchSchema.safeParse(c.req.query());
+    if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
+
+    let since: Date | null;
+    try {
+      since = parseSince(parsed.data.since);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+
+    const embedded = await embeddings.embedQuery(parsed.data.q);
+
+    const result = await hybridSearch(rawSql, {
+      terms: searchTerms(parsed.data.q),
+      queryVector: embedded.status === "ok" ? embedded.vector : null,
+      limit: parsed.data.limit,
+      since,
+      sourceId: parsed.data.sourceId ?? null,
+      unreadOnly: parsed.data.unreadOnly,
+      userId: DEFAULT_USER_ID,
+      maxDistance: config.SEARCH_MAX_DISTANCE,
+    });
+
+    return c.json({
+      mode: result.mode,
+      ...(embedded.status === "unavailable" ? { reason: embedded.reason } : {}),
+      results: result.hits,
+    });
   });
 
   app.get("/embeddings/status", async (c) => c.json(await embeddings.status()));

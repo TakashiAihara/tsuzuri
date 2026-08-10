@@ -77,7 +77,7 @@ try {
   console.error("embeddings could not be started:", error);
 }
 
-const app = createApi({ db, fetcher, config, embeddings });
+const app = createApi({ db, sql, fetcher, config, embeddings });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);

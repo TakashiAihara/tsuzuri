@@ -51,6 +51,7 @@ tsuzuri feed add https://news.ycombinator.com/rss
 tsuzuri feed import subscriptions.opml   # from Inoreader, Feedly, …
 tsuzuri fetch --all
 tsuzuri read
+tsuzuri search "機械学習"                   # works without any AI configured
 tsuzuri show <id>
 tsuzuri mark <id>
 tsuzuri doctor                            # what is enabled, what is not
@@ -73,8 +74,30 @@ All settings are environment variables. Only `DATABASE_URL` is required.
 | `FETCH_CONCURRENCY` | `20` | Feeds fetched at once |
 | `DEFAULT_FETCH_INTERVAL_SECONDS` | `3600` | Polling interval for new subscriptions |
 | `DEGRADE_AFTER_FAILURES` | `5` | Consecutive failures before a source is marked degraded |
+| `SEARCH_MAX_DISTANCE` | `0.6` | Cosine distance beyond which a vector match is not a result |
 
 The CLI reads `TSUZURI_ENDPOINT` (default `http://127.0.0.1:8787`), so it works against a daemon on another machine.
+
+### Search
+
+`tsuzuri search <query>` runs one query through two retrievers and fuses the results.
+
+- PGroonga finds the exact string, which is what proper nouns and product names need, and what makes `機械学習` match inside `機械学習の論文まとめ`.
+- pgvector finds articles that mean the same thing without sharing a word.
+
+Neither is a fallback for the other: vector similarity buries exact names among their conceptual neighbours, and term matching misses paraphrase entirely. The two are combined by Reciprocal Rank Fusion, which ranks by agreement between them rather than by scores that are not comparable.
+
+With no embedding model configured, search runs on PGroonga alone and says so — the response carries a `mode` of `text-only` and the reason, so an empty result is never mistaken for a disabled half.
+
+```bash
+tsuzuri search "Next.js 16" --since 7d --unread
+tsuzuri search 機械学習 --json          # includes per-arm ranks and the fused score
+```
+
+Two adjustments exist because of how the underlying tools behave, and both are visible in `--json` output:
+
+- PGroonga scores raw term frequency, with no length normalisation, so a long article mentioning a term once would otherwise outrank a short article about it. Scores are divided by the square root of the document length.
+- The vector side returns its nearest matches however far away they are, so a query that few documents match textually would fill its results with whatever exists. `SEARCH_MAX_DISTANCE` bounds it.
 
 ### Embeddings
 

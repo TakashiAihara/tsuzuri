@@ -1,4 +1,9 @@
-import { createEmbeddingProvider, type EmbeddingProvider, probeDimensions } from "@tsuzuri/core";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+  probeDimensions,
+  toVectorLiteral,
+} from "@tsuzuri/core";
 import {
   createEmbeddingIndex,
   type EmbeddingCounts,
@@ -44,6 +49,18 @@ export type EmbeddingStatus = {
   counts: EmbeddingCounts;
 };
 
+/**
+ * A query embedded for search, or the reason it could not be.
+ *
+ * The reason is carried rather than collapsed to null because /search has to
+ * tell a caller why it degraded. "No results" and "no results, and half the
+ * search was switched off" are different answers, and a caller cannot tell them
+ * apart from an empty list.
+ */
+export type QueryEmbedding =
+  | { status: "ok"; vector: string }
+  | { status: "unavailable"; reason: string };
+
 export type EmbeddingService = {
   /** Resolve state, initialising on first enablement, and start the worker if ready. */
   start: () => Promise<void>;
@@ -51,6 +68,8 @@ export type EmbeddingService = {
   status: () => Promise<EmbeddingStatus>;
   /** The provider, only when vectors may actually be produced or queried. */
   activeProvider: () => { provider: EmbeddingProvider; dimensions: number } | null;
+  /** Embed a search query, or explain why the vector arm cannot run. */
+  embedQuery: (text: string) => Promise<QueryEmbedding>;
   reindex: (options: { model: string }) => Promise<void>;
 };
 
@@ -151,6 +170,36 @@ export function createEmbeddingService(deps: {
     activeProvider() {
       if (state.status !== "ready" || !provider || dimensions === null) return null;
       return { provider, dimensions };
+    },
+
+    async embedQuery(text) {
+      if (state.status === "disabled") {
+        return { status: "unavailable", reason: "no embedding model is configured" };
+      }
+      if (state.status === "mismatch") {
+        return { status: "unavailable", reason: describeMismatch(state) };
+      }
+      if (state.status !== "ready" || !provider) {
+        return { status: "unavailable", reason: "embeddings are still initialising" };
+      }
+
+      try {
+        const [vector] = await provider.embed([text]);
+        if (!vector) {
+          return { status: "unavailable", reason: "the provider returned no vector" };
+        }
+        return { status: "ok", vector: toVectorLiteral(vector) };
+      } catch (error) {
+        // A provider that is down degrades search to full text rather than
+        // failing it. Losing paraphrase matching is worse than nothing, and
+        // nothing is what returning an error would give.
+        return {
+          status: "unavailable",
+          reason: `the embedding provider could not be reached: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
     },
 
     async status() {
