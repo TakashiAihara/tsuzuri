@@ -29,6 +29,14 @@ describe("parseSince", () => {
     expect(parseSince("2026-08-01", now)?.toISOString()).toBe("2026-08-01T00:00:00.000Z");
   });
 
+  test("refuses a duration too large to be a date", () => {
+    // Enough digits parse to Infinity, which makes an invalid Date. Returned,
+    // it survives this function and fails later where toISOString() throws,
+    // turning a bad input into a 500 instead of the 400 it is.
+    expect(() => parseSince(`${"9".repeat(400)}d`, now)).toThrow(/could not read/);
+    expect(() => parseSince("99999999999999999999d", now)).toThrow(/could not read/);
+  });
+
   test("refuses something it cannot read rather than silently widening the search", () => {
     // Falling back to null here would quietly turn "last week" into "all of
     // history", which is the opposite of what was asked for.

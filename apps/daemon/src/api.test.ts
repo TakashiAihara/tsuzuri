@@ -94,6 +94,22 @@ describeIfDb("api", () => {
       expect((await get("/items/'; DROP TABLE items; --")).status).toBe(404);
     });
 
+    test("a full-length id that does not exist is 404, not a foreign key violation", async () => {
+      // The state route inserts against this id, so trusting the length would
+      // turn a missing article into a 500.
+      const missing = `dead${"9".repeat(60)}`;
+      expect((await get(`/items/${missing}`)).status).toBe(404);
+
+      const response = await app.fetch(
+        new Request(`http://test/items/${missing}/state`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ read: true }),
+        }),
+      );
+      expect(response.status).toBe(404);
+    });
+
     test("state updates resolve the same way", async () => {
       const response = await app.fetch(
         new Request(`http://test/items/${idC.slice(0, 8)}/state`, {

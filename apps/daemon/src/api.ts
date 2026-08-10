@@ -213,15 +213,22 @@ export function createApi(deps: ApiDeps) {
   ): Promise<{ id: string } | { error: string; status: 404 | 400 }> {
     const candidate = idOrPrefix.trim().toLowerCase();
     if (!/^[0-9a-f]+$/.test(candidate)) return { error: "not found", status: 404 };
-    if (candidate.length === 64) return { id: candidate };
     if (candidate.length < MIN_ID_PREFIX) {
       return { error: `id prefix must be at least ${MIN_ID_PREFIX} characters`, status: 400 };
     }
 
+    // A full-length id is checked for existence too, rather than trusted. It
+    // reads fine on GET, which looks the row up anyway, but a state update
+    // would take it straight to an insert and turn a missing article into a
+    // foreign key violation -- a 500 where the answer is 404.
     const matches = await db
       .select({ id: items.id })
       .from(items)
-      .where(sql`${items.id} LIKE ${`${candidate}%`}`)
+      .where(
+        candidate.length === 64
+          ? eq(items.id, candidate)
+          : sql`${items.id} LIKE ${`${candidate}%`}`,
+      )
       .limit(2);
 
     if (matches.length === 0) return { error: "not found", status: 404 };
