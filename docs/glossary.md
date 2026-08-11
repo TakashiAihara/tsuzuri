@@ -88,6 +88,7 @@ Phase P3. Defined here so the terms are fixed before anything implements them.
 
 ## Interfaces
 
+- API contract is the set of Zod schemas in `packages/api` describing the daemon's JSON responses. Clients take their types from it; the daemon is tested against it. It is not a third source of truth precisely because of that test — without it the schemas would drift from the handlers as freely as the hand-written copies they replaced.
 - daemon is the only writer. Every interface is a client of its JSON API, which is what stops one of them growing behaviour the others lack.
 - CLI, web UI and MCP server are those clients. The web UI is P4.
 - MCP server is the agent-facing interface. It is designed rather than transliterated from the CLI, because an agent's useful granularity is not a human's.

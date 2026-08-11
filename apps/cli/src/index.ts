@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { readFile } from "node:fs/promises";
+import type { EmbeddingStatus, Item, ItemSummary, SearchResponse, Source } from "@tsuzuri/api";
 import { snippetToText } from "@tsuzuri/core";
 import { Command } from "commander";
 
@@ -85,7 +86,7 @@ feed
   .option("--title <title>", "override the title")
   .action(async (url: string, opts: { title?: string }) => {
     const body = JSON.stringify({ url, ...(opts.title ? { title: opts.title } : {}) });
-    const result = await call<{ source: { id: string; url: string } }>(globals(), "/sources", {
+    const result = await call<{ source: Source }>(globals(), "/sources", {
       method: "POST",
       raw: body,
     });
@@ -98,15 +99,7 @@ feed
   .command("list")
   .description("list subscriptions")
   .action(async () => {
-    type Row = {
-      id: string;
-      url: string;
-      title: string | null;
-      status: string;
-      lastSuccessAt: string | null;
-      consecutiveFailures: number;
-    };
-    const { sources } = await call<{ sources: Row[] }>(globals(), "/sources");
+    const { sources } = await call<{ sources: Source[] }>(globals(), "/sources");
     if (globals().json) return printJson(sources);
     if (sources.length === 0) return log("no subscriptions yet");
     for (const source of sources) {
@@ -162,10 +155,9 @@ program
   .option("--source <id>", "restrict to one subscription")
   .option("--all", "include items already read")
   .action(async (opts: { limit: string; source?: string; all?: boolean }) => {
-    type Row = { id: string; title: string | null; url: string; publishedAt: string };
     const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
     if (opts.source) params.set("sourceId", opts.source);
-    const { items } = await call<{ items: Row[] }>(globals(), `/items?${params}`);
+    const { items } = await call<{ items: ItemSummary[] }>(globals(), `/items?${params}`);
     if (globals().json) return printJson(items);
     if (items.length === 0) return log("nothing unread");
     for (const item of items) {
@@ -187,23 +179,12 @@ program
       query: string[],
       opts: { limit: string; since?: string; source?: string; unread?: boolean },
     ) => {
-      type Result = {
-        id: string;
-        title: string | null;
-        url: string;
-        publishedAt: string;
-        snippet: string | null;
-        score?: unknown;
-      };
       const params = new URLSearchParams({ q: query.join(" "), limit: opts.limit });
       if (opts.since) params.set("since", opts.since);
       if (opts.source) params.set("sourceId", opts.source);
       if (opts.unread) params.set("unreadOnly", "true");
 
-      const response = await call<{ mode: string; reason?: string; results: Result[] }>(
-        globals(),
-        `/search?${params}`,
-      );
+      const response = await call<SearchResponse>(globals(), `/search?${params}`);
       if (globals().json) return printJson(response);
 
       // Say when half the search was switched off. An empty list otherwise
@@ -230,16 +211,6 @@ program
   .command("show <id>")
   .description("print one item")
   .action(async (id: string) => {
-    type Item = {
-      id: string;
-      title: string | null;
-      url: string;
-      author: string | null;
-      publishedAt: string;
-      contentHtml: string | null;
-      summary: string | null;
-      searchText: string;
-    };
     const { item } = await call<{ item: Item }>(globals(), `/items/${id}`);
     if (globals().json) return printJson(item);
     out(item.title ?? "(untitled)");
@@ -275,18 +246,6 @@ program
     }
     log(`starred ${ids.length}`);
   });
-
-type EmbeddingStatus = {
-  state: string;
-  provider: string | null;
-  model: string | null;
-  dimensions: number | null;
-  message?: string;
-  indexBuilt: boolean;
-  reindexing: boolean;
-  lastReindexError: string | null;
-  counts: { total: number; embedded: number; pending: number; failed: number };
-};
 
 program
   .command("reindex")

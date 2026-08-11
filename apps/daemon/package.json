@@ -6,13 +6,14 @@
   "license": "MIT",
   "dependencies": {
     "@extractus/feed-extractor": "^8.0.3",
+    "@tsuzuri/api": "workspace:*",
     "@tsuzuri/core": "workspace:*",
     "@tsuzuri/db": "workspace:*",
     "drizzle-orm": "^0.45.2",
+    "fast-xml-parser": "^5.4.0",
     "hono": "^4.13.1",
     "p-queue": "^9.3.3",
     "postgres": "^3.4.9",
-    "zod": "^4.4.3",
-    "fast-xml-parser": "^5.4.0"
+    "zod": "^4.4.3"
   }
 }

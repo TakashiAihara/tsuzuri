@@ -1,3 +1,5 @@
+import type { Item, ItemStatePatch, ItemSummary, SearchResponse, Source } from "@tsuzuri/api";
+
 /**
  * HTTP client for the daemon.
  *
@@ -22,44 +24,9 @@ export class DaemonError extends Error {
   }
 }
 
-export type SearchResult = {
-  mode: "hybrid" | "text-only";
-  reason?: string;
-  results: {
-    id: string;
-    url: string;
-    title: string | null;
-    publishedAt: string;
-    summary: string | null;
-    snippet: string | null;
-    rrf: number;
-    textRank: number | null;
-    vectorRank: number | null;
-  }[];
-};
-
-export type Item = {
-  id: string;
-  url: string;
-  title: string | null;
-  author: string | null;
-  publishedAt: string;
-  publishedAtEstimated: boolean;
-  contentHtml: string | null;
-  summary: string | null;
-  searchText: string;
-};
-
-export type Source = {
-  id: string;
-  url: string;
-  title: string | null;
-  siteUrl: string | null;
-  status: string;
-  consecutiveFailures: number;
-  lastSuccessAt: string | null;
-  lastError: string | null;
-};
+// Re-exported so the server imports its shapes from one place; the definitions
+// live in @tsuzuri/api, which the daemon is tested against.
+export type { Item, SearchResponse as SearchResult, Source } from "@tsuzuri/api";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -125,13 +92,13 @@ export function createClient(options: ClientOptions) {
       since?: string;
       sourceId?: string;
       unreadOnly?: boolean;
-    }): Promise<SearchResult> {
+    }): Promise<SearchResponse> {
       const search = new URLSearchParams({ q: params.query });
       if (params.limit !== undefined) search.set("limit", String(params.limit));
       if (params.since) search.set("since", params.since);
       if (params.sourceId) search.set("sourceId", params.sourceId);
       if (params.unreadOnly) search.set("unreadOnly", "true");
-      return call<SearchResult>(`/search?${search}`);
+      return call<SearchResponse>(`/search?${search}`);
     },
 
     getItem(id: string): Promise<{ item: Item }> {
@@ -144,15 +111,7 @@ export function createClient(options: ClientOptions) {
         limit: String(params.limit ?? 20),
       });
       if (params.sourceId) search.set("sourceId", params.sourceId);
-      return call<{
-        items: {
-          id: string;
-          url: string;
-          title: string | null;
-          publishedAt: string;
-          summary: string | null;
-        }[];
-      }>(`/items?${search}`);
+      return call<{ items: ItemSummary[] }>(`/items?${search}`);
     },
 
     listSources(): Promise<{ sources: Source[] }> {
