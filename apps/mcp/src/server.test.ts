@@ -105,7 +105,7 @@ describe("search_articles", () => {
             title: "Rust 1.90 released",
             publishedAt: "2026-08-09T00:00:00.000Z",
             summary: "A summary",
-            snippet: 'Rust <span class="keyword">1.90</span> released',
+            snippet: 'Tom &amp; Rust <span class="keyword">1.90</span> released',
             rrf: 0.0323,
             textRank: 1,
             vectorRank: 1,
@@ -149,14 +149,16 @@ describe("search_articles", () => {
     expect(ID.startsWith(structured.results[0]?.id as string)).toBe(true);
   });
 
-  test("strips highlight markup, which is for a browser", async () => {
+  test("strips highlight markup and undoes the escaping under it", async () => {
     const client = await connect();
     const result = await client.callTool({
       name: "search_articles",
       arguments: { query: "Rust" },
     });
     const structured = result.structuredContent as { results: { snippet: string }[] };
-    expect(structured.results[0]?.snippet).toBe("Rust 1.90 released");
+    // pgroonga escapes the text before wrapping matches, so an ampersand in a
+    // title would otherwise reach the agent as "&amp;".
+    expect(structured.results[0]?.snippet).toBe("Tom & Rust 1.90 released");
   });
 
   test("passes filters through to the daemon", async () => {
