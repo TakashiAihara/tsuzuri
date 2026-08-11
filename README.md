@@ -170,7 +170,7 @@ Point a host at it. For Claude Code:
 
 Recent unread is also exposed as the resource `tsuzuri://unread/recent`, so a host can put current articles in context without spending a tool call.
 
-**List responses never carry article text.** Search results return id, title, summary and score; the `tsuzuri://unread/recent` resource returns id, title, URL, publication time and summary. Neither carries a body — that costs a deliberate `get_article`. A broad query would otherwise spend the context window before the agent had decided what was worth reading.
+**List responses never carry article text.** Search results carry id, title, summary, score, URL, publication time and a short match snippet; the `tsuzuri://unread/recent` resource carries id, title, URL, publication time and summary. Neither carries a body — that costs a deliberate `get_article`. A broad query would otherwise spend the context window before the agent had decided what was worth reading. Everything in a list response is there because an agent needs it to choose what to read next.
 
 **Article text is untrusted.** Titles, summaries, snippets and bodies come from the open web, and this project treats feeds as hostile input everywhere else too. The server says so in its instructions and in the description of every tool that returns article text, so a host's model is told to report what an article says rather than act on it. That is a declared trust boundary, not a guarantee: an agent with write tools is exposed to indirect prompt injection through any content it reads, so require confirmation for `mark_read`, `star` and `add_source` if your host supports it. The tools carry the MCP annotations (`readOnlyHint`, `destructiveHint`) that let a host make that distinction.
 
