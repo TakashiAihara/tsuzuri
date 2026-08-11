@@ -19,6 +19,7 @@ const fetcher = createFetcher({
   userAgent: config.USER_AGENT,
   timeoutMs: config.FETCH_TIMEOUT_MS,
   hostMinIntervalMs: config.HOST_MIN_INTERVAL_MS,
+  allowPrivateTargets: config.FETCH_ALLOW_PRIVATE_TARGETS,
 });
 
 /**
