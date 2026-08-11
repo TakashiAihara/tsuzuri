@@ -12,30 +12,36 @@
  */
 
 const NAMED_ENTITIES: Record<string, string> = {
-  "&amp;": "&",
-  "&lt;": "<",
-  "&gt;": ">",
-  "&quot;": '"',
-  "&#39;": "'",
-  "&apos;": "'",
-  "&nbsp;": " ",
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
 };
+
+/** Named or numeric, matched together so each is decoded exactly once. */
+const ENTITY = /&(#\d{1,7}|[a-zA-Z]+);/g;
 
 /**
  * Strip highlight markup and undo HTML escaping, collapsing whitespace.
  *
- * `&amp;` is decoded last by construction: the named replacement runs in one
- * pass over the original string, so `&amp;lt;` becomes `&lt;` rather than `<`.
- * Decoding twice would let escaped text masquerade as markup.
+ * One pass over the input, deliberately. Decoding named and numeric entities in
+ * separate passes decodes some text twice: `&amp;#60;` is an article that
+ * literally contains `&#60;`, and a named pass followed by a numeric one turns
+ * it into `<` -- changing what the source said, and letting escaped text
+ * masquerade as markup. Scanning once leaves the tail of a match as plain text.
  */
 export function snippetToText(html: string | null | undefined): string {
   if (!html) return "";
   return html
     .replace(/<[^>]+>/g, "")
-    .replace(/&(?:amp|lt|gt|quot|apos|nbsp|#39);/g, (entity) => NAMED_ENTITIES[entity] ?? entity)
-    .replace(/&#(\d{1,7});/g, (match, code: string) => {
-      const point = Number(code);
-      return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : match;
+    .replace(ENTITY, (match, body: string) => {
+      if (body.startsWith("#")) {
+        const point = Number(body.slice(1));
+        return point > 0 && point <= 0x10ffff ? String.fromCodePoint(point) : match;
+      }
+      return NAMED_ENTITIES[body.toLowerCase()] ?? match;
     })
     .replace(/\s+/g, " ")
     .trim();

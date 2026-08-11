@@ -23,9 +23,12 @@ describe("snippetToText", () => {
   });
 
   test("does not decode twice, so escaped text cannot become markup", () => {
-    // "&amp;lt;" is an article that literally contains "&lt;". A second pass
-    // would turn it into "<" and misrepresent the source.
+    // Each of these is an article that literally contains the inner entity.
+    // Decoding named and numeric forms in separate passes turns the second one
+    // into "<", changing what the source said.
     expect(snippetToText("&amp;lt;")).toBe("&lt;");
+    expect(snippetToText("&amp;#60;")).toBe("&#60;");
+    expect(snippetToText("&amp;amp;")).toBe("&amp;");
   });
 
   test("leaves an unknown entity alone rather than mangling it", () => {
