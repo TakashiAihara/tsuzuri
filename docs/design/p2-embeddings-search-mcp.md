@@ -25,7 +25,7 @@ These are settled and not reopened here:
 - AI is opt-in. The default embedding model is unset, and the reader works fully with no model configured.
 - PGroonga is a hard dependency; managed PostgreSQL is unsupported.
 - pgvector fixes the vector dimension in the column definition, so an instance has exactly one active embedding model, and changing it means re-embedding.
-- MCP list responses return id, title, summary and score, never full text.
+- MCP list responses never carry article text. See D12 for the exact field set and why it is wider than the original shorthand.
 - MIT licence, English documentation.
 
 ## Measured facts driving the design
@@ -315,7 +315,9 @@ Stdio only for now. The SDK's streamable HTTP transport is a later addition and 
 | `star` | `ids[]`, `starred` | Per-id result |
 | `add_source` | `url`, `title?` | The created subscription |
 
-Every list tool returns id, title, summary and score, never body text. Full text costs a deliberate `get_article` call. This is the point of the MCP surface being designed rather than generated from the CLI: a broad query that returned bodies would spend the agent's context before it had decided what was worth reading.
+No list tool returns body text. Full text costs a deliberate `get_article` call. This is the point of the MCP surface being designed rather than generated from the CLI: a broad query that returned bodies would spend the agent's context before it had decided what was worth reading.
+
+`search_articles` returns id, title, summary, score, url, published time and a match snippet. The last three are beyond the original shorthand of "id, title, summary and score" and are there deliberately — see D12.
 
 Tools declare `outputSchema` and return `structuredContent` alongside a text rendering, which the SDK requires once an output schema is present.
 
@@ -382,3 +384,4 @@ Settled 2026-08-10.
 | D9 | `get_article` needs HTML-to-markdown for `format: markdown` | Add `turndown`. Markdown is what agents consume best |
 | D10 | `tsuzuri read` prints an 8-character id prefix that `tsuzuri show` rejects, so the two do not compose | Accept a unique prefix. Carried as a separate commit, since it is a P1 bug rather than P2 scope |
 | D11 | Issue #3 lists a `digest` tool, but clustering and summarisation are both P3 | Move it to P3. A P2 version would group by source and change its grouping later, publishing an agent-facing contract that does not match its name. Recorded as a comment on issue #3 |
+| D12 | The stated contract for list responses was "id, title, summary and score", and `search_articles` also returns url, published time and a snippet | Keep the wider set; the constraint is that list responses carry no article *text*, and the enumeration was shorthand for that. Dropping the published time would break this phase's own acceptance criterion — an agent cannot answer "what happened last week" without dates — and dropping the url removes the only way to reach an article without a second call. The snippet is bounded at roughly 160 characters. Confirmed with the author 2026-08-11 |
