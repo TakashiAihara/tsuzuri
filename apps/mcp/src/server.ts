@@ -109,9 +109,10 @@ export function createMcpServer(client: DaemonClient): McpServer {
         query: z.string().min(1).describe("What to search for. Plain words, not a query language."),
         since: z
           .string()
+          .min(1)
           .optional()
           .describe("Only articles newer than this: a duration like '7d' or an ISO date."),
-        sourceId: z.string().optional().describe("Restrict to one subscription."),
+        sourceId: z.string().min(1).optional().describe("Restrict to one subscription."),
         unreadOnly: z.boolean().optional().describe("Exclude articles already read."),
         limit: z.number().int().min(1).max(100).optional().describe("Default 20."),
       },
@@ -245,6 +246,11 @@ export function createMcpServer(client: DaemonClient): McpServer {
     patch: { read?: boolean; starred?: boolean },
   ): Promise<{ updated: { id: string; ok: boolean; error?: string }[] }> {
     const deadline = Date.now() + STATE_DEADLINE_MS;
+    // Carried into the request itself, not just checked between them. A request
+    // starting a moment before the deadline would otherwise run for the
+    // client's full timeout past it, and the per-id results would claim
+    // something the daemon was still deciding.
+    const signal = AbortSignal.timeout(STATE_DEADLINE_MS);
     const updated = [];
 
     for (const id of ids) {
@@ -261,7 +267,7 @@ export function createMcpServer(client: DaemonClient): McpServer {
       }
 
       try {
-        await client.setItemState(id, patch);
+        await client.setItemState(id, patch, signal);
         updated.push({ id: shortId(id), ok: true });
       } catch (error) {
         updated.push({

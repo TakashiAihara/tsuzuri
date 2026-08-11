@@ -67,7 +67,7 @@ export function createClient(options: ClientOptions) {
   const endpoint = options.endpoint.replace(/\/+$/, "");
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  async function call<T>(path: string, init?: RequestInit & { signal?: AbortSignal }): Promise<T> {
     let response: Response;
     try {
       response = await fetch(`${endpoint}${path}`, {
@@ -76,7 +76,11 @@ export function createClient(options: ClientOptions) {
           ...(init?.body ? { "content-type": "application/json" } : {}),
           ...init?.headers,
         },
-        signal: AbortSignal.timeout(timeoutMs),
+        // The caller's deadline, when it has one, on top of the per-request
+        // timeout -- a batch of updates has a budget of its own.
+        signal: init?.signal
+          ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       throw new DaemonError(
@@ -162,10 +166,11 @@ export function createClient(options: ClientOptions) {
       });
     },
 
-    setItemState(id: string, patch: { read?: boolean; starred?: boolean }) {
+    setItemState(id: string, patch: { read?: boolean; starred?: boolean }, signal?: AbortSignal) {
       return call<{ state: unknown }>(`/items/${encodeURIComponent(id)}/state`, {
         method: "POST",
         body: JSON.stringify(patch),
+        ...(signal ? { signal } : {}),
       });
     },
   };
