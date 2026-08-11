@@ -18,12 +18,19 @@ import { z } from "zod";
  *
  * Schemas rather than types because the checking has to happen at runtime to be
  * worth anything; the types are inferred from them.
+ *
+ * Closed shapes use strictObject, not object. Zod's object() strips unknown
+ * keys and succeeds, so the contract test would catch a field that disappeared
+ * and miss one that appeared -- including a handler that started returning an
+ * article's body in a listing, which is the one thing the MCP surface promises
+ * not to do. Genuinely open values (a source's config, an error payload, ingest
+ * outcomes) stay permissive on purpose.
  */
 
 export const sourceStatusSchema = z.enum(["active", "degraded", "unsupported", "disabled"]);
 
 /** One subscription, as the API renders it. */
-export const sourceSchema = z.object({
+export const sourceSchema = z.strictObject({
   id: z.string(),
   userId: z.string(),
   kind: z.enum(["feed", "external", "rule", "plugin"]),
@@ -47,7 +54,7 @@ export const sourceSchema = z.object({
 export type Source = z.infer<typeof sourceSchema>;
 
 /** An item in a listing: no body, because listings are read in bulk. */
-export const itemSummarySchema = z.object({
+export const itemSummarySchema = z.strictObject({
   id: z.string(),
   url: z.string(),
   title: z.string().nullable(),
@@ -61,7 +68,7 @@ export const itemSummarySchema = z.object({
 export type ItemSummary = z.infer<typeof itemSummarySchema>;
 
 /** One article in full. */
-export const itemSchema = z.object({
+export const itemSchema = z.strictObject({
   id: z.string(),
   url: z.string(),
   canonicalUrl: z.string(),
@@ -79,7 +86,7 @@ export const itemSchema = z.object({
 });
 export type Item = z.infer<typeof itemSchema>;
 
-export const itemStateSchema = z.object({
+export const itemStateSchema = z.strictObject({
   userId: z.string(),
   itemId: z.string(),
   readAt: z.string().nullable(),
@@ -98,7 +105,7 @@ export type ItemState = z.infer<typeof itemStateSchema>;
  * cannot be tuned. `vectorRank` is null when the vector arm did not run or did
  * not reach this item.
  */
-export const searchHitSchema = z.object({
+export const searchHitSchema = z.strictObject({
   id: z.string(),
   url: z.string(),
   title: z.string().nullable(),
@@ -117,21 +124,21 @@ export type SearchHit = z.infer<typeof searchHitSchema>;
  * An empty result set cannot distinguish "nothing matched" from "half the
  * search was switched off", so the response says which.
  */
-export const searchResponseSchema = z.object({
+export const searchResponseSchema = z.strictObject({
   mode: z.enum(["hybrid", "text-only"]),
   reason: z.string().optional(),
   results: z.array(searchHitSchema),
 });
 export type SearchResponse = z.infer<typeof searchResponseSchema>;
 
-export const embeddingCountsSchema = z.object({
+export const embeddingCountsSchema = z.strictObject({
   total: z.number(),
   embedded: z.number(),
   pending: z.number(),
   failed: z.number(),
 });
 
-export const embeddingStatusSchema = z.object({
+export const embeddingStatusSchema = z.strictObject({
   state: z.enum(["disabled", "uninitialised", "ready", "mismatch"]),
   provider: z.string().nullable(),
   model: z.string().nullable(),
@@ -144,19 +151,19 @@ export const embeddingStatusSchema = z.object({
 });
 export type EmbeddingStatus = z.infer<typeof embeddingStatusSchema>;
 
-export const sourcesResponseSchema = z.object({ sources: z.array(sourceSchema) });
-export const sourceResponseSchema = z.object({ source: sourceSchema });
-export const itemsResponseSchema = z.object({ items: z.array(itemSummarySchema) });
-export const itemResponseSchema = z.object({ item: itemSchema });
-export const itemStateResponseSchema = z.object({ state: itemStateSchema });
+export const sourcesResponseSchema = z.strictObject({ sources: z.array(sourceSchema) });
+export const sourceResponseSchema = z.strictObject({ source: sourceSchema });
+export const itemsResponseSchema = z.strictObject({ items: z.array(itemSummarySchema) });
+export const itemResponseSchema = z.strictObject({ item: itemSchema });
+export const itemStateResponseSchema = z.strictObject({ state: itemStateSchema });
 
-export const importOpmlResponseSchema = z.object({
+export const importOpmlResponseSchema = z.strictObject({
   imported: z.number(),
   skipped: z.number(),
-  sources: z.array(z.object({ id: z.string(), url: z.string() })),
+  sources: z.array(z.strictObject({ id: z.string(), url: z.string() })),
 });
 
-export const ingestRunResponseSchema = z.object({
+export const ingestRunResponseSchema = z.strictObject({
   polled: z.number(),
   inserted: z.number(),
   failed: z.number(),
@@ -164,7 +171,7 @@ export const ingestRunResponseSchema = z.object({
 });
 
 /** Every error the API returns has this shape, whatever the status. */
-export const errorResponseSchema = z.object({ error: z.unknown() });
+export const errorResponseSchema = z.strictObject({ error: z.unknown() });
 
 export type ItemStatePatch = {
   read?: boolean;

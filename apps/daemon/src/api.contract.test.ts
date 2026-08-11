@@ -26,8 +26,11 @@ import { createEmbeddingService } from "./enrich/embeddings.ts";
  * returned something else. Here the handler runs, and its actual output has to
  * satisfy the schema clients were written against.
  *
- * Strict parsing throughout, so a field the daemon stopped sending fails as
- * loudly as one that changed type.
+ * Strict parsing throughout. Zod's object() strips unknown keys and succeeds, so
+ * with it the test would catch a field that disappeared and miss one that
+ * appeared -- including a listing that started carrying article bodies, which
+ * is the one thing the MCP surface promises not to do. strictObject catches
+ * both directions.
  */
 const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
@@ -37,6 +40,9 @@ describeIfDb("api contract", () => {
   let app: ReturnType<typeof createApi>;
 
   const ITEM_ID = `c0ffee11${"2".repeat(56)}`;
+  // Two ids sharing a prefix, so the ambiguity path is actually reachable.
+  const TWIN_A = `decafbad${"0".repeat(56)}`;
+  const TWIN_B = `decafbad${"1".repeat(56)}`;
 
   beforeAll(async () => {
     handle = createDatabase({ url: DATABASE_URL as string, max: 4 });
@@ -57,6 +63,12 @@ describeIfDb("api contract", () => {
       INSERT INTO item_sources (item_id, source_id)
       VALUES (${ITEM_ID}, '11111111-1111-1111-1111-111111111111')
     `;
+    for (const id of [TWIN_A, TWIN_B]) {
+      await handle.sql`
+        INSERT INTO items (id, url, canonical_url, title, published_at, search_text)
+        VALUES (${id}, ${`https://e.com/${id}`}, ${`https://e.com/${id}`}, 'twin', now(), 'twin')
+      `;
+    }
 
     const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
     const embeddings = createEmbeddingService({ sql: handle.sql, config });
@@ -92,6 +104,8 @@ describeIfDb("api contract", () => {
 
   test("GET /items", async () => {
     const body = await parsed(itemsResponseSchema, "/items?unread=false");
+    // Only the item with a subscription; the twins exist to make a prefix
+    // ambiguous and are not attached to one.
     expect(body.items).toHaveLength(1);
   });
 
@@ -135,14 +149,19 @@ describeIfDb("api contract", () => {
 
   describe("errors", () => {
     // Clients branch on these as much as on success bodies.
-    const cases: { name: string; path: string; init?: RequestInit }[] = [
-      { name: "unknown item", path: "/items/ffffffffffffffff" },
-      { name: "ambiguous id", path: "/items/abc" },
-      { name: "missing query", path: "/search" },
-      { name: "unreadable since", path: "/search?q=x&since=whenever" },
+    const cases: { name: string; path: string; status: number; init?: RequestInit }[] = [
+      { name: "unknown item", path: "/items/ffffffffffffffff", status: 404 },
+      // "abc" used to stand in for this and reached the too-short branch
+      // instead, so the ambiguity handler was never exercised. The expected
+      // status is asserted for the same reason: "not ok" would have passed.
+      { name: "ambiguous id", path: "/items/decafbad", status: 400 },
+      { name: "id prefix too short", path: "/items/abc", status: 400 },
+      { name: "missing query", path: "/search", status: 400 },
+      { name: "unreadable since", path: "/search?q=x&since=whenever", status: 400 },
       {
         name: "refused subscription",
         path: "/sources",
+        status: 400,
         init: {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -151,10 +170,10 @@ describeIfDb("api contract", () => {
       },
     ];
 
-    for (const { name, path, init } of cases) {
+    for (const { name, path, status, init } of cases) {
       test(name, async () => {
         const response = await app.fetch(new Request(`http://test${path}`, init));
-        expect(response.ok).toBe(false);
+        expect(response.status).toBe(status);
         expect(errorResponseSchema.safeParse(await response.json()).success).toBe(true);
       });
     }
