@@ -125,19 +125,25 @@ export async function hybridSearch(
   sql: postgres.Sql,
   options: SearchOptions,
 ): Promise<SearchResult> {
+  const queryVector = options.queryVector ?? null;
+  // Resolved before the empty-query shortcut, so an empty query reports the
+  // same mode a real one would. Deciding it from queryVector alone made the
+  // answer depend on the input: with no vector table, an empty query claimed
+  // "hybrid" and a non-empty one admitted "text-only" on the same install.
+  const useVector = queryVector !== null && (await itemEmbeddingsExists(sql));
+
   const query = await buildQuery(sql, options.terms);
-  if (!query) return { mode: options.queryVector ? "hybrid" : "text-only", hits: [] };
+  if (!query) return { mode: useVector ? "hybrid" : "text-only", hits: [] };
 
   const depth = candidateDepthFor(options);
   const maxDistance = options.maxDistance ?? DEFAULT_MAX_DISTANCE;
   const since = options.since ? options.since.toISOString() : null;
   const sourceId = options.sourceId ?? null;
   const unreadOnly = options.unreadOnly ?? false;
-  const queryVector = options.queryVector ?? null;
 
-  // Narrowed inside the branch rather than through a boolean, so the vector
-  // literal is known to be present where the query interpolates it.
-  if (queryVector !== null && (await itemEmbeddingsExists(sql))) {
+  // Narrowed here rather than relying on useVector, so the vector literal is
+  // known to be present where the query interpolates it.
+  if (useVector && queryVector !== null) {
     const hits = await sql<SearchHit[]>`
         WITH text_arm AS (
           SELECT id, row_number() OVER (ORDER BY score DESC, published_at DESC) AS rank

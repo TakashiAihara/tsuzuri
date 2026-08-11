@@ -280,7 +280,7 @@ export function createApi(deps: ApiDeps) {
   });
 
   const searchSchema = z.object({
-    q: z.string().min(1),
+    q: z.string().trim().min(1),
     limit: z.coerce.number().int().min(1).max(100).default(20),
     since: z.string().optional(),
     sourceId: z.uuid().optional(),

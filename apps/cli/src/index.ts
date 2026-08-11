@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { readFile } from "node:fs/promises";
+import { snippetToText } from "@tsuzuri/core";
 import { Command } from "commander";
 
 /**

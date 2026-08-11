@@ -148,6 +148,12 @@ describeIfDb("api", () => {
       expect((await get("/search")).status).toBe(400);
     });
 
+    test("rejects a query that is only whitespace", async () => {
+      // It would otherwise reach searchTerms, produce no terms, and come back
+      // as an empty result set indistinguishable from a real miss.
+      expect((await get("/search?q=%20%20")).status).toBe(400);
+    });
+
     test("caps the limit", async () => {
       expect((await get("/search?q=Rust&limit=5000")).status).toBe(400);
     });

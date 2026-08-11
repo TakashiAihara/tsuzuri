@@ -31,7 +31,7 @@ describeIfDb("hybridSearch", () => {
       title: "Rust 1.90 released",
       body: "Rust 1.90 is out. The release focuses on the borrow checker.",
       vector: "[1,0,0,0]",
-      published: "2026-08-09",
+      published: "2026-08-09T00:00:00Z",
     },
     {
       id: "long-mentions-rust",
@@ -42,14 +42,14 @@ describeIfDb("hybridSearch", () => {
       // corpus has to be built so the two orderings genuinely disagree.
       body: `${"Assorted notes about deployments, meetings and coffee. ".repeat(40)} We mentioned Rust here. Rust came up again. Someone asked about Rust. Rust once more. Rust.`,
       vector: "[0,1,0,0]",
-      published: "2026-08-08",
+      published: "2026-08-08T00:00:00Z",
     },
     {
       id: "ja-ml",
       title: "機械学習の論文まとめ",
       body: "今週読んだ機械学習の論文をまとめる。自然言語処理の話題が中心。",
       vector: "[0,0,1,0]",
-      published: "2026-08-07",
+      published: "2026-08-07T00:00:00Z",
     },
     {
       id: "ja-dl",
@@ -57,14 +57,14 @@ describeIfDb("hybridSearch", () => {
       // Semantically adjacent to ja-ml but shares no query term with it.
       body: "ニューラルネットワークの基礎を解説する。",
       vector: "[0,0,0.95,0.05]",
-      published: "2026-08-06",
+      published: "2026-08-06T00:00:00Z",
     },
     {
       id: "unrelated",
       title: "Bread recipes",
       body: "How to bake sourdough at home.",
       vector: "[0,0,0,1]",
-      published: "2026-08-05",
+      published: "2026-08-05T00:00:00Z",
     },
   ];
 
@@ -185,12 +185,12 @@ describeIfDb("hybridSearch", () => {
     // exist to catch a plan regression rather than a logic bug.
     const cases: { name: string; options: Record<string, unknown> }[] = [
       { name: "no filters", options: {} },
-      { name: "since", options: { since: new Date("2026-08-01") } },
+      { name: "since", options: { since: new Date("2026-08-01T00:00:00Z") } },
       { name: "sourceId", options: { sourceId: undefined } },
       { name: "unreadOnly", options: { unreadOnly: true } },
       {
         name: "since + unreadOnly",
-        options: { since: new Date("2026-08-01"), unreadOnly: true },
+        options: { since: new Date("2026-08-01T00:00:00Z"), unreadOnly: true },
       },
     ];
 
@@ -215,7 +215,7 @@ describeIfDb("hybridSearch", () => {
     test("since excludes older items", async () => {
       const { hits } = await search({
         terms: ["Rust", "sourdough"],
-        since: new Date("2026-08-09"),
+        since: new Date("2026-08-09T00:00:00Z"),
       });
       expect(hits.map((h) => h.id)).toEqual(["short-rust"]);
     });
@@ -305,6 +305,17 @@ describeIfDb("hybridSearch", () => {
       expect(Object.keys(textOnly.hits[0] ?? {}).sort()).toEqual(
         Object.keys(hybrid.hits[0] ?? {}).sort(),
       );
+    });
+
+    test("reports the same mode whether or not the query has terms", async () => {
+      // mode used to be decided from queryVector alone on the empty path, and
+      // from queryVector plus the table's existence on the real one. With no
+      // vector table an empty query claimed hybrid while a real one admitted
+      // text-only, on the same install.
+      const withTerms = await search({ terms: ["Rust"], queryVector: "[1,0,0,0]" });
+      const withoutTerms = await search({ terms: [], queryVector: "[1,0,0,0]" });
+      expect(withoutTerms.mode).toBe(withTerms.mode);
+      expect(withoutTerms.hits).toEqual([]);
     });
 
     test("respects the limit", async () => {
