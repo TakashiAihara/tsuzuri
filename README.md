@@ -241,6 +241,8 @@ TSUZURI_TEST_DATABASE_URL=postgres://tsuzuri:tsuzuri@localhost:5432/tsuzuri bun 
 
 Migrations are hand-written SQL in `packages/db/migrations`, and `packages/db/src/schema.ts` is a Drizzle mirror of them. `schema.test.ts` runs the SQL and then queries every table through the mirror, so the two cannot drift apart silently.
 
+`packages/api` holds the daemon's JSON API as Zod schemas. The CLI and the MCP server take their response types from there rather than declaring their own, and `apps/daemon/src/api.contract.test.ts` parses the daemon's real responses through the same schemas — so a handler that stops matching fails a test instead of a client at runtime. Shared types without that test would just be a third declaration free to drift.
+
 `docs/glossary.md` fixes the vocabulary this project is written in. Its first section is the useful one: the words that could reasonably mean two things here — cluster, model, score, provider, source — and which meaning gets the qualifier. Worth reading before naming anything.
 
 ## License
