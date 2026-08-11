@@ -190,6 +190,20 @@ describe("search_articles", () => {
     });
   });
 
+  test("rejects an empty filter rather than silently widening the search", async () => {
+    // The client drops empty parameters, so since: "" became "all of history"
+    // and sourceId: "" became "every subscription" -- the opposite of what the
+    // agent asked for, reported as success.
+    const client = await connect();
+    for (const args of [
+      { query: "Rust", since: "" },
+      { query: "Rust", sourceId: "" },
+    ]) {
+      const result = await client.callTool({ name: "search_articles", arguments: args });
+      expect(result.isError).toBe(true);
+    }
+  });
+
   test("rejects an empty query at the schema", async () => {
     const client = await connect();
     const result = await client.callTool({ name: "search_articles", arguments: { query: "" } });
