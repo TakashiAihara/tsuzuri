@@ -17,6 +17,7 @@
         "tsuzuri": "./src/index.ts",
       },
       "dependencies": {
+        "@tsuzuri/core": "workspace:*",
         "commander": "^15.0.0",
       },
     },

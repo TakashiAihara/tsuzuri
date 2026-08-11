@@ -16,6 +16,7 @@ export {
 export { contentHash, itemIdentity, sha256 } from "./hash.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
+export { snippetToText } from "./snippet.ts";
 export {
   defineSource,
   type FetchState,
