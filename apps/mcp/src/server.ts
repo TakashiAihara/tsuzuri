@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { snippetToText } from "@tsuzuri/core";
 import TurndownService from "turndown";
 import { z } from "zod";
 
@@ -135,8 +136,9 @@ export function createMcpServer(client: DaemonClient): McpServer {
           url: hit.url,
           publishedAt: hit.publishedAt,
           summary: hit.summary,
-          // The highlight markup is for a browser; an agent wants the words.
-          snippet: hit.snippet?.replace(/<[^>]+>/g, "") ?? null,
+          // The highlight markup is for a browser, and pgroonga escaped the
+          // text before adding it, so tags and entities both have to go.
+          snippet: hit.snippet ? snippetToText(hit.snippet) : null,
           score: hit.rrf,
         })),
       };
