@@ -1,3 +1,5 @@
+import { checkFetchTarget } from "./fetch-target.ts";
+
 /**
  * The HTTP client every source is given.
  *
@@ -12,7 +14,23 @@ export type FetcherOptions = {
   timeoutMs: number;
   /** Minimum gap between two requests to the same host. */
   hostMinIntervalMs: number;
+  /** Permit loopback and private targets. See checkFetchTarget. */
+  allowPrivateTargets?: boolean;
+  /** Injected by tests, which have to fetch loopback to test anything. */
+  checkTarget?: (url: string) => Promise<{ ok: boolean; reason?: string }>;
+  /** Hops followed before giving up. */
+  maxRedirects?: number;
 };
+
+/** Enough for the usual http-to-https and www hops, short of a loop. */
+const DEFAULT_MAX_REDIRECTS = 5;
+
+export class BlockedTargetError extends Error {
+  constructor(url: string, reason: string) {
+    super(`refusing to fetch ${url}: ${reason}`);
+    this.name = "BlockedTargetError";
+  }
+}
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -37,10 +55,14 @@ export function createFetcher(options: FetcherOptions): Fetcher {
     setTimeout(release, options.hostMinIntervalMs);
   }
 
-  return async function fetcher(url, init) {
-    const host = new URL(url).host;
-    await waitForTurn(host);
+  const checkTarget =
+    options.checkTarget ??
+    ((target: string) =>
+      checkFetchTarget(target, { allowPrivate: options.allowPrivateTargets ?? false }));
 
+  const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
+
+  return async function fetcher(url, init) {
     const headers = new Headers(init?.headers);
     headers.set("user-agent", options.userAgent);
     // Feeds are usually gzip-friendly XML and often large.
@@ -52,9 +74,36 @@ export function createFetcher(options: FetcherOptions): Fetcher {
     }
 
     // Combine our timeout with any caller signal so a shutdown still aborts.
+    // One budget for the whole redirect chain, not per hop.
     const timeout = AbortSignal.timeout(options.timeoutMs);
     const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
 
-    return fetch(url, { ...init, headers, signal, redirect: "follow" });
+    /**
+     * Redirects are followed here rather than by fetch, because every hop is a
+     * new decision about where this daemon will send a request. `redirect:
+     * "follow"` would let a public URL land on a private one with nothing
+     * looking at the destination, which makes the subscribe-time check
+     * decorative.
+     */
+    let target = url;
+    for (let hop = 0; ; hop += 1) {
+      const allowed = await checkTarget(target);
+      if (!allowed.ok) throw new BlockedTargetError(target, allowed.reason ?? "not permitted");
+
+      await waitForTurn(new URL(target).host);
+      const response = await fetch(target, { ...init, headers, signal, redirect: "manual" });
+
+      const location = response.headers.get("location");
+      if (response.status < 300 || response.status >= 400 || !location) return response;
+
+      if (hop >= maxRedirects) {
+        throw new Error(`too many redirects fetching ${url} (stopped at ${target})`);
+      }
+
+      const next = new URL(location, target).toString();
+      // Cancel the body we are not going to read; the next hop gets its own.
+      await response.body?.cancel().catch(() => {});
+      target = next;
+    }
   };
 }

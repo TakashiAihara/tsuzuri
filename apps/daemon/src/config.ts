@@ -36,6 +36,16 @@ const configSchema = z.object({
   DEGRADE_AFTER_FAILURES: z.coerce.number().int().positive().default(5),
 
   /**
+   * Allow subscriptions that resolve to loopback or private addresses.
+   *
+   * Off by default: a subscription URL tells this daemon where to send a
+   * request, and the MCP server puts that within reach of an agent reading
+   * untrusted articles. On for people who genuinely subscribe to something on
+   * their own network, which is a real self-hosting case.
+   */
+  FETCH_ALLOW_PRIVATE_TARGETS: z.stringbool().default(false),
+
+  /**
    * Embeddings. Off by default, and there is deliberately no default model:
    * a model cannot be chosen on someone's behalf when choosing one commits
    * their database to a vector dimension.

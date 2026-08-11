@@ -16,9 +16,9 @@ import { z } from "zod";
 
 import type { Config } from "./config.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
+import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
-import { checkSubscribableUrl } from "./ingest/subscribable-url.ts";
 import { parseOpml } from "./opml.ts";
 import { parseSince } from "./search-params.ts";
 
@@ -78,7 +78,9 @@ export function createApi(deps: ApiDeps) {
 
     // Subscribing is an instruction to fetch, and this endpoint is reachable
     // by an agent whose inputs include untrusted article text.
-    const allowed = await checkSubscribableUrl(parsed.data.url);
+    const allowed = await checkFetchTarget(parsed.data.url, {
+      allowPrivate: config.FETCH_ALLOW_PRIVATE_TARGETS,
+    });
     if (!allowed.ok) return c.json({ error: `refusing to subscribe: ${allowed.reason}` }, 400);
 
     const [row] = await db
