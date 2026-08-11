@@ -74,7 +74,7 @@ All settings are environment variables. Only `DATABASE_URL` is required.
 | `FETCH_CONCURRENCY` | `20` | Feeds fetched at once |
 | `DEFAULT_FETCH_INTERVAL_SECONDS` | `3600` | Polling interval for new subscriptions |
 | `DEGRADE_AFTER_FAILURES` | `5` | Consecutive failures before a source is marked degraded |
-| `FETCH_ALLOW_PRIVATE_TARGETS` | `false` | Allow subscriptions on your own network (loopback, private, link-local) |
+| `FETCH_ALLOW_PRIVATE_TARGETS` | `false` | Allow subscriptions on your own network (loopback and private ranges). Link-local stays blocked |
 | `SEARCH_MAX_DISTANCE` | `0.6` | Cosine distance beyond which a vector match is not a result |
 
 The CLI reads `TSUZURI_ENDPOINT` (default `http://127.0.0.1:8787`), so it works against a daemon on another machine.
@@ -208,7 +208,9 @@ tsuzuri fetches on behalf of one person, but it is software other people run, so
 - Per-host rate limiting on by default.
 - No bot-detection evasion: no TLS fingerprint spoofing, no stealth plugins, no CAPTCHA solving. If a site does not want to be read this way, that is an answer.
 - No republishing. tsuzuri is a personal reader and will not gain a feature that serves fetched full text to the public.
-- Requests go to public addresses only. A subscription URL tells the daemon where to send a request, and the MCP server puts that within reach of an agent reading untrusted articles — an article should not be able to talk one into fetching `http://169.254.169.254/`. Loopback, private, link-local and metadata addresses are refused, and every redirect hop is checked, not just the URL you typed. Set `FETCH_ALLOW_PRIVATE_TARGETS=true` if you subscribe to something on your own network.
+- Requests go to public addresses only. A subscription URL tells the daemon where to send a request, and the MCP server puts that within reach of an agent reading untrusted articles — an article should not be able to talk one into fetching `http://169.254.169.254/`. Loopback, private, link-local and metadata addresses are refused, and every redirect hop is checked, not just the URL you typed. Set `FETCH_ALLOW_PRIVATE_TARGETS=true` if you subscribe to something on your own network — that permits loopback and private ranges, and still refuses link-local, so `169.254.169.254` stays out of reach either way.
+
+This narrows the exposure rather than eliminating it. The address is checked by resolving the host, but the request itself resolves again independently, so a name that answers differently between the two can still be reached. Closing that needs the connection pinned to the address that was checked, which the runtime's `fetch` does not offer.
 
 `robots.txt` handling arrives with the scraping layer in P5, where it becomes relevant.
 

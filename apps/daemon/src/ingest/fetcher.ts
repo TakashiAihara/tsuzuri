@@ -96,14 +96,17 @@ export function createFetcher(options: FetcherOptions): Fetcher {
       const location = response.headers.get("location");
       if (response.status < 300 || response.status >= 400 || !location) return response;
 
-      if (hop >= maxRedirects) {
-        throw new Error(`too many redirects fetching ${url} (stopped at ${target})`);
+      // Whatever happens next, this response's body is not going to be read.
+      // Releasing it only on the happy path leaks a stream on every redirect
+      // that is refused or over the limit.
+      try {
+        if (hop >= maxRedirects) {
+          throw new Error(`too many redirects fetching ${url} (stopped at ${target})`);
+        }
+        target = new URL(location, target).toString();
+      } finally {
+        await response.body?.cancel().catch(() => {});
       }
-
-      const next = new URL(location, target).toString();
-      // Cancel the body we are not going to read; the next hop gets its own.
-      await response.body?.cancel().catch(() => {});
-      target = next;
     }
   };
 }

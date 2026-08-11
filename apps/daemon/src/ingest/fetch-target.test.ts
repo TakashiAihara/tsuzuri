@@ -40,8 +40,17 @@ describe("checkFetchTarget", () => {
     expect(result).toMatchObject({ ok: false });
   });
 
-  test("rejects IPv6 loopback, link-local and unique-local", async () => {
-    for (const host of ["[::1]", "[fe80::1]", "[fd00::1]", "[::ffff:127.0.0.1]"]) {
+  test("rejects IPv6 loopback, link-local, unique-local and multicast", async () => {
+    for (const host of ["[::1]", "[fe80::1]", "[fd00::1]", "[::ffff:127.0.0.1]", "[ff02::1]"]) {
+      const result = await checkFetchTarget(`http://${host}/feed`);
+      expect(result).toMatchObject({ ok: false });
+    }
+  });
+
+  test("rejects the whole link-local range, not just addresses starting fe80", async () => {
+    // fe80::/10 runs to febf. Matching the literal string "fe80" let the rest
+    // of the range through.
+    for (const host of ["[fe90::1]", "[fea0::1]", "[febf::1]"]) {
       const result = await checkFetchTarget(`http://${host}/feed`);
       expect(result).toMatchObject({ ok: false });
     }
@@ -97,6 +106,11 @@ describe("checkFetchTarget", () => {
         const result = await checkFetchTarget(`http://${host}/feed`, allowPrivate);
         expect(result.ok).toBe(true);
       }
+    });
+
+    test("still refuses carrier-grade NAT, which is the ISP's network not yours", async () => {
+      const result = await checkFetchTarget("http://100.64.0.1/feed", allowPrivate);
+      expect(result).toMatchObject({ ok: false });
     });
 
     test("still refuses link-local, where cloud metadata lives", async () => {

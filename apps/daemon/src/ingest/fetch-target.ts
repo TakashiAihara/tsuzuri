@@ -15,8 +15,17 @@ import { lookup } from "node:dns/promises";
  * anything, because it sees every redirect hop and the address the host
  * resolves to *now* rather than whatever it resolved to when it was added.
  *
- * Not a sandbox. Someone who can edit the database or the environment can point
- * this anywhere; the point is that untrusted *content* cannot.
+ * Not a sandbox, and not complete. Someone who can edit the database or the
+ * environment can point this anywhere; the point is that untrusted *content*
+ * cannot.
+ *
+ * The known gap is the one between checking and connecting. This resolves the
+ * host to decide, and then fetch() resolves it again to connect, so a name that
+ * answers differently between the two calls is still reachable. Closing it
+ * means pinning the connection to the address that was checked, which the
+ * runtime's fetch does not expose. What is here shortens the window from "when
+ * the subscription was created" to "moments ago", which is worth having and is
+ * not the same as protection.
  */
 
 export type UrlRejection = { ok: false; reason: string };
@@ -35,27 +44,46 @@ function isBlockedIpv4(address: string, allowPrivate: boolean): boolean {
 
   // Never permitted, even with the opt-in. Link-local is where cloud metadata
   // lives, and nobody subscribes to a feed there; allowing it as a side effect
-  // of "let me read my router's feed" would be a trap.
-  if (a === 169 && b === 254) return true; // link-local, incl. cloud metadata
-  if (a === 0) return true; // "this network"
-  if (a >= 224) return true; // multicast and reserved
+  // of "let me read my router's feed" would be a trap. Carrier-grade NAT is
+  // not your network either -- it is the ISP's, and RFC1918 is what the opt-in
+  // is for.
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  if (a === 0) return true; // 0.0.0.0/8
+  if (a >= 224) return true; // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
 
   if (allowPrivate) return false;
 
-  if (a === 10) return true; // private
-  if (a === 127) return true; // loopback
-  if (a === 172 && b >= 16 && b <= 31) return true; // private
-  if (a === 192 && b === 168) return true; // private
-  if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
   return false;
+}
+
+/**
+ * The leading 16 bits of an IPv6 address, which is what every range below is
+ * distinguished by. Returns 0 for an address that begins with "::".
+ */
+function leadingHextet(normalized: string): number {
+  if (normalized.startsWith("::")) return 0;
+  const head = normalized.split(":", 1)[0] ?? "";
+  const value = Number.parseInt(head, 16);
+  return Number.isNaN(value) ? 0 : value;
 }
 
 function isBlockedIpv6(address: string, allowPrivate: boolean): boolean {
   const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
   if (normalized === "::") return true; // unspecified
-  if (normalized.startsWith("fe80")) return true; // link-local, never permitted
-  if (!allowPrivate && normalized === "::1") return true; // loopback
-  if (!allowPrivate && /^f[cd]/.test(normalized)) return true; // unique local
+
+  // Checked as ranges rather than string prefixes. fe80::/10 runs to febf,
+  // so matching only the literal "fe80" let fe90::1 through.
+  const leading = leadingHextet(normalized);
+  if (leading >= 0xfe80 && leading <= 0xfebf) return true; // fe80::/10 link-local
+  if (leading >= 0xff00) return true; // ff00::/8 multicast
+
+  if (!allowPrivate && normalized === "::1") return true; // ::1/128 loopback
+  if (!allowPrivate && leading >= 0xfc00 && leading <= 0xfdff) return true; // fc00::/7
   // IPv4-mapped addresses, in both spellings. The URL parser rewrites
   // ::ffff:127.0.0.1 into ::ffff:7f00:1, so checking only the dotted form
   // would miss every mapped address that arrived through a URL.
