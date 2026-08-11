@@ -217,12 +217,10 @@ program
         out(
           `${hit.id.slice(0, 8)}  ${formatAge(hit.publishedAt).padEnd(5)} ${hit.title ?? hit.url}`,
         );
-        // pgroonga_snippet_html marks matches with a span; the terminal wants
-        // the text, not the markup.
-        const snippet = hit.snippet
-          ?.replace(/<[^>]+>/g, "")
-          .replace(/\s+/g, " ")
-          .trim();
+        // pgroonga_snippet_html escapes the text and then wraps matches in a
+        // span, so tags and entities both have to go. Shared with the MCP
+        // server, which renders the same snippets.
+        const snippet = snippetToText(hit.snippet);
         if (snippet) out(`          ${snippet.slice(0, 160)}`);
       }
     },
