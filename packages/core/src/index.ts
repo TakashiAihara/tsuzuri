@@ -14,6 +14,30 @@ export {
   toVectorLiteral,
 } from "./embedding.ts";
 export { contentHash, itemIdentity, sha256 } from "./hash.ts";
+export {
+  affinity,
+  clusterCount,
+  decayFactor,
+  explorationSlots,
+  interleaveExploration,
+  type RecencyOptions,
+  recencyFactor,
+  type ScoringInactiveReason,
+  type ScoringState,
+  SIGNAL_WEIGHTS,
+  type Signal,
+  type SignalKind,
+  signalStrength,
+} from "./interest.ts";
+export {
+  dot,
+  type KMeansInput,
+  type KMeansResult,
+  normalize,
+  seededRandom,
+  seedFrom,
+  sphericalKMeans,
+} from "./kmeans.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
 export { snippetToText } from "./snippet.ts";
