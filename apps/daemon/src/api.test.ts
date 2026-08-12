@@ -4,6 +4,7 @@ import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { createInterestService } from "./enrich/interest.ts";
 
 /**
  * The HTTP surface, driven through Hono's fetch rather than a live socket.
@@ -41,10 +42,32 @@ describeIfDb("api", () => {
       `;
     }
 
+    // Every stored item arrives through a subscription, and the listing joins
+    // on that, so a fixture without one lists nothing.
+    const [source] = await handle.sql<Array<{ id: string }>>`
+      INSERT INTO sources (user_id, kind, url)
+      VALUES (${DEFAULT_USER_ID}, 'feed', 'https://fixture.example/feed')
+      RETURNING id
+    `;
+    for (const id of [idA, idB, idC]) {
+      await handle.sql`
+        INSERT INTO item_sources (item_id, source_id) VALUES (${id}, ${source?.id as string})
+      `;
+    }
+
     const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
     const embeddings = createEmbeddingService({ sql: handle.sql, config });
     await embeddings.start();
-    app = createApi({ db: handle.db, sql: handle.sql, fetcher: fetch, config, embeddings });
+    const interest = createInterestService({ sql: handle.sql, config, embeddings });
+    await interest.start();
+    app = createApi({
+      db: handle.db,
+      sql: handle.sql,
+      fetcher: fetch,
+      config,
+      embeddings,
+      interest,
+    });
   });
 
   afterAll(async () => {
@@ -156,6 +179,64 @@ describeIfDb("api", () => {
 
     test("caps the limit", async () => {
       expect((await get("/search?q=Rust&limit=5000")).status).toBe(400);
+    });
+  });
+
+  describe("ranked listing", () => {
+    type RankedBody = {
+      items: Array<{ id: string; interest: number; exploration: boolean }>;
+      scoring: { active: boolean; reason?: string; signals: number; required: number };
+    };
+
+    test("degrades to date order and says why, with scoring switched off", async () => {
+      // Not an error: an install with scoring off is a supported configuration.
+      // But the list cannot distinguish "off" from "no history yet" from "the
+      // model does not match", so the response has to name which.
+      const body = await json<RankedBody>(await get("/items?sort=score&unread=false"));
+      expect(body.scoring.active).toBe(false);
+      expect(body.scoring.reason).toBe("interest scoring is not enabled");
+      expect(body.items.length).toBeGreaterThan(0);
+      expect(body.items.every((item) => item.interest === 0)).toBe(true);
+      expect(body.items.every((item) => item.exploration === false)).toBe(true);
+    });
+
+    test("reports how far off activation is", async () => {
+      const body = await json<RankedBody>(await get("/items?sort=score"));
+      // "How much further do I have to go" is the question someone actually
+      // has on day one, and it is answerable from these two numbers.
+      expect(body.scoring.required).toBeGreaterThan(0);
+      expect(body.scoring.signals).toBeGreaterThanOrEqual(0);
+    });
+
+    test("carries no scoring block when date order was asked for", async () => {
+      const body = await json<{ items: unknown[]; scoring?: unknown }>(
+        await get("/items?sort=recent"),
+      );
+      expect(body.scoring).toBeUndefined();
+      expect(Array.isArray(body.items)).toBe(true);
+    });
+
+    test("rejects an ordering it does not have", async () => {
+      expect((await get("/items?sort=whatever")).status).toBe(400);
+    });
+  });
+
+  describe("interest profile", () => {
+    test("refuses a rebuild while scoring is switched off, and says so", async () => {
+      const response = await app.fetch(
+        new Request("http://test/interest/rebuild", { method: "POST" }),
+      );
+      expect(response.status).toBe(400);
+      expect((await json<{ error: string }>(response)).error).toMatch(/INTEREST_SCORING_ENABLED/);
+    });
+
+    test("reports its state rather than 404ing when it is off", async () => {
+      const body = await json<{ enabled: boolean; active: boolean; builtAt: string | null }>(
+        await get("/interest/status"),
+      );
+      expect(body.enabled).toBe(false);
+      expect(body.active).toBe(false);
+      expect(body.builtAt).toBeNull();
     });
   });
 });
