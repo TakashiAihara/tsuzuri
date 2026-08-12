@@ -70,6 +70,51 @@ const configSchema = z.object({
   EMBEDDING_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   /**
+   * Interest scoring. Off by default, like everything else derived by a model.
+   *
+   * It needs embeddings, but it is not implied by them: building a profile of
+   * what someone reads is its own thing to opt into, and the fact that the
+   * arithmetic is cheap is an argument about cost rather than about consent.
+   */
+  INTEREST_SCORING_ENABLED: z.stringbool().default(false),
+  /** Half-life of a signal when the profile is built. */
+  INTEREST_SIGNAL_HALFLIFE_DAYS: z.coerce.number().positive().default(30),
+  /**
+   * Half-life applied to an item's age when scoring.
+   *
+   * 72 hours puts a week-old article at about a fifth of its similarity, which
+   * is what issue #4 means by not letting week-old items stay pinned.
+   */
+  INTEREST_RECENCY_HALFLIFE_HOURS: z.coerce.number().positive().default(72),
+  /**
+   * Discount for an item whose published_at is really the fetch time.
+   *
+   * Such an item always looks brand new, because the guess is "now". Discounted
+   * rather than backdated: there is no better timestamp, so the honest move is
+   * to trust it less rather than invent a different one.
+   */
+  INTEREST_ESTIMATED_DATE_FACTOR: z.coerce.number().positive().max(1).default(0.7),
+  /** Signals required before scoring activates at all. */
+  INTEREST_MIN_SIGNALS: z.coerce.number().int().positive().default(30),
+  /** Upper bound on the number of interest clusters. */
+  INTEREST_CLUSTERS_MAX: z.coerce.number().int().min(2).max(64).default(10),
+  /**
+   * Signalled items fetched to build the profile, in recency order.
+   *
+   * The bound on how much is pulled into memory. A signal ranked below this has
+   * decayed to near nothing anyway, so the cap costs nothing real.
+   */
+  INTEREST_MAX_PROFILE_ITEMS: z.coerce.number().int().positive().default(5_000),
+  /** Share of a ranked page reserved for subscriptions you read least. */
+  INTEREST_EXPLORATION_RATIO: z.coerce.number().min(0).max(0.9).default(0.2),
+  /** How far back a ranked page looks for candidates. */
+  INTEREST_WINDOW_DAYS: z.coerce.number().int().positive().default(30),
+  /** How often the profile is rebuilt. */
+  INTEREST_REBUILD_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
+  /** Ordering used when a listing does not ask for one. */
+  TIMELINE_DEFAULT_SORT: z.enum(["recent", "score"]).default("recent"),
+
+  /**
    * Cosine distance beyond which a vector candidate is not a result.
    *
    * The vector arm returns its nearest N however far away they are, so without

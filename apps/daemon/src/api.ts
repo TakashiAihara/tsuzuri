@@ -16,6 +16,7 @@ import { z } from "zod";
 
 import type { Config } from "./config.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
+import type { InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
@@ -37,6 +38,7 @@ export type ApiDeps = {
   fetcher: Fetcher;
   config: Config;
   embeddings: EmbeddingService;
+  interest: InterestService;
 };
 
 const addSourceSchema = z.object({
@@ -58,11 +60,16 @@ const listItemsSchema = z.object({
   unread: z.stringbool().default(true),
   limit: z.coerce.number().int().min(1).max(500).default(50),
   sourceId: z.uuid().optional(),
+  /**
+   * Ordering. Omitted means whatever TIMELINE_DEFAULT_SORT says, which is
+   * `recent` unless someone changed it.
+   */
+  sort: z.enum(["recent", "score"]).optional(),
 });
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
-  const { db, sql: rawSql, fetcher, config, embeddings } = deps;
+  const { db, sql: rawSql, fetcher, config, embeddings, interest } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -173,6 +180,46 @@ export function createApi(deps: ApiDeps) {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
     const { unread, limit, sourceId } = parsed.data;
+    const sort = parsed.data.sort ?? config.TIMELINE_DEFAULT_SORT;
+
+    /**
+     * Ranked ordering, when it was asked for and can actually run.
+     *
+     * Asking for a ranked list while scoring is off is not an error. An install
+     * with no embedding model, or with scoring switched off, is a supported
+     * configuration rather than a broken one, so the request degrades to date
+     * order and the response says which of the several possible reasons applied
+     * -- exactly as /search reports why its vector arm did not run.
+     */
+    if (sort === "score") {
+      const page = await interest.rank({
+        limit,
+        unreadOnly: unread,
+        sourceId: sourceId ?? null,
+      });
+      if (page.scoring.active) return c.json({ items: page.items, scoring: page.scoring });
+      const fallback = await listRecent({ unread, limit, sourceId });
+      return c.json({
+        items: fallback.map((item) => ({
+          ...item,
+          interest: 0,
+          affinitySimilarity: 0,
+          exploration: false,
+        })),
+        scoring: page.scoring,
+      });
+    }
+
+    return c.json({ items: await listRecent({ unread, limit, sourceId }) });
+  });
+
+  /** The reverse-chronological listing, shared by the plain and degraded paths. */
+  async function listRecent(options: {
+    unread: boolean;
+    limit: number;
+    sourceId?: string | undefined;
+  }) {
+    const { unread, limit, sourceId } = options;
 
     const conditions = [];
     if (unread) conditions.push(isNull(itemState.readAt));
@@ -200,8 +247,8 @@ export function createApi(deps: ApiDeps) {
       .orderBy(desc(items.publishedAt), items.id)
       .limit(limit);
 
-    return c.json({ items: rows });
-  });
+    return rows;
+  }
 
   /**
    * Resolve an item id that may have been abbreviated.
@@ -337,6 +384,23 @@ export function createApi(deps: ApiDeps) {
 
   app.get("/embeddings/status", async (c) => c.json(await embeddings.status()));
 
+  app.get("/interest/status", async (c) => c.json(await interest.status()));
+
+  /**
+   * Rebuild the interest profile now.
+   *
+   * Awaited rather than detached, unlike the embedding reindex: a rebuild reads
+   * a bounded set of signalled items and runs k-means over them in memory, so it
+   * finishes in the time a request can wait. Nothing about it outlives the call.
+   */
+  app.post("/interest/rebuild", async (c) => {
+    try {
+      return c.json(await interest.rebuild());
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+
   /**
    * Re-embed everything into the configured model.
    *
@@ -391,6 +455,7 @@ export function createApi(deps: ApiDeps) {
           enabled: embeddingStatus.state === "ready",
           ...embeddingStatus,
         },
+        scoring: await interest.status(),
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.
         llm: { enabled: false, reason: "not implemented until P3" },
