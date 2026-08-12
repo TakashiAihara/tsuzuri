@@ -35,7 +35,7 @@ These are the ones to be careful with. Each pair is two genuinely different thin
 ### provider
 
 - A provider is an external dependency behind an interface, chosen by configuration, defaulting to off or to something that works anywhere.
-- embedding provider, chat provider, storage provider and notifier are separate interfaces that share the pattern. They are never referred to collectively as "the provider".
+- embedding provider, chat provider, storage provider, notifier and exporter are separate interfaces that share the pattern. They are never referred to collectively as "the provider".
 
 ### source
 
@@ -82,6 +82,10 @@ Phase P3. Defined here so the terms are fixed before anything implements them.
 
 - enrichment is one derived artefact attached to an item: a summary, a translation, a tag set, a score. It records the model and prompt version that produced it, so a prompt change can be replayed over history. Table `enrichments`.
 - interest profile is the set of interest clusters for a user, rebuilt periodically from interaction history with time decay. Multiple clusters rather than one centroid, because a single average of several unrelated interests lands on a point that is none of them.
+- signal is one recorded interaction that interest scoring reads: a star, a read, or a skip. Its strength is a fixed weight for its kind multiplied by a decay from the timestamp in `item_state`. It is not a table, and the word names the reading of a row rather than a row: `item_state` deliberately keeps current state instead of an event log, because scoring needs when something happened and not how many times.
+- representative is the one member of a cluster shown when a list is collapsed. It is a property of the cluster, `clusters.representative_item_id`, not of the item, and it can change as members arrive.
+- collapse is to render a list with one row per cluster instead of one row per item. A display decision made per request: the stored rows are identical either way, which is what makes expanding a collapsed list free.
+- SimHash is a 64-bit fingerprint of an item's search text, where similar text produces hashes differing in few bits. Column `item_simhash.simhash`. It is the second of clustering's two signals and the only one that needs no embedding model, which is what lets clustering partly work on an install with no AI configured.
 - tag vocabulary is the closed set of tags an LLM may choose from, split into approved and candidate. Tagging is a classification task against this set, never free generation, because free tags diverge until they are useless for filtering. Table `tag_vocabulary`.
 - digest is a summary of a period built over clusters: the stories that happened, one entry each, rather than the articles that arrived. It requires both clustering and summarisation, which is why it does not exist before P3.
 - exploration slot is a fraction of a ranked list reserved for items that scoring did not choose, so that ranking on your own history does not close the loop on itself.
@@ -93,4 +97,6 @@ Phase P3. Defined here so the terms are fixed before anything implements them.
 - CLI, web UI and MCP server are those clients. The web UI is P4.
 - MCP server is the agent-facing interface. It is designed rather than transliterated from the CLI, because an agent's useful granularity is not a human's.
 - list response is any MCP result carrying more than one article. Ids in them are abbreviated to twelve characters, which every tool accepts in place of a full id because the daemon resolves unique prefixes. The rule is that none of them carry article body text: full text costs a deliberate `get_article` call, so a broad query cannot exhaust an agent's context before it has chosen what to read. What they do carry is whatever the agent needs to choose — for `search_articles`, id, title, summary, score, url, published time and a bounded match snippet; `list_sources` carries subscription fields instead.
+- exporter sends one article somewhere outside tsuzuri, chosen by configuration and defaulting to none. Distinct from notifier, and the distinction is the unit: a notifier delivers a digest on a schedule, an exporter delivers one article on request.
+- summary source is whether the summary in a response came from the feed or from a chat model. Reported as a field because with no chat model configured both are simply "the summary", and a caller cannot otherwise tell whether enrichment is doing anything.
 - doctor reports what is enabled and what is not. On a self-hosted product, not knowing which half of the system you turned on is the largest source of friction, so it is a first-class command rather than a diagnostic afterthought.
