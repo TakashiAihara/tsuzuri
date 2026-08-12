@@ -2,7 +2,9 @@
 
 Covers issues #4 (interest scoring), #6 (duplicate clustering), #5 (LLM enrichment), #7 (digest and notifiers).
 
-Status: open decisions settled 2026-08-12; awaiting approval to implement. Nothing here is implemented.
+Status: open decisions settled 2026-08-12.
+
+Part 1, interest scoring (#4), is implemented — `createInterestService`, `GET /items?sort=score`, `POST /interest/rebuild` and `tsuzuri read --by score`. Parts 2 to 4 — clustering (#6), LLM enrichment (#5), digest and notifiers (#7) — are designed here and not built. Where the implementation and this document disagreed, the document was corrected; those corrections are marked in Measured facts and in the decision table.
 
 One document for four issues because they are not four features. Scoring decides which items are worth an LLM call, clustering decides that eight copies of one story are one call rather than eight, and the digest is a rendering of what the other three produced. Splitting them would mean writing the same interfaces three times and deciding the same questions differently each time.
 
@@ -98,9 +100,11 @@ The profile is rebuilt on a timer, `INTEREST_REBUILD_INTERVAL_MINUTES`, default 
 
 k is not fixed at one value. The issue asks for five to ten clusters; five clusters over the thirty signals that first activate scoring would be five clusters of six items, which describes noise rather than interests. k is `clamp(round(sqrt(signals / 2)), 2, INTEREST_CLUSTERS_MAX)` with `INTEREST_CLUSTERS_MAX` defaulting to 10, so it reaches the issue's range at a few hundred signals and stays below it before that. See D15.
 
-Initialisation is k-means++ driven by a seeded PRNG, seeded from the user id and the rebuild timestamp. Determinism is not cosmetic here: without it the same history produces a different timeline on each rebuild, and no test of the clustering can assert anything.
+Initialisation is k-means++ driven by a seeded PRNG, seeded from the user id alone. Determinism is not cosmetic here: without it the same history produces a different timeline on each rebuild, and no test of the clustering can assert anything — which is also why the rebuild timestamp is not part of the seed, as an earlier draft of this document had it. Mixing the clock in would have defeated the property the same paragraph asks for.
 
 Skipped items are not clustered. A negatively-weighted point in a k-means run moves a centroid to a position that represents nothing, and cosine k-means has no meaningful notion of a repulsive member. Instead each skipped item is assigned to its nearest centroid and its decayed weight accumulates against that cluster, which therefore carries two weights: `positive_weight` from stars and reads, and `skipped_weight` from skips.
+
+Only if it is actually near it. Nearest is not the same as near, and a skip further than `INTEREST_SKIP_MAX_DISTANCE` (default 0.6, matching `SEARCH_MAX_DISTANCE`'s notion of related at all) from every centroid is discarded rather than charged to the closest one. Without that bound a skip says something about whichever interest happens to be least far away, which is wrong in general and badly wrong for a young profile: with one cluster, everything you skip is charged to it. This was found end to end rather than in review — three starred Rust articles and one skipped cooking article produced a Rust interest penalised by ten percent — and it is pinned by a test that fails without the bound.
 
 The ratio between them is the cluster's affinity, `positive_weight / (positive_weight + skipped_weight)`, and it scales that cluster's contribution to a score. A cluster nobody has skipped has an affinity of exactly 1 and is untouched; one you skip as often as you read halves. No cluster is ever removed for being skipped — an interest you have cooled on fades continuously instead of vanishing the moment a running total crosses zero. See D14.
 
@@ -440,6 +444,7 @@ This is also why no request-templating syntax appears anywhere in this document.
 | `INTEREST_MIN_SIGNALS` | `30` | Signals required before scoring activates |
 | `INTEREST_CLUSTERS_MAX` | `10` | Upper bound on k |
 | `INTEREST_MAX_PROFILE_ITEMS` | `5000` | Signalled items fetched to build the profile, in decayed-weight order |
+| `INTEREST_SKIP_MAX_DISTANCE` | `0.6` | How near a skip must be to an interest to count against it |
 | `INTEREST_EXPLORATION_RATIO` | `0.2` | Share of a ranked list reserved for unexplored sources |
 | `INTEREST_WINDOW_DAYS` | `30` | Candidate window for scoring |
 | `INTEREST_REBUILD_INTERVAL_MINUTES` | `60` | Profile rebuild interval |
@@ -489,7 +494,7 @@ The suite stood at 305 passing when this document was written, skipping database
 
 Four draft PRs, chained, each leaving `main` in a working state:
 
-1. `feat/p3-interest-scoring` — issue #4.
+1. `feat/p3-interest-scoring` — issue #4. Open as PR #29.
 2. `feat/p3-clustering` — issue #6, based on 1.
 3. `feat/p3-llm-enrichment` — issue #5, based on 2.
 4. `feat/p3-digest-notifiers` — issue #7, based on 3.
@@ -509,7 +514,7 @@ Proposed. Nothing here is settled until this document is approved.
 | # | Decision | Resolution |
 | --- | --- | --- |
 | D13 | Where interest signals come from | `item_state` timestamps. No `interactions` table — migration `0002` already settled that the state row is deliberate, and scoring needs when rather than how many. `saved_at` is unused because nothing writes it |
-| D14 | How skipped items participate in clustering | Not clustered. Each is assigned to its nearest centroid and accumulates into that cluster's `skipped_weight`; the cluster's affinity, `positive / (positive + skipped)`, scales its contribution to a score, and no cluster is ever removed for being skipped. Rejected: weighted k-means with negative weights, which moves a centroid to a position representing nothing; a separate set of aversion centroids, which adds a concept the glossary does not have for one of three signals; and dropping a cluster once its net weight crosses zero, which makes an interest vanish at a threshold instead of fading. Settled 2026-08-12 |
+| D14 | How skipped items participate in clustering | Not clustered. Each is assigned to its nearest centroid and accumulates into that cluster's `skipped_weight`; the cluster's affinity, `positive / (positive + skipped)`, scales its contribution to a score, and no cluster is ever removed for being skipped. A skip further than `INTEREST_SKIP_MAX_DISTANCE` from every centroid is discarded rather than charged to the least distant one. Rejected: weighted k-means with negative weights, which moves a centroid to a position representing nothing; a separate set of aversion centroids, which adds a concept the glossary does not have for one of three signals; and dropping a cluster once its net weight crosses zero, which makes an interest vanish at a threshold instead of fading. Settled 2026-08-12 |
 | D15 | K-Means or HDBSCAN, and how many clusters | Spherical k-means with seeded k-means++, k = `clamp(round(sqrt(signals / 2)), 2, 10)`. No maintained TypeScript HDBSCAN exists, and its variable cluster count plus noise label would still have to be mapped onto the issue's five-to-ten contract. Determinism is required or the timeline reshuffles on every rebuild and nothing about it is testable |
 | D16 | Whether interest scores are stored | Computed per query. Measured at 46 ms for 20,000 items against ten centroids. A stored score would need invalidating on every rebuild and is stale by construction anyway, because the score contains a time decay |
 | D17 | A centroid can be zero-length | Refuse to write one, and filter in the query as well. Measured: cosine distance to a zero vector is `NaN`, `max()` propagates it, PostgreSQL sorts `NaN` first, and `l2_normalize` returns the zero vector unchanged. The failure is silently wrong ranking with no error |

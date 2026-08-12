@@ -206,7 +206,10 @@ export type RankedItem = z.infer<typeof rankedItemSchema>;
  */
 export const interestStatusSchema = z.union([
   z.strictObject({
-    enabled: z.boolean(),
+    // literal(true): the daemon cannot report active scoring while the feature
+    // is off, and a client type that admits the combination invites handling
+    // for a state that never occurs.
+    enabled: z.literal(true),
     builtAt: z.string().nullable(),
     active: z.literal(true),
     signals: z.number(),

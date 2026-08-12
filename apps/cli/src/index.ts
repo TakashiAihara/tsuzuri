@@ -164,17 +164,25 @@ program
   .option("--limit <n>", "how many", "20")
   .option("--source <id>", "restrict to one subscription")
   .option("--all", "include items already read")
-  .option("--by <order>", "recent or score", "recent")
+  // No default: an omitted --by sends no `sort`, which leaves the choice to the
+  // daemon's TIMELINE_DEFAULT_SORT. Defaulting to "recent" here would send it
+  // explicitly and make that setting unreachable from the CLI.
+  .option("--by <order>", "recent or score (default: the daemon's setting)")
   .action(async (opts: { limit: string; source?: string; all?: boolean; by?: string }) => {
     const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
     if (opts.source) params.set("sourceId", opts.source);
     if (opts.by) params.set("sort", opts.by);
 
-    if (opts.by !== "score") {
-      const { items } = await call<{ items: ItemSummary[] }>(globals(), `/items?${params}`);
-      if (globals().json) return printJson(items);
-      if (items.length === 0) return log("nothing unread");
-      for (const item of items) {
+    // Which shape came back is a property of the response, not of the flag,
+    // precisely because the daemon may have chosen the ordering.
+    const body = await call<{ items: ItemSummary[] } | RankedItemsResponse>(
+      globals(),
+      `/items?${params}`,
+    );
+    if (!("scoring" in body)) {
+      if (globals().json) return printJson(body.items);
+      if (body.items.length === 0) return log("nothing unread");
+      for (const item of body.items) {
         out(
           `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
         );
@@ -182,7 +190,7 @@ program
       return;
     }
 
-    const response = await call<RankedItemsResponse>(globals(), `/items?${params}`);
+    const response = body;
     if (globals().json) return printJson(response);
 
     // Say when the list is not actually ranked. Dates and scores produce the

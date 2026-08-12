@@ -105,6 +105,16 @@ const configSchema = z.object({
    * decayed to near nothing anyway, so the cap costs nothing real.
    */
   INTEREST_MAX_PROFILE_ITEMS: z.coerce.number().int().positive().default(5_000),
+  /**
+   * How near a skipped article must be to an interest to count against it.
+   *
+   * Cosine distance, matching SEARCH_MAX_DISTANCE's notion of "related at all".
+   * Without a bound, every skip lands on whichever cluster is closest even when
+   * that is not close, so skipping something the profile has no interest for
+   * penalises an unrelated one. A young profile with a single cluster is the
+   * worst case: everything skipped would be charged to it.
+   */
+  INTEREST_SKIP_MAX_DISTANCE: z.coerce.number().positive().max(2).default(0.6),
   /** Share of a ranked page reserved for subscriptions you read least. */
   INTEREST_EXPLORATION_RATIO: z.coerce.number().min(0).max(0.9).default(0.2),
   /** How far back a ranked page looks for candidates. */

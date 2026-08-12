@@ -153,9 +153,9 @@ tsuzuri read --by score --limit 10 --json   # includes the score and why it rank
 
 Off by default, and it needs an embedding model, so turning it on is two steps. The model is not implied by the embeddings: building a picture of what you read is its own thing to agree to, and the fact that it costs no API call does not make that decision for you.
 
-Your history becomes **five to ten interests, not one average.** A single centroid over everything you read lands at a point that represents none of your interests — the midpoint of Rust, cooking and local news is not a topic. So the profile is several clusters, and an article scores against whichever one it is nearest.
+Your history becomes **several interests, not one average.** A single centroid over everything you read lands at a point that represents none of your interests — the midpoint of Rust, cooking and local news is not a topic. So the profile is several clusters, and an article scores against whichever one it is nearest. How many grows with your history, from two up to `INTEREST_CLUSTERS_MAX`: splitting thirty articles ten ways would be describing noise.
 
-Stars count three times a read, and everything decays: something you starred last year no longer decides what you are shown today. Skipping is the counterweight — a skipped article is charged to the interest it sits closest to, and that interest's scores fall in proportion. It fades rather than disappearing, and an interest you have never skipped near is unaffected.
+Stars count three times a read, and everything decays: something you starred last year no longer decides what you are shown today. Skipping is the counterweight — a skipped article is charged to the interest it sits closest to, and that interest's scores fall in proportion. It fades rather than disappearing, and an interest you have never skipped near is unaffected. Skipping something that matches none of your interests costs nothing, rather than being blamed on whichever one happened to be least far away.
 
 Recency multiplies the result, so a week-old article keeps about a fifth of its score and yesterday's does not stay pinned all week. An article whose date had to be guessed — many feeds publish none — is discounted rather than treated as breaking news.
 
@@ -176,6 +176,7 @@ not ranked: not enough reading history yet
 | `INTEREST_RECENCY_HALFLIFE_HOURS` | `72` | How fast an article's age discounts its score |
 | `INTEREST_ESTIMATED_DATE_FACTOR` | `0.7` | Discount for an article whose date was guessed |
 | `INTEREST_CLUSTERS_MAX` | `10` | Most interests to split your history into |
+| `INTEREST_SKIP_MAX_DISTANCE` | `0.6` | How near a skip must be to an interest to count against it |
 | `INTEREST_EXPLORATION_RATIO` | `0.2` | Share of a page reserved for subscriptions you read least |
 | `INTEREST_WINDOW_DAYS` | `30` | How far back a ranked page looks |
 | `INTEREST_MAX_PROFILE_ITEMS` | `5000` | Cap on the history read to build the profile |

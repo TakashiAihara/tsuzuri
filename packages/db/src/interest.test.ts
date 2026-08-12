@@ -307,6 +307,56 @@ describeIfDb("interest profile and scoring", () => {
       expect(scoped.map((row) => row.id)).toEqual(["y-unrelated"]);
     });
 
+    test("does not let a future-dated item outrank everything", async () => {
+      // Ingest accepts a publication date up to a day ahead, so this is
+      // reachable from a real feed with a fast clock. An unclamped age makes
+      // the exponent negative, the decay greater than 1, and the item's score
+      // exceed its own similarity. core's decayFactor clamps the same input.
+      await resetState();
+      await seedProfile();
+      await handle.sql`
+        INSERT INTO items (id, url, canonical_url, title, published_at, search_text)
+        VALUES ('x-future', 'https://e.com/f', 'https://e.com/f', 'future',
+                ${NOW.toISOString()}::timestamptz + interval '12 hours', 'future')
+        ON CONFLICT (id) DO UPDATE SET published_at = EXCLUDED.published_at
+      `;
+      await handle.sql`
+        INSERT INTO item_embeddings (item_id, embedding)
+        SELECT id, vec::vector FROM UNNEST(ARRAY['x-future'], ARRAY['[1,0,0]']) AS t(id, vec)
+        ON CONFLICT (item_id) DO UPDATE SET embedding = EXCLUDED.embedding
+      `;
+
+      const rows = await scoreItems(handle.sql, scoreDefaults, NOW);
+      const future = rows.find((row) => row.id === "x-future");
+      expect(future?.interest).toBeLessThanOrEqual(future?.affinitySimilarity as number);
+      expect(future?.interest).toBeCloseTo(1, 6);
+
+      await handle.sql`DELETE FROM items WHERE id = 'x-future'`;
+    });
+
+    test("floors a similarity that points away from every interest", async () => {
+      // Cosine distance runs to 2, so this term goes negative for an opposed
+      // vector. Multiplying a negative by a decay makes older items score
+      // higher among them, which is backwards.
+      await resetState();
+      await writeInterestProfile(handle.sql, {
+        userId: DEFAULT_USER_ID,
+        builtAt: NOW,
+        clusters: [
+          { ordinal: 0, centroid: [-1, 0, 0], positiveWeight: 1, skippedWeight: 0, members: 1 },
+        ],
+      });
+      const rows = await scoreItems(handle.sql, scoreDefaults, NOW);
+      const fresh = rows.find((row) => row.id === "x-fresh");
+      const old = rows.find((row) => row.id === "x-week-old");
+      expect(fresh?.affinitySimilarity).toBe(0);
+      expect(fresh?.interest).toBe(0);
+      // Tied at zero, so the older one must not sort above the newer one.
+      expect(rows.indexOf(fresh as (typeof rows)[number])).toBeLessThan(
+        rows.indexOf(old as (typeof rows)[number]),
+      );
+    });
+
     test("returns nothing when there is no profile", async () => {
       await resetState();
       expect(await scoreItems(handle.sql, scoreDefaults, NOW)).toHaveLength(0);
