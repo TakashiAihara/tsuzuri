@@ -152,6 +152,15 @@ describe("interleaveExploration", () => {
     expect(merged.indexOf("e1")).toBeLessThan(merged.length - 2);
   });
 
+  test("does not park a lone exploration item at the end", () => {
+    // With one reserved slot, ending each interval puts it at total - 1, which
+    // is the append this function exists to avoid. Fails under that formula.
+    const merged = interleaveExploration(["r1", "r2", "r3", "r4"], ["e1"]);
+    expect(merged).toHaveLength(5);
+    expect(merged.at(-1)).not.toBe("e1");
+    expect(merged.indexOf("e1")).toBeGreaterThan(0);
+  });
+
   test("is deterministic", () => {
     // A timeline that reshuffles on every refresh cannot be navigated.
     const ranked = ["r1", "r2", "r3", "r4"];

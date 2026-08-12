@@ -303,7 +303,13 @@ export async function scoreItems(
     WITH matched AS (
       SELECT i.id,
              max(
-               (1 - (e.embedding <=> c.centroid))
+               -- GREATEST(0, ...): cosine distance runs to 2, so this term is
+               -- negative for a vector pointing away from the interest. A
+               -- negative similarity multiplied by a decay gets *larger* as the
+               -- item ages, which would order the least relevant items
+               -- backwards. Flooring at zero collapses them into one tie that
+               -- published_at breaks.
+               GREATEST(0, 1 - (e.embedding <=> c.centroid))
                * (c.positive_weight / (c.positive_weight + c.skipped_weight))
              ) AS affinity_similarity
       FROM items i
@@ -330,7 +336,13 @@ export async function scoreItems(
            st.starred_at AS "starredAt",
            m.affinity_similarity AS "affinitySimilarity",
            m.affinity_similarity
-             * pow(0.5, extract(epoch FROM ${instant(now)}::timestamptz - i.published_at)
+             -- GREATEST(0, ...) on the age: a feed may publish up to a day
+             -- into the future and ingest stores it, which makes the exponent
+             -- negative and the decay greater than 1 -- pinning it above every
+             -- real item. core's decayFactor clamps the same input to 1, and
+             -- the two implementations have to agree.
+             * pow(0.5, GREATEST(0, extract(epoch FROM ${instant(now)}::timestamptz
+                                                       - i.published_at))
                         / ${halfLifeSeconds}::double precision)
              -- Cast both branches: postgres.js infers a parameter's type from
              -- its context, and an integer literal in the other branch makes
@@ -418,7 +430,10 @@ export async function explorationCandidates(
           ${options.sourceId}::uuid IS NULL
           OR src.source_id = ${options.sourceId}::uuid
         )
-      ORDER BY i.id, sr.reads ASC
+      -- src.source_id breaks a tie between two subscriptions with equal
+      -- reads; without it the surviving row is planner-dependent and the
+      -- outer ordering it feeds stops being deterministic.
+      ORDER BY i.id, sr.reads ASC, src.source_id
     )
     SELECT id,
            url,

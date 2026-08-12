@@ -16,7 +16,7 @@ import { z } from "zod";
 
 import type { Config } from "./config.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
-import type { InterestService } from "./enrich/interest.ts";
+import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
@@ -397,7 +397,14 @@ export function createApi(deps: ApiDeps) {
     try {
       return c.json(await interest.rebuild());
     } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      // Only a precondition is the caller's fault. A database failure answered
+      // as 400 tells a client its request was malformed when retrying would
+      // have worked.
+      if (error instanceof InterestPreconditionError) {
+        return c.json({ error: error.message }, 400);
+      }
+      console.error("interest rebuild failed:", error);
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
     }
   });
 

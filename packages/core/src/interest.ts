@@ -153,10 +153,13 @@ export function interleaveExploration<T>(ranked: readonly T[], explore: readonly
   if (explore.length === 0) return [...ranked];
   if (ranked.length === 0) return [...explore];
 
+  // The midpoint of each interval, not its end. Ending each interval puts the
+  // last exploration item at total - 1 every time, so a page with one reserved
+  // slot degenerates into exactly the append this function exists to avoid.
   const total = ranked.length + explore.length;
   const positions = new Set<number>();
   for (let i = 1; i <= explore.length; i += 1) {
-    positions.add(Math.min(total - 1, Math.ceil((i * total) / explore.length) - 1));
+    positions.add(Math.min(total - 1, Math.floor(((i - 0.5) * total) / explore.length)));
   }
 
   const out: T[] = [];

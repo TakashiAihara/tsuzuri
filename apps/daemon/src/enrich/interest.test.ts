@@ -174,6 +174,36 @@ describeIfDb("createInterestService", () => {
     expect(rustAfter).toBeLessThan(rustBefore);
   });
 
+  test("does not charge a skip to an interest it is nowhere near", async () => {
+    // Found end to end: with only Rust starred, the profile has one cluster,
+    // and a skipped cooking article was charged to it because "nearest" was
+    // the only option. The whole Rust interest lost 10% for a skip that had
+    // nothing to do with it. This fails without the distance bound.
+    const { interest } = await ready();
+    for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "starred");
+    await signal("cooking-a", "skipped");
+    await interest.rebuild();
+
+    const rows = await handle.sql<Array<{ skipped: number }>>`
+      SELECT skipped_weight AS skipped FROM interest_clusters
+    `;
+    expect(rows.every((row) => row.skipped === 0)).toBe(true);
+  });
+
+  test("still charges a skip that lands inside an interest", async () => {
+    // The bound must not make skipping a no-op: a skip on the same axis as the
+    // interest is exactly the signal the feature is for.
+    const { interest } = await ready();
+    for (const id of ["rust-a", "rust-b"]) await signal(id, "starred");
+    await signal("rust-c", "skipped");
+    await interest.rebuild();
+
+    const rows = await handle.sql<Array<{ skipped: number }>>`
+      SELECT skipped_weight AS skipped FROM interest_clusters ORDER BY skipped_weight DESC
+    `;
+    expect(rows[0]?.skipped).toBeGreaterThan(0);
+  });
+
   test("never writes a cluster with no positive weight", async () => {
     const { interest } = await ready();
     // Skips alone: there is nothing positive to cluster, so there is no profile.

@@ -46,6 +46,21 @@ export type RankedPage = {
   scoring: ScoringState;
 };
 
+/**
+ * A rebuild refused because the instance is not configured for one.
+ *
+ * Distinguished from anything else that can go wrong so the endpoint can answer
+ * 400 for "you have not turned this on" and 5xx for a database that fell over.
+ * Collapsing the two tells a client its request was malformed when the truth is
+ * that retrying would work.
+ */
+export class InterestPreconditionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InterestPreconditionError";
+  }
+}
+
 export type InterestService = {
   start: () => Promise<void>;
   stop: () => Promise<void>;
@@ -75,8 +90,16 @@ export function createInterestService(deps: {
   let wake: (() => void) | null = null;
   let loop: Promise<void> | null = null;
   let lastBuiltAt: Date | null = null;
-  /** In-flight rebuild, so stop() waits for it rather than racing it. */
-  let running: Promise<unknown> | null = null;
+  /**
+   * The one in-flight rebuild, if any.
+   *
+   * Single-flight rather than one variable per caller: the timer and any number
+   * of POST /interest/rebuild can arrive together, and letting each start its
+   * own would have them overwrite each other's handle -- so stop() would wait
+   * for whichever happened to be last and close the pool underneath the rest,
+   * while two wholesale profile replacements raced.
+   */
+  let running: Promise<{ clusters: number; signals: number }> | null = null;
 
   /**
    * Why a ranked list cannot be produced right now, or null when it can.
@@ -200,6 +223,14 @@ export function createInterestService(deps: {
 
     // Skips are never clustered -- a repulsive member has no meaning in cosine
     // k-means -- so each is charged to whichever interest it sits closest to.
+    //
+    // Only if it is actually near it. "Nearest" is not the same as "near", and
+    // charging every skip to whatever happens to be closest makes a skip about
+    // a topic the profile does not model into a penalty against an unrelated
+    // interest -- worst with a young profile, where one cluster is the nearest
+    // thing to everything. A skip beyond the bound is evidence about a topic
+    // there is no cluster for, so it is discarded rather than misattributed.
+    const minSimilarity = 1 - config.INTEREST_SKIP_MAX_DISTANCE;
     for (const row of usable) {
       if (row.skipped <= 0 || clusters.length === 0) continue;
       let best = -1;
@@ -211,6 +242,7 @@ export function createInterestService(deps: {
           best = index;
         }
       }
+      if (bestSimilarity < minSimilarity) continue;
       const cluster = clusters[best];
       if (cluster) cluster.skippedWeight += row.skipped;
     }
@@ -222,6 +254,16 @@ export function createInterestService(deps: {
     });
     lastBuiltAt = now;
     return { clusters: written, signals: await signalCount(sql, userId) };
+  }
+
+  /** Start a rebuild, or join the one already running. */
+  function rebuildOnce(): Promise<{ clusters: number; signals: number }> {
+    if (running) return running;
+    const started = buildProfile().finally(() => {
+      if (running === started) running = null;
+    });
+    running = started;
+    return started;
   }
 
   const sleep = (ms: number) =>
@@ -247,12 +289,7 @@ export function createInterestService(deps: {
       Date.now() - lastBuiltAt.getTime() >= config.INTEREST_REBUILD_INTERVAL_MINUTES * 60_000;
     if (!due) return;
 
-    running = buildProfile();
-    try {
-      await running;
-    } finally {
-      running = null;
-    }
+    await rebuildOnce();
   }
 
   return {
@@ -301,19 +338,16 @@ export function createInterestService(deps: {
 
     async rebuild() {
       if (!config.INTEREST_SCORING_ENABLED) {
-        throw new Error("interest scoring is not enabled; set INTEREST_SCORING_ENABLED first");
+        throw new InterestPreconditionError(
+          "interest scoring is not enabled; set INTEREST_SCORING_ENABLED first",
+        );
       }
       if (!embeddings.activeProvider()) {
         throw new Error(
           "interest scoring needs an embedding model that matches the stored vectors",
         );
       }
-      running = buildProfile();
-      try {
-        return (await running) as { clusters: number; signals: number };
-      } finally {
-        running = null;
-      }
+      return rebuildOnce();
     },
 
     async rank(options) {
