@@ -66,11 +66,13 @@ Both controls matter. The negative control — unrelated hashes — removed 2,01
 
 Consequence: no specialised Hamming index is needed. The time window is what makes the scan cheap, and it is also the semantically right restriction: the same story arriving three weeks apart is not a duplicate. See D21.
 
-### pgvector has `avg(vector)` and `l2_normalize`
+### pgvector has no scalar multiplication, so a weighted centroid is not expressible in SQL
 
-`avg(vector)` returns the element-wise mean and `l2_normalize` scales to unit length, both in 0.8.6. `avg` over an empty set returns `NULL` rather than a zero vector.
+`avg(vector)` and `l2_normalize` both exist in 0.8.6, and `avg` over an empty set returns `NULL` rather than a zero vector. But `'[1,2,3]'::vector * 2` fails with `operator does not exist: vector * integer`: pgvector defines element-wise `vector * vector` and no scalar form.
 
-Consequence: k-means centroid recomputation happens in SQL over the member set rather than by streaming every vector into the daemon. The `NULL` case is an empty cluster, which the loop drops.
+A centroid here is a *weighted* mean — a starred article counts three times a read one — and without scalar multiplication that cannot be written over `avg` or `sum`.
+
+Consequence: the k-means loop runs in the daemon over vectors fetched for signalled items, not in SQL over the corpus. Its input is bounded by how much you have reacted to rather than by how much you have stored, and capped besides. It also makes the loop a pure function, which is the only reason its seeded determinism can be tested at all. See D15.
 
 ## Glossary changes
 
@@ -104,7 +106,7 @@ The ratio between them is the cluster's affinity, `positive_weight / (positive_w
 
 Note what affinity is not. It is not the cluster's size or weight used as a multiplier: ranking by raw weight would let a dominant interest swamp a smaller one the item actually matches better, which is the failure a multi-cluster profile exists to avoid. Affinity is bounded to (0, 1] and is exactly 1 until you have actually skipped something near that cluster.
 
-Centroids are recomputed in SQL, `l2_normalize(avg(embedding))` over the member set, and the loop runs to a fixed iteration cap or until assignments stop changing. Any centroid that comes out zero-length is dropped rather than written, per the measured `NaN` hazard above.
+The loop runs in the daemon, to a fixed iteration cap or until assignments stop changing, over embeddings fetched once for signalled items only — the profile is built from what you reacted to, never from the corpus. The fetch is capped at `INTEREST_MAX_PROFILE_ITEMS` (default 5,000) in decayed-weight order, which costs nothing real: a signal ranked below that cap has decayed to near zero by definition. Any centroid that comes out zero-length is dropped rather than written, per the measured `NaN` hazard above.
 
 ### Schema
 
@@ -437,6 +439,7 @@ This is also why no request-templating syntax appears anywhere in this document.
 | `INTEREST_ESTIMATED_DATE_FACTOR` | `0.7` | Discount for an item whose date was guessed |
 | `INTEREST_MIN_SIGNALS` | `30` | Signals required before scoring activates |
 | `INTEREST_CLUSTERS_MAX` | `10` | Upper bound on k |
+| `INTEREST_MAX_PROFILE_ITEMS` | `5000` | Signalled items fetched to build the profile, in decayed-weight order |
 | `INTEREST_EXPLORATION_RATIO` | `0.2` | Share of a ranked list reserved for unexplored sources |
 | `INTEREST_WINDOW_DAYS` | `30` | Candidate window for scoring |
 | `INTEREST_REBUILD_INTERVAL_MINUTES` | `60` | Profile rebuild interval |
