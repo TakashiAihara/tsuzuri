@@ -143,7 +143,7 @@ WITH matched AS (
          i.published_at,
          i.published_at_estimated,
          -- Affinity is inside max(), not applied to its result. See below.
-         max((1 - (e.embedding <=> c.centroid))
+         max(GREATEST(0, 1 - (e.embedding <=> c.centroid))
              * (c.positive_weight / (c.positive_weight + c.skipped_weight)))
            AS affinity_similarity
   FROM items i
@@ -157,7 +157,10 @@ WITH matched AS (
 SELECT id,
        affinity_similarity,
        affinity_similarity
-         * pow(0.5, extract(epoch FROM now() - published_at)
+         -- GREATEST on the age: a feed may publish into the future and ingest
+         -- stores it, which would make the exponent negative and the decay
+         -- greater than 1.
+         * pow(0.5, GREATEST(0, extract(epoch FROM now() - published_at))
                     / ($halflifeHours * 3600))
          * CASE WHEN published_at_estimated THEN $estimatedFactor ELSE 1 END
          AS interest
@@ -178,7 +181,7 @@ Points that are load-bearing rather than incidental:
 
 Scoring is off unless `INTEREST_SCORING_ENABLED` is set, and it is unset by default. Once enabled it is still inactive until embeddings are ready, until `INTEREST_MIN_SIGNALS` decayed signals exist (default 30), and until a profile has been built.
 
-Every one of those is a reason a list came back in date order, and a caller cannot tell them apart from the list. So the response carries `scoring: { active, reason, signals, required }` and `doctor` reports the same, in the shape `/search` established for its `mode` and `reason` in P2. Asking for `sort=score` while any of them is unmet is not an error: the request degrades to reverse-chronological and names which one, because an install with scoring switched off is a supported configuration rather than a broken one. The issue asks that it says when scoring becomes active; the same field also answers "why is this list not ranked" and "how much further do I have to go", which is the question someone actually has on day one.
+Every one of those is a reason a list came back in date order, and a caller cannot tell them apart from the list. So the response carries a `scoring` block — `{ active: true, signals, required, clusters }` when it ran, `{ active: false, reason, signals, required }` when it did not — and `doctor` reports the same, in the shape `/search` established for its `mode` and `reason` in P2. Asking for `sort=score` while any of them is unmet is not an error: the request degrades to reverse-chronological and names which one, because an install with scoring switched off is a supported configuration rather than a broken one. The issue asks that it says when scoring becomes active; the same field also answers "why is this list not ranked" and "how much further do I have to go", which is the question someone actually has on day one.
 
 A share of every ranked list, `INTEREST_EXPLORATION_RATIO` (default 0.2), is reserved for items scoring did not choose. They are taken from subscriptions with the fewest reads in the window, most recent first — "unexplored sources" in the issue's words — and are deterministic rather than random. A timeline that reshuffles on every refresh is unusable, and a randomised one cannot be tested. Each hit carries `exploration: true` so the CLI and the web UI can label it; an unlabelled item that ranking did not choose is indistinguishable from a ranking bug. See D19.
 
@@ -509,7 +512,7 @@ README gains a configuration section for the chat, scoring, clustering, digest a
 
 ## Decisions
 
-Proposed. Nothing here is settled until this document is approved.
+Settled 2026-08-12, including D14, D20 and D33, which were the three left open in the draft. Corrections made while implementing part 1 are marked in the rows they affect.
 
 | # | Decision | Resolution |
 | --- | --- | --- |

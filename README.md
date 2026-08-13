@@ -2,7 +2,7 @@
 
 A self-hosted feed reader built for a CLI and for AI agents, with first-class support for sites that do not publish a feed at all.
 
-> Status: early. Ingest, the CLI, hybrid search and the MCP server work end to end, and interest scoring is landing. Summarisation, tagging, clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
+> Status: early. Ingest, the CLI, hybrid search, the MCP server and interest scoring work end to end. Summarisation, tagging, clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
 
 ## Why another reader
 

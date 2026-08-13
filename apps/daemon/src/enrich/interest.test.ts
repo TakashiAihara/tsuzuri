@@ -1,9 +1,15 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { createDatabase, DEFAULT_USER_ID, insertEmbeddings, migrate } from "@tsuzuri/db";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  createDatabase,
+  DEFAULT_USER_ID,
+  insertEmbeddings,
+  interestClustersExists,
+  migrate,
+} from "@tsuzuri/db";
 
 import { loadConfig } from "../config.ts";
 import { createEmbeddingService } from "./embeddings.ts";
-import { createInterestService } from "./interest.ts";
+import { createInterestService, InterestPreconditionError } from "./interest.ts";
 
 /**
  * The service that turns reading history into a profile, end to end against a
@@ -60,9 +66,22 @@ describeIfDb("createInterestService", () => {
     await handle.close();
   });
 
-  beforeEach(async () => {
+  // Migrate once and truncate between tests, rather than dropping the schema
+  // each time. Dropping it changes every relation's OID underneath postgres.js's
+  // per-connection prepared-statement cache, and a statement first prepared in
+  // one test then reused in a later one stalls instead of failing cleanly.
+  beforeAll(async () => {
     await handle.sql.unsafe("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
     await migrate(handle.sql);
+  });
+
+  beforeEach(async () => {
+    await handle.sql.unsafe(
+      "TRUNCATE items, sources, item_state, item_sources RESTART IDENTITY CASCADE",
+    );
+    if (await interestClustersExists(handle.sql)) {
+      await handle.sql.unsafe("TRUNCATE interest_clusters");
+    }
 
     const [source] = await handle.sql<Array<{ id: string }>>`
       INSERT INTO sources (user_id, kind, url)
@@ -224,6 +243,34 @@ describeIfDb("createInterestService", () => {
     // a ranking bug, which is the whole reason the flag is on the wire.
     expect(explored.every((item) => item.interest === 0)).toBe(true);
     expect(new Set(page.items.map((item) => item.id)).size).toBe(page.items.length);
+  });
+
+  test("fills the page when scoring has fewer candidates than its share", async () => {
+    // The reserved share is a floor on exploration, not a ceiling on the page.
+    // With a narrow scoring window and a page of 7, splitting 6/1 and stopping
+    // would return 7 rows only by luck; the point is that leftover ranked
+    // capacity goes to exploration rather than being lost.
+    const { interest } = await ready({
+      INTEREST_EXPLORATION_RATIO: "0.2",
+      INTEREST_WINDOW_DAYS: "30",
+    });
+    for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "starred");
+    await interest.rebuild();
+
+    const page = await interest.rank({ limit: 7, unreadOnly: false, sourceId: null });
+    expect(page.items).toHaveLength(Object.keys(VECTORS).length);
+    expect(new Set(page.items.map((item) => item.id)).size).toBe(page.items.length);
+  });
+
+  test("reports a precondition rather than a server fault when the model is missing", async () => {
+    // Retrying will not fix a missing embedding model, so it must not reach the
+    // caller as a 5xx. Both preconditions have to be the same class or the
+    // endpoint's 400-vs-500 split is decided by which one happened to fail.
+    const cfg = config({ EMBEDDING_PROVIDER: "none" });
+    const embeddings = createEmbeddingService({ sql: handle.sql, config: cfg });
+    await embeddings.start();
+    const interest = createInterestService({ sql: handle.sql, config: cfg, embeddings });
+    await expect(interest.rebuild()).rejects.toThrow(InterestPreconditionError);
   });
 
   test("stays inactive, with a reason, below the signal threshold", async () => {
