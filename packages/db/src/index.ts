@@ -18,6 +18,24 @@ export {
   retryBackoffSeconds,
   writeEmbeddingModel,
 } from "./embeddings.ts";
+export {
+  createInterestClusters,
+  type ExplorationOptions,
+  explorationCandidates,
+  type InterestCluster,
+  interestClustersExists,
+  type ProfileSummary,
+  parseVectorLiteral,
+  readProfileSummary,
+  rebuildInterestClusters,
+  type ScoredItem,
+  type ScoreOptions,
+  type SignalledItem,
+  scoreItems,
+  signalCount,
+  signalledItems,
+  writeInterestProfile,
+} from "./interest.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
   DEFAULT_USER_ID,

@@ -2,7 +2,7 @@
 
 A self-hosted feed reader built for a CLI and for AI agents, with first-class support for sites that do not publish a feed at all.
 
-> Status: early. Phase 1 (ingest + CLI) works end to end. Search, MCP, AI processing, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
+> Status: early. Ingest, the CLI, hybrid search, the MCP server and interest scoring work end to end. Summarisation, tagging, clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
 
 ## Why another reader
 
@@ -52,6 +52,7 @@ tsuzuri feed import subscriptions.opml   # from Inoreader, Feedly, …
 tsuzuri fetch --all
 tsuzuri read
 tsuzuri search "機械学習"                   # works without any AI configured
+tsuzuri read --by score                   # ranked by what you actually read (opt-in)
 tsuzuri show <id>
 tsuzuri mark <id>
 tsuzuri doctor                            # what is enabled, what is not
@@ -139,6 +140,51 @@ tsuzuri reindex --embedding-model <the-new-model>
 
 That discards every existing vector, which is why it takes the model name: the flag confirms what is being rebuilt, it does not select it. `tsuzuri reindex` with no flag just reports backfill progress, since the daemon fills gaps on its own.
 
+### Ranked reading
+
+With a couple of hundred subscriptions, a thousand articles arrive in a day and the useful ten are somewhere in the middle. `tsuzuri read --by score` orders them by how well they match what you actually read.
+
+```bash
+INTEREST_SCORING_ENABLED=true bun run apps/daemon/src/index.ts
+
+tsuzuri read --by score
+tsuzuri read --by score --limit 10 --json   # includes the score and why it ranked
+```
+
+Off by default, and it needs an embedding model, so turning it on is two steps. The model is not implied by the embeddings: building a picture of what you read is its own thing to agree to, and the fact that it costs no API call does not make that decision for you.
+
+Your history becomes **several interests, not one average.** A single centroid over everything you read lands at a point that represents none of your interests — the midpoint of Rust, cooking and local news is not a topic. So the profile is several clusters, and an article scores against whichever one it is nearest. How many grows with your history, from two up to `INTEREST_CLUSTERS_MAX`: splitting thirty articles ten ways would be describing noise.
+
+Stars count three times a read, and everything decays: something you starred last year no longer decides what you are shown today. Skipping is the counterweight — a skipped article is charged to the interest it sits closest to, and that interest's scores fall in proportion. It fades rather than disappearing, and an interest you have never skipped near is unaffected. Skipping something that matches none of your interests costs nothing, rather than being blamed on whichever one happened to be least far away.
+
+Recency multiplies the result, so a week-old article keeps about a fifth of its score and yesterday's does not stay pinned all week. An article whose date had to be guessed — many feeds publish none — is discounted rather than treated as breaking news.
+
+**A fifth of every page is reserved for subscriptions you read least,** marked with a `·`, so ranking on your own history does not quietly narrow it to the things you already agree with.
+
+Ranking is never silent about itself. Until it is switched on, has a model, has enough history and has built a profile, `tsuzuri read --by score` returns the same list as always and says which of those is missing:
+
+```text
+not ranked: not enough reading history yet
+12 of 30 signals so far
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `INTEREST_SCORING_ENABLED` | `false` | Build the profile and score at all |
+| `INTEREST_MIN_SIGNALS` | `30` | Stars, reads and skips needed before ranking starts |
+| `INTEREST_SIGNAL_HALFLIFE_DAYS` | `30` | How fast your past reading stops counting |
+| `INTEREST_RECENCY_HALFLIFE_HOURS` | `72` | How fast an article's age discounts its score |
+| `INTEREST_ESTIMATED_DATE_FACTOR` | `0.7` | Discount for an article whose date was guessed |
+| `INTEREST_CLUSTERS_MAX` | `10` | Most interests to split your history into |
+| `INTEREST_SKIP_MAX_DISTANCE` | `0.6` | How near a skip must be to an interest to count against it |
+| `INTEREST_EXPLORATION_RATIO` | `0.2` | Share of a page reserved for subscriptions you read least |
+| `INTEREST_WINDOW_DAYS` | `30` | How far back a ranked page looks |
+| `INTEREST_MAX_PROFILE_ITEMS` | `5000` | Cap on the history read to build the profile |
+| `INTEREST_REBUILD_INTERVAL_MINUTES` | `60` | How often the profile is rebuilt |
+| `TIMELINE_DEFAULT_SORT` | `recent` | `recent` or `score`, when `--by` is not given |
+
+The profile rebuilds on its own; `tsuzuri doctor` shows whether ranking is active and how many interests it found. Switching embedding models discards it along with the vectors, since a profile only means something in the space it was built in.
+
 ## MCP server
 
 Agents are a first-class way in, not a wrapper over the CLI. Their useful granularity is not a human's, so the tools are designed rather than transliterated.
@@ -219,8 +265,8 @@ This narrows the exposure rather than eliminating it. The address is checked by 
 | Phase | Scope | State |
 | --- | --- | --- |
 | P1 | Ingest (RSS/Atom/JSON Feed), storage, CLI, OPML import | done |
-| P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | next |
-| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | |
+| P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | done |
+| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | in progress |
 | P4 | Web UI (React + TanStack + shadcn/ui), packaging | |
 | P5 | Source plugins: declarative YAML rules (CSS/XPath), TypeScript plugins, external generators | |
 | P6 | Headless rendering, LLM-based extraction and rule repair | |

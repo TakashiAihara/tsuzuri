@@ -4,9 +4,11 @@ import {
   errorResponseSchema,
   importOpmlResponseSchema,
   ingestRunResponseSchema,
+  interestStatusSchema,
   itemResponseSchema,
   itemStateResponseSchema,
   itemsResponseSchema,
+  rankedItemsResponseSchema,
   searchResponseSchema,
   sourcesResponseSchema,
 } from "@tsuzuri/api";
@@ -16,6 +18,7 @@ import type { z } from "zod";
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { createInterestService } from "./enrich/interest.ts";
 
 /**
  * The daemon's real responses, parsed through the shared contract.
@@ -73,7 +76,16 @@ describeIfDb("api contract", () => {
     const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
     const embeddings = createEmbeddingService({ sql: handle.sql, config });
     await embeddings.start();
-    app = createApi({ db: handle.db, sql: handle.sql, fetcher: fetch, config, embeddings });
+    const interest = createInterestService({ sql: handle.sql, config, embeddings });
+    await interest.start();
+    app = createApi({
+      db: handle.db,
+      sql: handle.sql,
+      fetcher: fetch,
+      config,
+      embeddings,
+      interest,
+    });
   });
 
   afterAll(async () => {
@@ -127,6 +139,20 @@ describeIfDb("api contract", () => {
     const body = await parsed(searchResponseSchema, "/search?q=Rust");
     expect(body.mode).toBe("text-only");
     expect(body.results[0]?.id).toBe(ITEM_ID);
+  });
+
+  test("GET /items?sort=score", async () => {
+    // The degraded shape is the one every install sees until scoring is turned
+    // on, so it is the one the contract has to hold.
+    const body = await parsed(rankedItemsResponseSchema, "/items?sort=score&unread=false");
+    expect(body.scoring.active).toBe(false);
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]?.exploration).toBe(false);
+  });
+
+  test("GET /interest/status", async () => {
+    const body = await parsed(interestStatusSchema, "/interest/status");
+    expect(body.enabled).toBe(false);
   });
 
   test("GET /embeddings/status", async () => {

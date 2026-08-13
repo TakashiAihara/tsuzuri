@@ -151,9 +151,101 @@ export const embeddingStatusSchema = z.strictObject({
 });
 export type EmbeddingStatus = z.infer<typeof embeddingStatusSchema>;
 
+/**
+ * Why a listing came back in date order rather than ranked.
+ *
+ * Scoring switched off, no embedding model, a model mismatch, too little
+ * history and a profile that has not been built yet all produce the same list,
+ * so the list cannot say which happened. Same argument as `mode` and `reason`
+ * on a search response, and the same shape.
+ */
+export const scoringStateSchema = z.union([
+  z.strictObject({
+    active: z.literal(true),
+    signals: z.number(),
+    required: z.number(),
+    clusters: z.number(),
+  }),
+  z.strictObject({
+    active: z.literal(false),
+    reason: z.string(),
+    signals: z.number(),
+    required: z.number(),
+  }),
+]);
+export type ScoringState = z.infer<typeof scoringStateSchema>;
+
+/**
+ * An item in a ranked listing.
+ *
+ * `interest` is the fused score and `exploration` marks a row the score did not
+ * choose. The flag is not decoration: without it, an item that ranking did not
+ * pick is indistinguishable from a ranking bug.
+ */
+export const rankedItemSchema = z.strictObject({
+  id: z.string(),
+  url: z.string(),
+  title: z.string().nullable(),
+  author: z.string().nullable(),
+  publishedAt: z.string(),
+  publishedAtEstimated: z.boolean(),
+  summary: z.string().nullable(),
+  readAt: z.string().nullable(),
+  starredAt: z.string().nullable(),
+  interest: z.number(),
+  affinitySimilarity: z.number(),
+  exploration: z.boolean(),
+});
+export type RankedItem = z.infer<typeof rankedItemSchema>;
+
+/**
+ * Written out as two closed shapes rather than an intersection with
+ * `scoringStateSchema`. Intersecting a strictObject with anything rejects every
+ * key the other side adds, so the strictness that catches a field appearing --
+ * the reason these schemas are closed at all -- would have had to be given up.
+ */
+export const interestStatusSchema = z.union([
+  z.strictObject({
+    // literal(true): the daemon cannot report active scoring while the feature
+    // is off, and a client type that admits the combination invites handling
+    // for a state that never occurs.
+    enabled: z.literal(true),
+    builtAt: z.string().nullable(),
+    active: z.literal(true),
+    signals: z.number(),
+    required: z.number(),
+    clusters: z.number(),
+  }),
+  z.strictObject({
+    enabled: z.boolean(),
+    builtAt: z.string().nullable(),
+    active: z.literal(false),
+    reason: z.string(),
+    signals: z.number(),
+    required: z.number(),
+  }),
+]);
+export type InterestStatus = z.infer<typeof interestStatusSchema>;
+
+export const rebuildInterestResponseSchema = z.strictObject({
+  clusters: z.number(),
+  signals: z.number(),
+});
+
 export const sourcesResponseSchema = z.strictObject({ sources: z.array(sourceSchema) });
 export const sourceResponseSchema = z.strictObject({ source: sourceSchema });
 export const itemsResponseSchema = z.strictObject({ items: z.array(itemSummarySchema) });
+/**
+ * A ranked listing.
+ *
+ * A separate shape from `itemsResponseSchema` rather than optional fields on
+ * it. A caller asking for date order gets no score, and a score that is
+ * sometimes absent would have to be defended at every use.
+ */
+export const rankedItemsResponseSchema = z.strictObject({
+  items: z.array(rankedItemSchema),
+  scoring: scoringStateSchema,
+});
 export const itemResponseSchema = z.strictObject({ item: itemSchema });
 export const itemStateResponseSchema = z.strictObject({ state: itemStateSchema });
 

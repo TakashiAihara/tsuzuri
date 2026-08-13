@@ -1,5 +1,7 @@
 import type postgres from "postgres";
 
+import { createInterestClusters, rebuildInterestClusters } from "./interest.ts";
+
 /**
  * The item_embeddings table: runtime DDL and the queries over it.
  *
@@ -138,6 +140,11 @@ export async function createEmbeddingTable(sql: SqlLike, dimensions: number): Pr
 export async function ensureItemEmbeddings(sql: postgres.Sql, dimensions: number): Promise<void> {
   await createEmbeddingTable(sql, dimensions);
   await createEmbeddingIndex(sql);
+  // The interest profile lives in the same vector space and is built at the
+  // same dimension, so the two tables are created together. Keeping the pair in
+  // one place is what stops a restart finding vectors with no profile table to
+  // rank against.
+  await createInterestClusters(sql, dimensions);
 }
 
 /** Whether the vector table exists yet. */
@@ -199,6 +206,11 @@ export async function rebuildItemEmbeddings(sql: postgres.Sql, dimensions: numbe
     // schedule forward would hold items back from a model that might embed
     // them without complaint.
     await tx`TRUNCATE embedding_failures`;
+
+    // Every centroid is an average of vectors that are being discarded, so the
+    // profile goes with them. Leaving it would rank the new model's vectors
+    // against the old model's idea of what the reader likes.
+    await rebuildInterestClusters(tx, n);
   });
 }
 

@@ -1,6 +1,14 @@
 #!/usr/bin/env bun
 import { readFile } from "node:fs/promises";
-import type { EmbeddingStatus, Item, ItemSummary, SearchResponse, Source } from "@tsuzuri/api";
+import type {
+  EmbeddingStatus,
+  Item,
+  ItemSummary,
+  RankedItem,
+  ScoringState,
+  SearchResponse,
+  Source,
+} from "@tsuzuri/api";
 import { snippetToText } from "@tsuzuri/core";
 import { Command } from "commander";
 
@@ -14,6 +22,8 @@ import { Command } from "commander";
  * Convention throughout: data goes to stdout (machine readable with --json),
  * everything else goes to stderr, so output can be piped without filtering.
  */
+
+type RankedItemsResponse = { items: RankedItem[]; scoring: ScoringState };
 
 const DEFAULT_ENDPOINT = process.env.TSUZURI_ENDPOINT ?? "http://127.0.0.1:8787";
 
@@ -154,15 +164,57 @@ program
   .option("--limit <n>", "how many", "20")
   .option("--source <id>", "restrict to one subscription")
   .option("--all", "include items already read")
-  .action(async (opts: { limit: string; source?: string; all?: boolean }) => {
+  // No default: an omitted --by sends no `sort`, which leaves the choice to the
+  // daemon's TIMELINE_DEFAULT_SORT. Defaulting to "recent" here would send it
+  // explicitly and make that setting unreachable from the CLI.
+  .option("--by <order>", "recent or score (default: the daemon's setting)")
+  .action(async (opts: { limit: string; source?: string; all?: boolean; by?: string }) => {
     const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
     if (opts.source) params.set("sourceId", opts.source);
-    const { items } = await call<{ items: ItemSummary[] }>(globals(), `/items?${params}`);
-    if (globals().json) return printJson(items);
-    if (items.length === 0) return log("nothing unread");
-    for (const item of items) {
+    if (opts.by) params.set("sort", opts.by);
+
+    // Which shape came back is a property of the response, not of the flag,
+    // precisely because the daemon may have chosen the ordering.
+    const body = await call<{ items: ItemSummary[] } | RankedItemsResponse>(
+      globals(),
+      `/items?${params}`,
+    );
+    if (!("scoring" in body)) {
+      // Same JSON shape either way. Which branch runs depends on the daemon's
+      // TIMELINE_DEFAULT_SORT when --by is omitted, and a script parsing this
+      // cannot see that setting -- so emitting an array here and an object
+      // below would change the contract of `tsuzuri read --json` based on
+      // server configuration. `scoring: null` is "no ranking was applied".
+      if (globals().json) return printJson({ items: body.items, scoring: null });
+      if (body.items.length === 0) return log("nothing unread");
+      for (const item of body.items) {
+        out(
+          `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
+        );
+      }
+      return;
+    }
+
+    const response = body;
+    if (globals().json) return printJson(response);
+
+    // Say when the list is not actually ranked. Dates and scores produce the
+    // same-looking list, so silence here reads as "ranking thinks this is the
+    // order", which is the one thing it does not mean.
+    if (!response.scoring.active) {
+      log(`not ranked: ${response.scoring.reason}`);
+      if (response.scoring.signals < response.scoring.required) {
+        log(`${response.scoring.signals} of ${response.scoring.required} signals so far`);
+      }
+    }
+    if (response.items.length === 0) return log("nothing unread");
+
+    for (const item of response.items) {
+      // A leading dot marks a row the score did not choose. Without it, an
+      // exploration slot is indistinguishable from a ranking bug.
+      const mark = item.exploration ? "·" : " ";
       out(
-        `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
+        `${mark}${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
       );
     }
   });
