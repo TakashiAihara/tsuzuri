@@ -180,7 +180,12 @@ program
       `/items?${params}`,
     );
     if (!("scoring" in body)) {
-      if (globals().json) return printJson(body.items);
+      // Same JSON shape either way. Which branch runs depends on the daemon's
+      // TIMELINE_DEFAULT_SORT when --by is omitted, and a script parsing this
+      // cannot see that setting -- so emitting an array here and an object
+      // below would change the contract of `tsuzuri read --json` based on
+      // server configuration. `scoring: null` is "no ranking was applied".
+      if (globals().json) return printJson({ items: body.items, scoring: null });
       if (body.items.length === 0) return log("nothing unread");
       for (const item of body.items) {
         out(

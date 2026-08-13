@@ -343,7 +343,7 @@ export function createInterestService(deps: {
         );
       }
       if (!embeddings.activeProvider()) {
-        throw new Error(
+        throw new InterestPreconditionError(
           "interest scoring needs an embedding model that matches the stored vectors",
         );
       }
@@ -354,10 +354,7 @@ export function createInterestService(deps: {
       const state = await inactiveReason();
       if (state) return { items: [], scoring: state };
 
-      const { ranked, explore } = explorationSlots(
-        options.limit,
-        config.INTEREST_EXPLORATION_RATIO,
-      );
+      const { ranked } = explorationSlots(options.limit, config.INTEREST_EXPLORATION_RATIO);
 
       const scored = await scoreItems(sql, {
         userId,
@@ -369,9 +366,13 @@ export function createInterestService(deps: {
         windowDays: config.INTEREST_WINDOW_DAYS,
       });
 
+      // Whatever scoring did not fill, exploration may. The reserved share is a
+      // floor on exploration, not a ceiling on the page: a window with five
+      // scoreable items should not return a page of fifteen when fifty were
+      // asked for and the candidates exist.
       const exploration = await explorationCandidates(sql, {
         userId,
-        limit: explore,
+        limit: options.limit - scored.length,
         unreadOnly: options.unreadOnly,
         sourceId: options.sourceId,
         windowDays: config.INTEREST_WINDOW_DAYS,
