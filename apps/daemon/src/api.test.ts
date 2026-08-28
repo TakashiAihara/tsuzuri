@@ -44,7 +44,14 @@ describeIfDb("api", () => {
     const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
     const embeddings = createEmbeddingService({ sql: handle.sql, config });
     await embeddings.start();
-    app = createApi({ db: handle.db, sql: handle.sql, fetcher: fetch, config, embeddings });
+    app = createApi({
+      db: handle.db,
+      sql: handle.sql,
+      fetcher: fetch,
+      config,
+      embeddings,
+      chatProvider: null,
+    });
   });
 
   afterAll(async () => {

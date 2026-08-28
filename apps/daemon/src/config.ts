@@ -87,6 +87,23 @@ const configSchema = z.object({
   SCORING_EXPLORATION_SHARE: z.coerce.number().min(0).max(0.5).default(0.15),
 
   /**
+   * LLM enrichment. Off by default like everything else AI-shaped, and
+   * unlike embeddings a model change here costs nothing: no stored shape
+   * depends on which model wrote a summary.
+   */
+  CHAT_PROVIDER: z.enum(["none", "openai-compatible"]).default("none"),
+  CHAT_BASE_URL: z.string().optional(),
+  CHAT_API_KEY: z.string().optional(),
+  CHAT_MODEL: z.string().optional(),
+  CHAT_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  /** Articles per kind per pass. Every one is a model call. */
+  ENRICH_TOP_N: z.coerce.number().int().positive().max(500).default(50),
+  /** How far back enrichment looks. Older articles are not worth a call. */
+  ENRICH_WINDOW_HOURS: z.coerce.number().positive().default(48),
+  /** Target language for translations. Unset means translation is off. */
+  ENRICH_TRANSLATE_TO: z.string().optional(),
+
+  /**
    * Duplicate clustering. Needs no provider: SimHash alone clusters
    * syndicated copy, and the embedding signal widens it where vectors exist.
    */
@@ -118,14 +135,27 @@ const configSchema = z.object({
  * the missing variable named.
  */
 const configSchemaWithEmbeddingRules = configSchema.superRefine((config, ctx) => {
-  if (config.EMBEDDING_PROVIDER === "none") return;
-  for (const key of ["EMBEDDING_BASE_URL", "EMBEDDING_MODEL"] as const) {
-    if (!config[key]) {
-      ctx.addIssue({
-        code: "custom",
-        path: [key],
-        message: `required when EMBEDDING_PROVIDER is "${config.EMBEDDING_PROVIDER}"`,
-      });
+  if (config.EMBEDDING_PROVIDER !== "none") {
+    for (const key of ["EMBEDDING_BASE_URL", "EMBEDDING_MODEL"] as const) {
+      if (!config[key]) {
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message: `required when EMBEDDING_PROVIDER is "${config.EMBEDDING_PROVIDER}"`,
+        });
+      }
+    }
+  }
+
+  if (config.CHAT_PROVIDER !== "none") {
+    for (const key of ["CHAT_BASE_URL", "CHAT_MODEL"] as const) {
+      if (!config[key]) {
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message: `required when CHAT_PROVIDER is "${config.CHAT_PROVIDER}"`,
+        });
+      }
     }
   }
 });

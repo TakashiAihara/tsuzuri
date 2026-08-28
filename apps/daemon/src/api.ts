@@ -1,4 +1,4 @@
-import { searchTerms } from "@tsuzuri/core";
+import { type ChatProvider, searchTerms } from "@tsuzuri/core";
 import {
   clusteringStatus,
   clusterMembers,
@@ -42,6 +42,8 @@ export type ApiDeps = {
   fetcher: Fetcher;
   config: Config;
   embeddings: EmbeddingService;
+  /** Null when no chat model is configured, which is the default. */
+  chatProvider: ChatProvider | null;
 };
 
 const addSourceSchema = z.object({

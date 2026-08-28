@@ -34,6 +34,27 @@ export {
   retryBackoffSeconds,
   writeEmbeddingModel,
 } from "./embeddings.ts";
+export {
+  approvedTags,
+  approveTag,
+  clearEnrichmentFailure,
+  type EnrichmentCandidate,
+  type EnrichmentKind,
+  type EnrichmentRow,
+  type EnrichmentStatus,
+  enrichmentBackoffSeconds,
+  enrichmentCandidates,
+  enrichmentStatus,
+  itemTags,
+  latestEnrichments,
+  listVocabulary,
+  recordCandidates,
+  recordEnrichmentFailure,
+  rejectTag,
+  setItemTags,
+  type VocabularyRow,
+  writeEnrichment,
+} from "./enrichments.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
   clusters,

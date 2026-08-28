@@ -1,3 +1,4 @@
+import { createChatProvider } from "@tsuzuri/core";
 import { createDatabase, migrate } from "@tsuzuri/db";
 import PQueue from "p-queue";
 
@@ -5,7 +6,8 @@ import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { startClusterWorker } from "./enrich/cluster-worker.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
-import { startProfileWorker } from "./enrich/profile.ts";
+import { startEnrichWorker } from "./enrich/enrich-worker.ts";
+import { profileStatus, startProfileWorker } from "./enrich/profile.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
 
@@ -85,7 +87,32 @@ const profileWorker = startProfileWorker({ sql, config, embeddings });
 // install with no AI configured at all.
 const clusterWorker = startClusterWorker({ sql, config });
 
-const app = createApi({ db, sql, fetcher, config, embeddings });
+/**
+ * Enrichment only starts when a chat model is configured. Unlike the other
+ * workers there is no useful degraded mode: without a provider there is
+ * nothing to call, and a loop that wakes every fifteen minutes to discover
+ * that again is just noise in the log.
+ */
+const chatProvider = createChatProvider({
+  provider: config.CHAT_PROVIDER,
+  baseUrl: config.CHAT_BASE_URL,
+  apiKey: config.CHAT_API_KEY,
+  model: config.CHAT_MODEL,
+  requestTimeoutMs: config.CHAT_REQUEST_TIMEOUT_MS,
+});
+const enrichWorker = chatProvider
+  ? startEnrichWorker({
+      sql,
+      config,
+      provider: chatProvider,
+      scoringActive: async () => (await profileStatus(sql, config)).active,
+    })
+  : null;
+if (chatProvider) {
+  console.error(`enrichment enabled: ${chatProvider.id}/${chatProvider.model}`);
+}
+
+const app = createApi({ db, sql, fetcher, config, embeddings, chatProvider });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
@@ -97,7 +124,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     await server.stop();
     profileWorker.stop();
     clusterWorker.stop();
-    await Promise.all([profileWorker.done, clusterWorker.done]);
+    enrichWorker?.stop();
+    await Promise.all([profileWorker.done, clusterWorker.done, enrichWorker?.done]);
     await embeddings.stop();
     await close();
     process.exit(0);
