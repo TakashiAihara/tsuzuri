@@ -15,6 +15,54 @@ export function halfLifeDecay(ageMs: number, halfLifeMs: number): number {
   return 2 ** (-ageMs / halfLifeMs);
 }
 
+export type InteractionTimestamps = {
+  readAt: Date | null;
+  starredAt: Date | null;
+  skippedAt: Date | null;
+  savedAt: Date | null;
+};
+
+export type InteractionSignal = {
+  /** Positive for interest, negative for a skip, already time-decayed. */
+  weight: number;
+  /** When the winning interaction happened. */
+  at: Date;
+};
+
+/** Base weights per interaction kind (design D13/#4): an explicit act of keeping outweighs reading, and a skip counts against. */
+const STAR_WEIGHT = 3.0;
+const SAVE_WEIGHT = 3.0;
+const READ_WEIGHT = 1.0;
+const SKIP_WEIGHT = -1.0;
+
+/**
+ * Collapse one item_state row into a single signal.
+ *
+ * The strongest interaction wins: a star after a skip means interest, not a
+ * tie. Decay applies from the winning interaction's own timestamp, so an old
+ * star fades the same way an old read does. Returns null when no interaction
+ * has happened, which is most rows a timeline ever touches.
+ */
+export function interactionSignal(
+  state: InteractionTimestamps,
+  now: Date,
+  halfLifeMs: number,
+): InteractionSignal | null {
+  const winner = state.starredAt
+    ? { weight: STAR_WEIGHT, at: state.starredAt }
+    : state.savedAt
+      ? { weight: SAVE_WEIGHT, at: state.savedAt }
+      : state.readAt
+        ? { weight: READ_WEIGHT, at: state.readAt }
+        : state.skippedAt
+          ? { weight: SKIP_WEIGHT, at: state.skippedAt }
+          : null;
+  if (!winner) return null;
+
+  const decay = halfLifeDecay(now.getTime() - winner.at.getTime(), halfLifeMs);
+  return { weight: winner.weight * decay, at: winner.at };
+}
+
 export type WeightedVector = {
   vector: readonly number[];
   /** Signal strength × time decay. Must be positive: negative signals (skips) do not cluster, they are applied by the caller against cluster weights. */

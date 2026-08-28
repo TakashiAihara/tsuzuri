@@ -10,7 +10,15 @@ import {
   searchResponseSchema,
   sourcesResponseSchema,
 } from "@tsuzuri/api";
-import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
+import {
+  createDatabase,
+  createEmbeddingTable,
+  DEFAULT_USER_ID,
+  ensureInterestClusters,
+  insertEmbeddings,
+  migrate,
+  replaceInterestClusters,
+} from "@tsuzuri/db";
 import type { z } from "zod";
 
 import { createApi } from "./api.ts";
@@ -107,6 +115,32 @@ describeIfDb("api contract", () => {
     // Only the item with a subscription; the twins exist to make a prefix
     // ambiguous and are not attached to one.
     expect(body.items).toHaveLength(1);
+  });
+
+  test("GET /items?order=interest before there is a profile", async () => {
+    // Interest order with no profile answers chronologically and says why,
+    // like search's text-only mode.
+    const body = await parsed(itemsResponseSchema, "/items?unread=false&order=interest");
+    expect(body.scoring?.active).toBe(false);
+    expect(body.scoring?.reason).toMatch(/interactions/);
+    expect(body.items).toHaveLength(1);
+  });
+
+  test("GET /items?order=interest with a profile", async () => {
+    await createEmbeddingTable(handle.sql, 4);
+    await insertEmbeddings(handle.sql, [{ itemId: ITEM_ID, vector: "[1,0,0,0]" }]);
+    await ensureInterestClusters(handle.sql, 4);
+    await replaceInterestClusters(
+      handle.sql,
+      DEFAULT_USER_ID,
+      [{ centroid: "[1,0,0,0]", weight: 1, itemCount: 1 }],
+      new Date(),
+    );
+
+    const body = await parsed(itemsResponseSchema, "/items?unread=false&order=interest");
+    expect(body.scoring?.active).toBe(true);
+    const hit = body.items.find((item) => item.id === ITEM_ID);
+    expect(hit?.interestScore ?? 0).toBeGreaterThan(0.5);
   });
 
   test("GET /items/:id", async () => {

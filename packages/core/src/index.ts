@@ -17,7 +17,10 @@ export { contentHash, itemIdentity, sha256 } from "./hash.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export {
   halfLifeDecay,
+  type InteractionSignal,
+  type InteractionTimestamps,
   type InterestCentroid,
+  interactionSignal,
   type KMeansOptions,
   kmeans,
   maxCosineSimilarity,

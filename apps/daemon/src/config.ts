@@ -70,6 +70,23 @@ const configSchema = z.object({
   EMBEDDING_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   /**
+   * Interest scoring. No enable flag of its own: it runs exactly when
+   * embeddings do, because interest clusters live in the same vector space.
+   */
+  /** Half-life for interaction signals. Interests move in weeks. */
+  SCORING_HALF_LIFE_DAYS: z.coerce.number().positive().default(30),
+  /** Half-life for the freshness term on scored timelines. Timelines move in days. */
+  SCORING_FRESHNESS_HALF_LIFE_HOURS: z.coerce.number().positive().default(48),
+  /** How many interest clusters to build. A fixed k keeps ranking stable run to run. */
+  SCORING_CLUSTERS: z.coerce.number().int().min(2).max(32).default(8),
+  /** How often the profile is rebuilt from history. */
+  SCORING_REBUILD_INTERVAL_MS: z.coerce.number().int().positive().default(21_600_000),
+  /** Interactions (with embeddings) required before scoring activates. */
+  SCORING_MIN_INTERACTIONS: z.coerce.number().int().positive().default(30),
+  /** Share of an interest-ordered page reserved for items the score did not choose. */
+  SCORING_EXPLORATION_SHARE: z.coerce.number().min(0).max(0.5).default(0.15),
+
+  /**
    * Cosine distance beyond which a vector candidate is not a result.
    *
    * The vector arm returns its nearest N however far away they are, so without

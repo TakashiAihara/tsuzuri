@@ -199,6 +199,11 @@ export async function rebuildItemEmbeddings(sql: postgres.Sql, dimensions: numbe
     // schedule forward would hold items back from a model that might embed
     // them without complaint.
     await tx`TRUNCATE embedding_failures`;
+
+    // The interest profile lives in the same vector space, so it dies with the
+    // model too. Dropped rather than truncated because its column dimension is
+    // also wrong now; the profile worker recreates it from re-embedded history.
+    await tx.unsafe(`DROP TABLE IF EXISTS interest_clusters`);
   });
 }
 

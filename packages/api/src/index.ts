@@ -64,6 +64,13 @@ export const itemSummarySchema = z.strictObject({
   summary: z.string().nullable(),
   readAt: z.string().nullable(),
   starredAt: z.string().nullable(),
+  /**
+   * Present only on interest-ordered listings. Null there means the item has
+   * no embedding yet; it is listed last rather than hidden.
+   */
+  interestScore: z.number().nullable().optional(),
+  /** True for items the exploration slot picked rather than the score. */
+  exploration: z.boolean().optional(),
 });
 export type ItemSummary = z.infer<typeof itemSummarySchema>;
 
@@ -153,7 +160,20 @@ export type EmbeddingStatus = z.infer<typeof embeddingStatusSchema>;
 
 export const sourcesResponseSchema = z.strictObject({ sources: z.array(sourceSchema) });
 export const sourceResponseSchema = z.strictObject({ source: sourceSchema });
-export const itemsResponseSchema = z.strictObject({ items: z.array(itemSummarySchema) });
+/**
+ * `scoring` appears only when interest order was asked for, and says whether
+ * it was actually applied: an inactive profile answers chronologically with
+ * the reason, the same shape of honesty as search's text-only mode.
+ */
+export const itemsResponseSchema = z.strictObject({
+  items: z.array(itemSummarySchema),
+  scoring: z
+    .strictObject({
+      active: z.boolean(),
+      reason: z.string().optional(),
+    })
+    .optional(),
+});
 export const itemResponseSchema = z.strictObject({ item: itemSchema });
 export const itemStateResponseSchema = z.strictObject({ state: itemStateSchema });
 

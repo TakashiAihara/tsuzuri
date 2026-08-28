@@ -4,6 +4,7 @@ import PQueue from "p-queue";
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { startProfileWorker } from "./enrich/profile.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
 
@@ -78,6 +79,8 @@ try {
   console.error("embeddings could not be started:", error);
 }
 
+const profileWorker = startProfileWorker({ sql, config, embeddings });
+
 const app = createApi({ db, sql, fetcher, config, embeddings });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
@@ -88,6 +91,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     stopping = true;
     await server.stop();
+    profileWorker.stop();
+    await profileWorker.done;
     await embeddings.stop();
     await close();
     process.exit(0);

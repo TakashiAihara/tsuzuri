@@ -35,6 +35,22 @@ export {
   users,
 } from "./schema.ts";
 export {
+  dropInterestClusters,
+  ensureInterestClusters,
+  explorationItems,
+  type InteractionRow,
+  type InterestClusterRow,
+  interactionCount,
+  interactionRows,
+  interestClustersExist,
+  type NewInterestCluster,
+  readInterestClusters,
+  replaceInterestClusters,
+  type ScoredItemRow,
+  type ScoredItemsOptions,
+  scoredItems,
+} from "./scoring.ts";
+export {
   DEFAULT_MAX_DISTANCE,
   hybridSearch,
   type SearchFilters,

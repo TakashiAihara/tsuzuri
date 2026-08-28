@@ -139,6 +139,28 @@ tsuzuri reindex --embedding-model <the-new-model>
 
 That discards every existing vector, which is why it takes the model name: the flag confirms what is being rebuilt, it does not select it. `tsuzuri reindex` with no flag just reports backfill progress, since the daemon fills gaps on its own.
 
+### Interest scoring
+
+Once embeddings run, the reader starts learning what you actually open. There is no switch of its own: scoring is derived entirely from vectors and your own reads, stars and skips, so it runs exactly when embeddings do and costs no extra model calls.
+
+```bash
+tsuzuri read --order interest
+```
+
+Until enough history exists the same command answers newest-first and says `chronological (12/30 interactions)`, so a fresh install is never silently reordered by a profile that does not exist yet. After the threshold, the daemon periodically clusters your reading history into a handful of interest centroids — several, not one, because the average of unrelated interests is a point that is none of them — and each article scores by its similarity to the nearest one, decayed by age.
+
+A configurable share of every scored page is reserved for recent items the score did *not* choose, drawn from subscriptions you have never touched first. Ranking on your own history otherwise closes the loop on itself. These rows are marked (`+` in the CLI, `"exploration": true` in the API).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SCORING_MIN_INTERACTIONS` | `30` | Interactions (on embedded items) before scoring activates |
+| `SCORING_CLUSTERS` | `8` | Interest clusters to build |
+| `SCORING_HALF_LIFE_DAYS` | `30` | How fast old interactions fade from the profile |
+| `SCORING_FRESHNESS_HALF_LIFE_HOURS` | `48` | How fast an article's score decays with age |
+| `SCORING_EXPLORATION_SHARE` | `0.15` | Share of a scored page reserved for exploration |
+
+Skipping articles counts against the topic they belong to: skip a topic persistently and its cluster fades from the profile. Reindexing embeddings (`tsuzuri reindex --embedding-model`) discards the profile with the vectors — it lives in the same vector space — and it rebuilds itself once backfill catches up. `tsuzuri doctor` shows whether scoring is active, how far history has accumulated, and the shape of the current profile.
+
 ## MCP server
 
 Agents are a first-class way in, not a wrapper over the CLI. Their useful granularity is not a human's, so the tools are designed rather than transliterated.
@@ -219,8 +241,8 @@ This narrows the exposure rather than eliminating it. The address is checked by 
 | Phase | Scope | State |
 | --- | --- | --- |
 | P1 | Ingest (RSS/Atom/JSON Feed), storage, CLI, OPML import | done |
-| P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | next |
-| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | |
+| P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | done |
+| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | in progress |
 | P4 | Web UI (React + TanStack + shadcn/ui), packaging | |
 | P5 | Source plugins: declarative YAML rules (CSS/XPath), TypeScript plugins, external generators | |
 | P6 | Headless rendering, LLM-based extraction and rule repair | |

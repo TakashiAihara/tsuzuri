@@ -2,10 +2,12 @@ import { searchTerms } from "@tsuzuri/core";
 import {
   type Database,
   DEFAULT_USER_ID,
+  explorationItems,
   hybridSearch,
   itemSources,
   itemState,
   items,
+  scoredItems,
   sources,
 } from "@tsuzuri/db";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
@@ -16,6 +18,7 @@ import { z } from "zod";
 
 import type { Config } from "./config.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
+import { profileStatus } from "./enrich/profile.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
@@ -58,7 +61,34 @@ const listItemsSchema = z.object({
   unread: z.stringbool().default(true),
   limit: z.coerce.number().int().min(1).max(500).default(50),
   sourceId: z.uuid().optional(),
+  order: z.enum(["published", "interest"]).default("published"),
 });
+
+/**
+ * Spread exploration picks through the page instead of appending them.
+ *
+ * A block of unscored items at the bottom of a scored list is a block nobody
+ * scrolls to, which would quietly turn the exploration share into zero.
+ */
+function interleave<T>(scored: T[], exploration: T[]): T[] {
+  if (exploration.length === 0) return scored;
+  const merged: T[] = [];
+  const step = Math.max(1, Math.floor((scored.length + exploration.length) / exploration.length));
+  let nextExploration = 0;
+  for (let i = 0; i < scored.length; i++) {
+    if (merged.length % step === step - 1 && nextExploration < exploration.length) {
+      const pick = exploration[nextExploration++];
+      if (pick !== undefined) merged.push(pick);
+    }
+    const item = scored[i];
+    if (item !== undefined) merged.push(item);
+  }
+  while (nextExploration < exploration.length) {
+    const pick = exploration[nextExploration++];
+    if (pick !== undefined) merged.push(pick);
+  }
+  return merged;
+}
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
@@ -172,8 +202,63 @@ export function createApi(deps: ApiDeps) {
   app.get("/items", async (c) => {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
-    const { unread, limit, sourceId } = parsed.data;
+    const { unread, limit, sourceId, order } = parsed.data;
 
+    /**
+     * Interest order, when there is a profile to order by.
+     *
+     * With no profile the answer degrades to the chronological listing below
+     * and says so, mirroring text-only mode in search: an empty or oddly
+     * ordered page cannot explain itself, so the response does.
+     */
+    if (order === "interest") {
+      const profile = await profileStatus(rawSql, config);
+      if (profile.active) {
+        const explorationBudget = Math.min(
+          Math.floor(limit * config.SCORING_EXPLORATION_SHARE),
+          limit - 1,
+        );
+        const scored = await scoredItems(rawSql, {
+          userId: DEFAULT_USER_ID,
+          limit: limit - explorationBudget,
+          unreadOnly: unread,
+          sourceId: sourceId ?? null,
+          freshnessHalfLifeMs: config.SCORING_FRESHNESS_HALF_LIFE_HOURS * 3_600_000,
+        });
+        const exploration = await explorationItems(rawSql, {
+          userId: DEFAULT_USER_ID,
+          limit: limit - scored.length,
+          unreadOnly: unread,
+          sourceId: sourceId ?? null,
+          excludeIds: scored.map((row) => row.id),
+        });
+        const rows = interleave(
+          scored,
+          exploration.map((row) => ({ ...row, exploration: true })),
+        );
+        return c.json({ items: rows, scoring: { active: true } });
+      }
+      // Fall through to the chronological listing, labelled with why.
+      const rows = await listItemsChronological({ unread, limit, sourceId });
+      return c.json({
+        items: rows,
+        scoring: {
+          active: false,
+          reason: `${profile.signals}/${profile.threshold} interactions`,
+        },
+      });
+    }
+
+    const rows = await listItemsChronological({ unread, limit, sourceId });
+    return c.json({ items: rows });
+  });
+
+  async function listItemsChronological(options: {
+    unread: boolean;
+    limit: number;
+    sourceId?: string;
+  }) {
+    const { unread, limit, sourceId } = options;
     const conditions = [];
     if (unread) conditions.push(isNull(itemState.readAt));
     if (sourceId) conditions.push(eq(itemSources.sourceId, sourceId));
@@ -200,8 +285,8 @@ export function createApi(deps: ApiDeps) {
       .orderBy(desc(items.publishedAt), items.id)
       .limit(limit);
 
-    return c.json({ items: rows });
-  });
+    return rows;
+  }
 
   /**
    * Resolve an item id that may have been abbreviated.
@@ -382,6 +467,7 @@ export function createApi(deps: ApiDeps) {
       .from(sql`(SELECT 1) AS t`);
 
     const embeddingStatus = await embeddings.status();
+    const scoring = await profileStatus(rawSql, config);
 
     return c.json({
       database: { extensions: [...extensions] },
@@ -390,6 +476,12 @@ export function createApi(deps: ApiDeps) {
         embeddings: {
           enabled: embeddingStatus.state === "ready",
           ...embeddingStatus,
+        },
+        // Scoring has no switch of its own: it runs exactly when embeddings
+        // do, and "active" is about having enough history, not configuration.
+        scoring: {
+          enabled: embeddingStatus.state === "ready",
+          ...scoring,
         },
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.

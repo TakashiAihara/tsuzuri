@@ -154,15 +154,24 @@ program
   .option("--limit <n>", "how many", "20")
   .option("--source <id>", "restrict to one subscription")
   .option("--all", "include items already read")
-  .action(async (opts: { limit: string; source?: string; all?: boolean }) => {
+  .option("--order <order>", "published or interest", "published")
+  .action(async (opts: { limit: string; source?: string; all?: boolean; order: string }) => {
     const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
     if (opts.source) params.set("sourceId", opts.source);
-    const { items } = await call<{ items: ItemSummary[] }>(globals(), `/items?${params}`);
-    if (globals().json) return printJson(items);
+    if (opts.order !== "published") params.set("order", opts.order);
+    const { items, scoring } = await call<{
+      items: ItemSummary[];
+      scoring?: { active: boolean; reason?: string };
+    }>(globals(), `/items?${params}`);
+    if (globals().json) return printJson({ items, ...(scoring ? { scoring } : {}) });
+    // Which ordering actually answered, because a scored list and a
+    // chronological one look identical until they surprise you.
+    if (scoring) log(scoring.active ? "scored by interest" : `chronological (${scoring.reason})`);
     if (items.length === 0) return log("nothing unread");
     for (const item of items) {
+      const marker = item.exploration ? "+" : " ";
       out(
-        `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
+        `${item.id.slice(0, 8)} ${marker} ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
       );
     }
   });

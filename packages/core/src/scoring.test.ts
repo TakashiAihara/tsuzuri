@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { halfLifeDecay, kmeans, maxCosineSimilarity, type WeightedVector } from "./scoring.ts";
+import {
+  halfLifeDecay,
+  interactionSignal,
+  kmeans,
+  maxCosineSimilarity,
+  type WeightedVector,
+} from "./scoring.ts";
 
 const HOUR = 3_600_000;
 
@@ -21,6 +27,51 @@ describe("halfLifeDecay", () => {
   test("rejects a non-positive half-life", () => {
     expect(() => halfLifeDecay(HOUR, 0)).toThrow("positive");
     expect(() => halfLifeDecay(HOUR, -1)).toThrow("positive");
+  });
+});
+
+describe("interactionSignal", () => {
+  const now = new Date("2026-08-28T12:00:00Z");
+  const halfLife = 30 * 24 * HOUR;
+  const empty = { readAt: null, starredAt: null, skippedAt: null, savedAt: null };
+
+  test("returns null when nothing happened", () => {
+    expect(interactionSignal(empty, now, halfLife)).toBeNull();
+  });
+
+  test("a fresh read weighs 1, a fresh star weighs 3, a fresh skip weighs -1", () => {
+    expect(interactionSignal({ ...empty, readAt: now }, now, halfLife)?.weight).toBeCloseTo(1, 10);
+    expect(interactionSignal({ ...empty, starredAt: now }, now, halfLife)?.weight).toBeCloseTo(
+      3,
+      10,
+    );
+    expect(interactionSignal({ ...empty, skippedAt: now }, now, halfLife)?.weight).toBeCloseTo(
+      -1,
+      10,
+    );
+    expect(interactionSignal({ ...empty, savedAt: now }, now, halfLife)?.weight).toBeCloseTo(3, 10);
+  });
+
+  test("a star after a skip means interest: the strongest interaction wins", () => {
+    const signal = interactionSignal(
+      { ...empty, skippedAt: new Date("2026-08-01T00:00:00Z"), starredAt: now },
+      now,
+      halfLife,
+    );
+    expect(signal?.weight).toBeCloseTo(3, 10);
+    expect(signal?.at).toEqual(now);
+  });
+
+  test("decay runs from the winning interaction's own timestamp", () => {
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * HOUR);
+    const signal = interactionSignal({ ...empty, readAt: thirtyDaysAgo }, now, halfLife);
+    expect(signal?.weight).toBeCloseTo(0.5, 10);
+  });
+
+  test("an old skip stays negative after decay, just weaker", () => {
+    const sixtyDaysAgo = new Date(now.getTime() - 60 * 24 * HOUR);
+    const signal = interactionSignal({ ...empty, skippedAt: sixtyDaysAgo }, now, halfLife);
+    expect(signal?.weight).toBeCloseTo(-0.25, 10);
   });
 });
 
