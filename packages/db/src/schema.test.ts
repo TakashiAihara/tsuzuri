@@ -3,7 +3,7 @@ import { eq, sql as raw } from "drizzle-orm";
 
 import { createDatabase, type Database } from "./client.ts";
 import { migrate } from "./migrate.ts";
-import { DEFAULT_USER_ID, itemSources, itemState, items, sources } from "./schema.ts";
+import { clusters, DEFAULT_USER_ID, itemSources, itemState, items, sources } from "./schema.ts";
 
 /**
  * Integration test against a real PostgreSQL with pgroonga and pgvector.
@@ -163,5 +163,107 @@ describeIfDb("schema", () => {
 
     const itemRows = await db.select().from(items);
     expect(itemRows).toHaveLength(1);
+  });
+
+  test("round-trips a cluster referencing an item through Drizzle", async () => {
+    // The cluster's only interesting property is the FK to its representative;
+    // the round trip proves gen_random_uuid() and the reference both hold.
+    await db.insert(items).values({
+      id: "b".repeat(64),
+      url: "https://example.com/posts/duplicate",
+      canonicalUrl: "https://example.com/posts/duplicate",
+      publishedAt: new Date("2026-08-10T00:00:00Z"),
+    });
+
+    const [cluster] = await db
+      .insert(clusters)
+      .values({ representativeItem: "b".repeat(64) })
+      .returning();
+    expect(cluster?.id).toBeDefined();
+
+    const [row] = await db
+      .select()
+      .from(clusters)
+      .where(eq(clusters.id, cluster?.id as string));
+    expect(row?.representativeItem).toBe("b".repeat(64));
+  });
+
+  test("simhash round-trips as a bigint rather than a rounded number", async () => {
+    // 2^63-1 sits well past Number.MAX_SAFE_INTEGER, so a driver that quietly
+    // decodes bigint as a JS number would round this and the assertion would catch it.
+    const nearMax = 9223372036854775807n;
+
+    await db.insert(items).values({
+      id: "c".repeat(64),
+      url: "https://example.com/posts/simhash",
+      canonicalUrl: "https://example.com/posts/simhash",
+      publishedAt: new Date("2026-08-10T00:00:00Z"),
+      simhash: nearMax,
+    });
+
+    const [row] = await db
+      .select()
+      .from(items)
+      .where(eq(items.id, "c".repeat(64)));
+    expect(row?.simhash).toBe(nearMax);
+  });
+
+  test("deleting a cluster nulls the member's cluster_id instead of deleting the item", async () => {
+    // This is what the clustering pass leans on to be self-healing: an
+    // orphaned member just becomes unclustered again, ready for the next pass,
+    // rather than vanishing along with the cluster it belonged to.
+    await db.insert(items).values({
+      id: "d".repeat(64),
+      url: "https://example.com/posts/representative",
+      canonicalUrl: "https://example.com/posts/representative",
+      publishedAt: new Date("2026-08-10T00:00:00Z"),
+    });
+    await db.insert(items).values({
+      id: "e".repeat(64),
+      url: "https://example.com/posts/member",
+      canonicalUrl: "https://example.com/posts/member",
+      publishedAt: new Date("2026-08-10T00:00:01Z"),
+    });
+
+    const [cluster] = await db
+      .insert(clusters)
+      .values({ representativeItem: "d".repeat(64) })
+      .returning();
+
+    await db
+      .update(items)
+      .set({ clusterId: cluster?.id })
+      .where(eq(items.id, "e".repeat(64)));
+
+    await db.delete(clusters).where(eq(clusters.id, cluster?.id as string));
+
+    const [member] = await db
+      .select()
+      .from(items)
+      .where(eq(items.id, "e".repeat(64)));
+    expect(member).toBeDefined();
+    expect(member?.clusterId).toBeNull();
+  });
+
+  test("deleting the representative item cascades the cluster row away", async () => {
+    await db.insert(items).values({
+      id: "f".repeat(64),
+      url: "https://example.com/posts/vanishing-representative",
+      canonicalUrl: "https://example.com/posts/vanishing-representative",
+      publishedAt: new Date("2026-08-10T00:00:00Z"),
+    });
+
+    const [cluster] = await db
+      .insert(clusters)
+      .values({ representativeItem: "f".repeat(64) })
+      .returning();
+
+    await db.delete(items).where(eq(items.id, "f".repeat(64)));
+
+    const rows = await db
+      .select()
+      .from(clusters)
+      .where(eq(clusters.id, cluster?.id as string));
+    expect(rows).toHaveLength(0);
   });
 });

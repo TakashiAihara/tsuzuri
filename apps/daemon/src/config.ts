@@ -87,6 +87,17 @@ const configSchema = z.object({
   SCORING_EXPLORATION_SHARE: z.coerce.number().min(0).max(0.5).default(0.15),
 
   /**
+   * Duplicate clustering. Needs no provider: SimHash alone clusters
+   * syndicated copy, and the embedding signal widens it where vectors exist.
+   */
+  /** Hamming distance within which two SimHashes are the same story. */
+  CLUSTER_SIMHASH_MAX_DISTANCE: z.coerce.number().int().min(0).max(64).default(6),
+  /** Cosine distance within which two embeddings are the same story. */
+  CLUSTER_MAX_COSINE_DISTANCE: z.coerce.number().positive().max(2).default(0.25),
+  /** How far apart two reports of one story can be published. */
+  CLUSTER_WINDOW_HOURS: z.coerce.number().positive().default(72),
+
+  /**
    * Cosine distance beyond which a vector candidate is not a result.
    *
    * The vector arm returns its nearest N however far away they are, so without

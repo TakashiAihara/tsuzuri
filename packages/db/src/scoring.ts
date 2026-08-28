@@ -41,15 +41,6 @@ export async function ensureInterestClusters(sql: postgres.Sql, dimensions: numb
   `);
 }
 
-/**
- * Dropped rather than truncated on reindex: the column's dimension belongs to
- * the model being discarded, and the profile rebuilds itself from re-embedded
- * history once backfill has caught up.
- */
-export async function dropInterestClusters(sql: postgres.Sql): Promise<void> {
-  await sql.unsafe(`DROP TABLE IF EXISTS ${TABLE}`);
-}
-
 export async function interestClustersExist(sql: postgres.Sql): Promise<boolean> {
   const [row] = await sql<{ exists: boolean }[]>`
     SELECT to_regclass(${TABLE}) IS NOT NULL AS exists
@@ -181,7 +172,24 @@ export type ScoredItemRow = {
   starredAt: string | null;
   /** Null when the item has no embedding yet; it is still listed, last. */
   interestScore: number | null;
+  /** How many items report this story. 1 when unclustered or alone. */
+  clusterSize: number | null;
 };
+
+/**
+ * Only cluster representatives, when a listing is collapsing duplicates.
+ *
+ * Written as a condition rather than a join so an item the clustering pass has
+ * not reached yet still appears: an unassigned item is not a duplicate, it is
+ * an item nobody has looked at.
+ */
+const REPRESENTATIVES_ONLY = `(
+  i.cluster_id IS NULL
+  OR EXISTS (
+    SELECT 1 FROM clusters c
+    WHERE c.id = i.cluster_id AND c.representative_item = i.id
+  )
+)`;
 
 export type ScoredItemsOptions = {
   userId: string;
@@ -190,6 +198,8 @@ export type ScoredItemsOptions = {
   sourceId: string | null;
   /** Freshness decay half-life. Interests move in weeks; timelines move in days. */
   freshnessHalfLifeMs: number;
+  /** Show one row per story rather than one per copy of it. */
+  collapseDuplicates?: boolean;
   now?: Date;
 };
 
@@ -223,6 +233,9 @@ export async function scoredItems(
       to_char(st.read_at AT TIME ZONE 'UTC', ${sql.unsafe(ISO)}) AS "readAt",
       to_char(st.starred_at AT TIME ZONE 'UTC', ${sql.unsafe(ISO)}) AS "starredAt",
       (
+        SELECT count(*)::int FROM items sib WHERE sib.cluster_id = i.cluster_id
+      ) AS "clusterSize",
+      (
         SELECT
           max(1 - (e.embedding <=> c.centroid))
           * exp(
@@ -240,6 +253,7 @@ export async function scoredItems(
       -- Items whose every subscription is gone stay hidden, matching the
       -- chronological listing's inner join on item_sources.
       AND EXISTS (SELECT 1 FROM item_sources sub WHERE sub.item_id = i.id)
+      AND (NOT ${options.collapseDuplicates ?? false}::boolean OR ${sql.unsafe(REPRESENTATIVES_ONLY)})
       AND (${sourceId}::uuid IS NULL OR EXISTS (
         SELECT 1 FROM item_sources s
         WHERE s.item_id = i.id AND s.source_id = ${sourceId}::uuid
@@ -265,6 +279,7 @@ export async function explorationItems(
     unreadOnly: boolean;
     sourceId: string | null;
     excludeIds: readonly string[];
+    collapseDuplicates?: boolean;
     now?: Date;
   },
 ): Promise<ScoredItemRow[]> {
@@ -284,13 +299,17 @@ export async function explorationItems(
       i.summary,
       to_char(st.read_at AT TIME ZONE 'UTC', ${sql.unsafe(ISO)}) AS "readAt",
       to_char(st.starred_at AT TIME ZONE 'UTC', ${sql.unsafe(ISO)}) AS "starredAt",
-      NULL::float8 AS "interestScore"
+      NULL::float8 AS "interestScore",
+      (
+        SELECT count(*)::int FROM items sib WHERE sib.cluster_id = i.cluster_id
+      ) AS "clusterSize"
     FROM items i
     LEFT JOIN item_state st
       ON st.item_id = i.id AND st.user_id = ${options.userId}::uuid
     WHERE i.id != ALL(${exclude}::text[])
       AND i.published_at >= ${instant(now)}::timestamptz - make_interval(days => ${EXPLORATION_WINDOW_DAYS})
       AND EXISTS (SELECT 1 FROM item_sources sub WHERE sub.item_id = i.id)
+      AND (NOT ${options.collapseDuplicates ?? false}::boolean OR ${sql.unsafe(REPRESENTATIVES_ONLY)})
       AND (NOT ${options.unreadOnly}::boolean OR st.read_at IS NULL)
       AND (${sourceId}::uuid IS NULL OR EXISTS (
         SELECT 1 FROM item_sources s

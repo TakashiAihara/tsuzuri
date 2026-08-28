@@ -1,5 +1,21 @@
 export { type CreateDatabaseOptions, createDatabase, type Database } from "./client.ts";
 export {
+  assignToCluster,
+  type ClusterCandidate,
+  type ClusteringStatus,
+  type ClusterSize,
+  candidateClusters,
+  clusteringStatus,
+  clusterMembers,
+  clusterSizes,
+  createClusterFor,
+  itemsMissingSimhash,
+  nearestClusterByEmbedding,
+  setSimhash,
+  type UnclusteredItem,
+  unclusteredItems,
+} from "./clusters.ts";
+export {
   createEmbeddingIndex,
   createEmbeddingTable,
   type EmbeddingCounts,
@@ -20,6 +36,7 @@ export {
 } from "./embeddings.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
+  clusters,
   DEFAULT_USER_ID,
   embeddingFailures,
   embeddingModel,
@@ -35,7 +52,6 @@ export {
   users,
 } from "./schema.ts";
 export {
-  dropInterestClusters,
   ensureInterestClusters,
   explorationItems,
   type InteractionRow,

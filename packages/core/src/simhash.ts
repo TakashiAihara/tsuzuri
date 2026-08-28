@@ -38,15 +38,40 @@ export function simhash64(text: string): bigint {
   return result;
 }
 
-/** Number of differing bits between two SimHashes. */
+/**
+ * Number of differing bits between two SimHashes.
+ *
+ * Masked to 64 bits first, so a hash that has been through a signed
+ * round-trip (see toSigned64) compares identically to its unsigned form.
+ */
 export function hammingDistance64(a: bigint, b: bigint): number {
-  let x = (a ^ b) & 0xffffffffffffffffn;
+  let x = (a ^ b) & MASK64;
   let count = 0;
   while (x !== 0n) {
     x &= x - 1n;
     count++;
   }
   return count;
+}
+
+const SIGN_BIT = 1n << 63n;
+
+/**
+ * Reinterpret an unsigned 64-bit hash as the signed value Postgres stores.
+ *
+ * `bigint` in Postgres is signed, and simhash64 sets the top bit about half
+ * the time, so storing the raw value fails outright ("out of range") for half
+ * the corpus. Reinterpreting rather than truncating keeps every bit, which is
+ * what Hamming distance needs.
+ */
+export function toSigned64(hash: bigint): bigint {
+  const masked = hash & MASK64;
+  return masked & SIGN_BIT ? masked - (1n << 64n) : masked;
+}
+
+/** The inverse of toSigned64, for values read back out of the database. */
+export function fromSigned64(stored: bigint): bigint {
+  return stored < 0n ? stored + (1n << 64n) : stored;
 }
 
 const FNV_OFFSET = 0xcbf29ce484222325n;

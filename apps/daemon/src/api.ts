@@ -1,5 +1,7 @@
 import { searchTerms } from "@tsuzuri/core";
 import {
+  clusteringStatus,
+  clusterMembers,
   type Database,
   DEFAULT_USER_ID,
   explorationItems,
@@ -62,6 +64,12 @@ const listItemsSchema = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(50),
   sourceId: z.uuid().optional(),
   order: z.enum(["published", "interest"]).default("published"),
+  /**
+   * Collapse duplicates by default: a widely syndicated story occupying eight
+   * rows is the problem clustering exists to solve, so not collapsing is the
+   * deliberate choice, not the other way round.
+   */
+  collapse: z.stringbool().default(true),
 });
 
 /**
@@ -202,7 +210,7 @@ export function createApi(deps: ApiDeps) {
   app.get("/items", async (c) => {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
-    const { unread, limit, sourceId, order } = parsed.data;
+    const { unread, limit, sourceId, order, collapse } = parsed.data;
 
     /**
      * Interest order, when there is a profile to order by.
@@ -224,6 +232,7 @@ export function createApi(deps: ApiDeps) {
           unreadOnly: unread,
           sourceId: sourceId ?? null,
           freshnessHalfLifeMs: config.SCORING_FRESHNESS_HALF_LIFE_HOURS * 3_600_000,
+          collapseDuplicates: collapse,
         });
         const exploration = await explorationItems(rawSql, {
           userId: DEFAULT_USER_ID,
@@ -231,6 +240,7 @@ export function createApi(deps: ApiDeps) {
           unreadOnly: unread,
           sourceId: sourceId ?? null,
           excludeIds: scored.map((row) => row.id),
+          collapseDuplicates: collapse,
         });
         const rows = interleave(
           scored,
@@ -239,7 +249,7 @@ export function createApi(deps: ApiDeps) {
         return c.json({ items: rows, scoring: { active: true } });
       }
       // Fall through to the chronological listing, labelled with why.
-      const rows = await listItemsChronological({ unread, limit, sourceId });
+      const rows = await listItemsChronological({ unread, limit, sourceId, collapse });
       return c.json({
         items: rows,
         scoring: {
@@ -249,7 +259,7 @@ export function createApi(deps: ApiDeps) {
       });
     }
 
-    const rows = await listItemsChronological({ unread, limit, sourceId });
+    const rows = await listItemsChronological({ unread, limit, sourceId, collapse });
     return c.json({ items: rows });
   });
 
@@ -257,11 +267,22 @@ export function createApi(deps: ApiDeps) {
     unread: boolean;
     limit: number;
     sourceId?: string;
+    collapse: boolean;
   }) {
-    const { unread, limit, sourceId } = options;
+    const { unread, limit, sourceId, collapse } = options;
     const conditions = [];
     if (unread) conditions.push(isNull(itemState.readAt));
     if (sourceId) conditions.push(eq(itemSources.sourceId, sourceId));
+    if (collapse) {
+      // An item the clustering pass has not reached yet is not a duplicate,
+      // so a null cluster_id stays visible.
+      conditions.push(
+        sql`(${items.clusterId} IS NULL OR EXISTS (
+          SELECT 1 FROM clusters c
+          WHERE c.id = ${items.clusterId} AND c.representative_item = ${items.id}
+        ))`,
+      );
+    }
 
     const rows = await db
       .selectDistinctOn([items.publishedAt, items.id], {
@@ -274,6 +295,9 @@ export function createApi(deps: ApiDeps) {
         summary: items.summary,
         readAt: itemState.readAt,
         starredAt: itemState.starredAt,
+        clusterSize: sql<number>`(
+          SELECT count(*)::int FROM items sib WHERE sib.cluster_id = ${items.clusterId}
+        )`,
       })
       .from(items)
       .innerJoin(itemSources, eq(itemSources.itemId, items.id))
@@ -420,6 +444,20 @@ export function createApi(deps: ApiDeps) {
     });
   });
 
+  /**
+   * The other reports of one story.
+   *
+   * Separate from the listing rather than nested in it: a collapsed row only
+   * needs a count, and returning every member of every cluster inline would
+   * put the duplicates back into the payload that collapsing removed them from.
+   */
+  app.get("/clusters/:id/members", async (c) => {
+    const id = c.req.param("id");
+    if (!z.uuid().safeParse(id).success) return c.json({ error: "not found" }, 404);
+    const members = await clusterMembers(rawSql, id);
+    return c.json({ clusterId: id, members });
+  });
+
   app.get("/embeddings/status", async (c) => c.json(await embeddings.status()));
 
   /**
@@ -468,6 +506,7 @@ export function createApi(deps: ApiDeps) {
 
     const embeddingStatus = await embeddings.status();
     const scoring = await profileStatus(rawSql, config);
+    const clustering = await clusteringStatus(rawSql);
 
     return c.json({
       database: { extensions: [...extensions] },
@@ -482,6 +521,13 @@ export function createApi(deps: ApiDeps) {
         scoring: {
           enabled: embeddingStatus.state === "ready",
           ...scoring,
+        },
+        // Clustering always runs: SimHash needs no model. The embedding
+        // signal only widens what it can catch.
+        clustering: {
+          enabled: true,
+          ...clustering,
+          embeddingSignal: embeddingStatus.state === "ready",
         },
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.

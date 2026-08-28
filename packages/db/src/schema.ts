@@ -1,4 +1,5 @@
 import {
+  bigint,
   boolean,
   index,
   integer,
@@ -84,11 +85,29 @@ export const items = pgTable(
     searchText: text("search_text").notNull().default(""),
     rawHtmlKey: text("raw_html_key"),
 
+    /** 64-bit SimHash of search_text; null when unhashed or too short to hash. */
+    simhash: bigint("simhash", { mode: "bigint" }),
+    /**
+     * The story this item reports. The foreign key to clusters lives in the
+     * SQL, not here: items and clusters reference each other, and declaring
+     * both directions in the mirror makes their types mutually recursive.
+     */
+    clusterId: uuid("cluster_id"),
+
     fetchedAt: timestamp("fetched_at", { withTimezone: true }).notNull().defaultNow(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index("items_published_at").on(table.publishedAt)],
 );
+
+export const clusters = pgTable("clusters", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  /** The earliest-published member; see 0005_clusters.sql for the lifecycle. */
+  representativeItem: text("representative_item")
+    .notNull()
+    .references(() => items.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const itemSources = pgTable(
   "item_sources",

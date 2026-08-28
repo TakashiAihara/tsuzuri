@@ -27,7 +27,7 @@ export {
   type WeightedVector,
 } from "./scoring.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
-export { hammingDistance64, simhash64 } from "./simhash.ts";
+export { fromSigned64, hammingDistance64, simhash64, toSigned64 } from "./simhash.ts";
 export { snippetToText } from "./snippet.ts";
 export {
   defineSource,

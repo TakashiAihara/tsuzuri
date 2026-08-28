@@ -3,6 +3,7 @@ import PQueue from "p-queue";
 
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
+import { startClusterWorker } from "./enrich/cluster-worker.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { startProfileWorker } from "./enrich/profile.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
@@ -80,6 +81,9 @@ try {
 }
 
 const profileWorker = startProfileWorker({ sql, config, embeddings });
+// Runs unconditionally: SimHash needs no model, so clustering works on an
+// install with no AI configured at all.
+const clusterWorker = startClusterWorker({ sql, config });
 
 const app = createApi({ db, sql, fetcher, config, embeddings });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
@@ -92,7 +96,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopping = true;
     await server.stop();
     profileWorker.stop();
-    await profileWorker.done;
+    clusterWorker.stop();
+    await Promise.all([profileWorker.done, clusterWorker.done]);
     await embeddings.stop();
     await close();
     process.exit(0);

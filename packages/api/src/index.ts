@@ -71,6 +71,11 @@ export const itemSummarySchema = z.strictObject({
   interestScore: z.number().nullable().optional(),
   /** True for items the exploration slot picked rather than the score. */
   exploration: z.boolean().optional(),
+  /**
+   * How many items report this story. A collapsed listing shows the
+   * representative; anything above 1 means there are other versions behind it.
+   */
+  clusterSize: z.number().nullable().optional(),
 });
 export type ItemSummary = z.infer<typeof itemSummarySchema>;
 
@@ -88,6 +93,10 @@ export const itemSchema = z.strictObject({
   summary: z.string().nullable(),
   searchText: z.string(),
   rawHtmlKey: z.string().nullable(),
+  /** 64-bit SimHash of the search text. Serialised as a string: it exceeds Number's exact range. */
+  simhash: z.string().nullable(),
+  /** The story this article reports, once the clustering pass has reached it. */
+  clusterId: z.string().nullable(),
   fetchedAt: z.string(),
   createdAt: z.string(),
 });
@@ -189,6 +198,20 @@ export const ingestRunResponseSchema = z.strictObject({
   failed: z.number(),
   outcomes: z.array(z.unknown()),
 });
+
+/** The other reports of one story, behind a collapsed row. */
+export const clusterMembersResponseSchema = z.strictObject({
+  clusterId: z.string(),
+  members: z.array(
+    z.strictObject({
+      id: z.string(),
+      url: z.string(),
+      title: z.string().nullable(),
+      publishedAt: z.string(),
+    }),
+  ),
+});
+export type ClusterMembersResponse = z.infer<typeof clusterMembersResponseSchema>;
 
 /** Every error the API returns has this shape, whatever the status. */
 export const errorResponseSchema = z.strictObject({ error: z.unknown() });

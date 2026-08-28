@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hammingDistance64, simhash64 } from "./simhash.ts";
+import { fromSigned64, hammingDistance64, simhash64, toSigned64 } from "./simhash.ts";
 
 const ARTICLE =
   "The city council approved the new transit plan on Tuesday, allocating funds for two additional light rail lines that will connect the harbour district with the northern suburbs by 2030.";
@@ -54,6 +54,51 @@ describe("simhash64", () => {
     expect(simhash64("ab")).toBe(0n);
     expect(simhash64("  a  ")).toBe(0n);
     expect(simhash64("")).toBe(0n);
+  });
+});
+
+describe("signed round-trip", () => {
+  const PG_MAX = 2n ** 63n - 1n;
+  const PG_MIN = -(2n ** 63n);
+
+  test("hashes with the top bit set fit in a Postgres bigint", () => {
+    // Postgres bigint is signed and simhash64 sets the top bit about half the
+    // time, so storing the raw value fails outright for half the corpus.
+    const withTopBit = 0xf000_0000_0000_0001n;
+    const stored = toSigned64(withTopBit);
+    expect(stored).toBeLessThan(0n);
+    expect(stored).toBeGreaterThanOrEqual(PG_MIN);
+    expect(fromSigned64(stored)).toBe(withTopBit);
+  });
+
+  test("hashes without the top bit are unchanged", () => {
+    const small = 0x0123_4567_89ab_cdefn;
+    expect(toSigned64(small)).toBe(small);
+    expect(fromSigned64(small)).toBe(small);
+    expect(toSigned64(small)).toBeLessThanOrEqual(PG_MAX);
+  });
+
+  test("every real hash survives the round-trip and stays in range", () => {
+    for (const text of [
+      ARTICLE,
+      ARTICLE_SYNDICATED,
+      UNRELATED,
+      "市議会は火曜日に交通計画を承認した",
+    ]) {
+      const hash = simhash64(text);
+      const stored = toSigned64(hash);
+      expect(stored).toBeGreaterThanOrEqual(PG_MIN);
+      expect(stored).toBeLessThanOrEqual(PG_MAX);
+      expect(fromSigned64(stored)).toBe(hash);
+    }
+  });
+
+  test("distance is unaffected by which form the operands are in", () => {
+    const a = simhash64(ARTICLE);
+    const b = simhash64(ARTICLE_SYNDICATED);
+    const direct = hammingDistance64(a, b);
+    expect(hammingDistance64(toSigned64(a), toSigned64(b))).toBe(direct);
+    expect(hammingDistance64(toSigned64(a), b)).toBe(direct);
   });
 });
 

@@ -5,7 +5,6 @@ import { createEmbeddingTable, insertEmbeddings, rebuildItemEmbeddings } from ".
 import { migrate } from "./migrate.ts";
 import { DEFAULT_USER_ID } from "./schema.ts";
 import {
-  dropInterestClusters,
   ensureInterestClusters,
   explorationItems,
   interactionCount,
@@ -255,6 +254,52 @@ describeIfDb("scored timeline", () => {
     expect(farFresh?.interestScore).toBeCloseTo(0, 3);
     expect(unembedded?.interestScore).toBeNull();
     expect(closeFresh?.publishedAt).toBe("2026-08-28T12:00:00.000Z");
+  });
+
+  test("collapsing shows the representative and drops the other reports", async () => {
+    await seedItem("representative", NOW);
+    await seedItem("duplicate", NOW);
+    await seedItem("unclustered", NOW);
+    await insertEmbeddings(handle.sql, [
+      { itemId: "representative", vector: "[1,0,0,0]" },
+      { itemId: "duplicate", vector: "[1,0,0,0]" },
+      { itemId: "unclustered", vector: "[1,0,0,0]" },
+    ]);
+    const [cluster] = await handle.sql<{ id: string }[]>`
+      INSERT INTO clusters (representative_item) VALUES ('representative') RETURNING id
+    `;
+    const clusterId = cluster?.id;
+    if (!clusterId) throw new Error("the cluster insert returned no id");
+    await handle.sql`
+      UPDATE items SET cluster_id = ${clusterId}::uuid
+      WHERE id IN ('representative', 'duplicate')
+    `;
+
+    const collapsed = await scoredItems(handle.sql, { ...options, collapseDuplicates: true });
+    // The duplicate is gone; the item nobody has clustered yet is not a
+    // duplicate and stays.
+    expect(collapsed.map((row) => row.id).sort()).toEqual(["representative", "unclustered"]);
+    expect(collapsed.find((row) => row.id === "representative")?.clusterSize).toBe(2);
+
+    const expanded = await scoredItems(handle.sql, { ...options, collapseDuplicates: false });
+    expect(expanded.map((row) => row.id).sort()).toEqual([
+      "duplicate",
+      "representative",
+      "unclustered",
+    ]);
+
+    // Exploration collapses on the same rule, or the slot would reintroduce
+    // exactly the duplicates the listing just removed.
+    const explored = await explorationItems(handle.sql, {
+      userId: DEFAULT_USER_ID,
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      excludeIds: [],
+      collapseDuplicates: true,
+      now: NOW,
+    });
+    expect(explored.map((row) => row.id)).not.toContain("duplicate");
   });
 
   test("unreadOnly hides read items and keeps the rest", async () => {

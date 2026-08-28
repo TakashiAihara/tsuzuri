@@ -155,26 +155,39 @@ program
   .option("--source <id>", "restrict to one subscription")
   .option("--all", "include items already read")
   .option("--order <order>", "published or interest", "published")
-  .action(async (opts: { limit: string; source?: string; all?: boolean; order: string }) => {
-    const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
-    if (opts.source) params.set("sourceId", opts.source);
-    if (opts.order !== "published") params.set("order", opts.order);
-    const { items, scoring } = await call<{
-      items: ItemSummary[];
-      scoring?: { active: boolean; reason?: string };
-    }>(globals(), `/items?${params}`);
-    if (globals().json) return printJson({ items, ...(scoring ? { scoring } : {}) });
-    // Which ordering actually answered, because a scored list and a
-    // chronological one look identical until they surprise you.
-    if (scoring) log(scoring.active ? "scored by interest" : `chronological (${scoring.reason})`);
-    if (items.length === 0) return log("nothing unread");
-    for (const item of items) {
-      const marker = item.exploration ? "+" : " ";
-      out(
-        `${item.id.slice(0, 8)} ${marker} ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
-      );
-    }
-  });
+  .option("--no-collapse", "show every copy of a story, not one row per story")
+  .action(
+    async (opts: {
+      limit: string;
+      source?: string;
+      all?: boolean;
+      order: string;
+      collapse: boolean;
+    }) => {
+      const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
+      if (opts.source) params.set("sourceId", opts.source);
+      if (opts.order !== "published") params.set("order", opts.order);
+      if (!opts.collapse) params.set("collapse", "false");
+      const { items, scoring } = await call<{
+        items: ItemSummary[];
+        scoring?: { active: boolean; reason?: string };
+      }>(globals(), `/items?${params}`);
+      if (globals().json) return printJson({ items, ...(scoring ? { scoring } : {}) });
+      // Which ordering actually answered, because a scored list and a
+      // chronological one look identical until they surprise you.
+      if (scoring) log(scoring.active ? "scored by interest" : `chronological (${scoring.reason})`);
+      if (items.length === 0) return log("nothing unread");
+      for (const item of items) {
+        const marker = item.exploration ? "+" : " ";
+        // "+7" means seven more outlets ran this story, reachable through the
+        // cluster; a bare row is the only report of it.
+        const duplicates = (item.clusterSize ?? 1) > 1 ? ` +${(item.clusterSize ?? 1) - 1}` : "";
+        out(
+          `${item.id.slice(0, 8)} ${marker} ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}${duplicates}`,
+        );
+      }
+    },
+  );
 
 program
   .command("search <query...>")

@@ -1,4 +1,4 @@
-import { normalizeItem, type Source } from "@tsuzuri/core";
+import { normalizeItem, type Source, simhash64, toSigned64 } from "@tsuzuri/core";
 import { type Database, itemSources, items, type SourceRow, sources } from "@tsuzuri/db";
 import { and, eq, inArray, lte } from "drizzle-orm";
 
@@ -46,6 +46,15 @@ function backoffSeconds(intervalSeconds: number, consecutiveFailures: number): n
 }
 
 /** Strip markup down to the text pgroonga will index. */
+/**
+ * simhash64 answers 0n for text too short to hash; that is "no hash", not a
+ * hash of zero. Everything else is reinterpreted as signed, because Postgres
+ * bigint is signed and half of all hashes set the top bit.
+ */
+function orNull(hash: bigint): bigint | null {
+  return hash === 0n ? null : toSigned64(hash);
+}
+
 function toSearchText(title: string | null, html: string | null, summary: string | null): string {
   const body = html ?? summary ?? "";
   const stripped = body
@@ -140,6 +149,7 @@ export async function ingestSource(row: SourceRow, deps: IngestDeps): Promise<In
 
   await db.transaction(async (tx) => {
     for (const item of normalized) {
+      const searchText = toSearchText(item.title, item.contentHtml, item.summary);
       const rows = await tx
         .insert(items)
         .values({
@@ -153,7 +163,11 @@ export async function ingestSource(row: SourceRow, deps: IngestDeps): Promise<In
           publishedAtEstimated: item.publishedAtEstimated,
           contentHtml: item.contentHtml,
           summary: item.summary,
-          searchText: toSearchText(item.title, item.contentHtml, item.summary),
+          searchText: searchText,
+          // Hashed here rather than in the clustering pass: it is a pure
+          // function of text that ingest already has in hand, and computing it
+          // now means a new article is comparable the moment it lands.
+          simhash: searchText ? orNull(simhash64(searchText)) : null,
           fetchedAt: now,
         })
         // An article already stored is left alone. Publishers do fix typos, but

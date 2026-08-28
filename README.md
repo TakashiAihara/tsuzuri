@@ -161,6 +161,27 @@ A configurable share of every scored page is reserved for recent items the score
 
 Skipping articles counts against the topic they belong to: skip a topic persistently and its cluster fades from the profile. Reindexing embeddings (`tsuzuri reindex --embedding-model`) discards the profile with the vectors — it lives in the same vector space — and it rebuilds itself once backfill catches up. `tsuzuri doctor` shows whether scoring is active, how far history has accumulated, and the shape of the current profile.
 
+### Duplicate clustering
+
+With a couple of hundred subscriptions the same story arrives many times. Items are already global by canonical URL, but the same report republished by eight outlets is eight different URLs.
+
+Clustering runs unconditionally — it needs no model. Two signals decide whether two articles are the same story, and either is enough on its own:
+
+- A 64-bit SimHash over character trigrams of the article text, which catches syndicated copy. Character trigrams rather than words because half a real feed list is not English and word boundaries are a tokeniser away.
+- Embedding distance, where vectors exist, which catches the same story told in different words.
+
+Requiring both would reduce this to exact-copy detection, so an install with no embedding model still collapses syndication.
+
+Listings show one row per story: the earliest-published member, with the others reachable behind it. `tsuzuri read` marks a collapsed row with the number of other reports (`+7`), `--no-collapse` shows every copy, and `GET /clusters/:id/members` returns the rest. Search never collapses — when you searched for something, every version of it is a legitimate answer.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CLUSTER_SIMHASH_MAX_DISTANCE` | `6` | Hamming distance within which two SimHashes are one story |
+| `CLUSTER_MAX_COSINE_DISTANCE` | `0.25` | Cosine distance within which two embeddings are one story |
+| `CLUSTER_WINDOW_HOURS` | `72` | How far apart two reports of one story can be published |
+
+Read state stays per item: marking the representative read marks the representative. The window is what stops an anniversary piece joining the original, and it keeps the comparison set small enough to scan without an index on either signal.
+
 ## MCP server
 
 Agents are a first-class way in, not a wrapper over the CLI. Their useful granularity is not a human's, so the tools are designed rather than transliterated.
