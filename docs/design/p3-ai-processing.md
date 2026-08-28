@@ -62,7 +62,7 @@ One signal row per `(user, item)` with an embedding, derived from `item_state`:
 
 - Algorithm: K-Means over the signal vectors, weights applied when averaging. Own implementation in `packages/core` (a K-Means over a few thousand vectors is ~40 lines); HDBSCAN would pull a dependency and its density parameters are harder to explain to a self-hoster than "k".
 - k: `SCORING_CLUSTERS` (default 8, bounded 2–32). The issue says 5–10; a fixed default in that range with a config escape beats auto-selection (elbow/silhouette) that would make scoring behaviour vary run to run.
-- Negative-weight signals (skips) do not form clusters; they subtract. Items whose nearest cluster is dominated by skip weight lower that cluster's own weight, so a persistently skipped topic fades rather than pinning a "disinterest" centroid that attracts nothing.
+- Negative-weight signals (skips) do not form clusters; they subtract. Each skip lowers the weight of its nearest cluster, and a cluster whose weight is exhausted is dropped from the profile, so a persistently skipped topic stops contributing to scores entirely rather than pinning a "disinterest" centroid that attracts nothing (D22).
 - Rebuild cadence: `SCORING_REBUILD_INTERVAL_MS` (default 6 h) in a worker following the embed-worker pattern. A rebuild is a full recompute; there is no incremental path to maintain or get wrong.
 - Activation threshold: the profile is not built until `SCORING_MIN_INTERACTIONS` (default 30) signal rows with embeddings exist. Below it, ranking stays reverse-chronological and the API says so.
 
@@ -241,3 +241,4 @@ Four stacked PRs, each leaving main working (repo rule):
 | D19 | Digest persistence | Computed, not stored. Archiving is what export is for |
 | D20 | Notifier scope in this phase | Interface plus `file` and `webhook` implementations; `smtp` / `ntfy` / `slack` / `discord` are same-payload adapters, follow-ups if the PR would otherwise grow |
 | D21 | Where the `tags` search filter lands | In PR 3 with the vocabulary, completing P2's D8 deferral |
+| D22 | How skips make a topic fade | A skip subtracts its decayed weight from the nearest cluster; a cluster with no weight left is dropped. Cluster weight does not otherwise scale the score, so this is the one mechanism by which disinterest acts |
