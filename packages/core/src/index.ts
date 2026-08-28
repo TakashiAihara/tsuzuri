@@ -15,7 +15,16 @@ export {
 } from "./embedding.ts";
 export { contentHash, itemIdentity, sha256 } from "./hash.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
+export {
+  halfLifeDecay,
+  type InterestCentroid,
+  type KMeansOptions,
+  kmeans,
+  maxCosineSimilarity,
+  type WeightedVector,
+} from "./scoring.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
+export { hammingDistance64, simhash64 } from "./simhash.ts";
 export { snippetToText } from "./snippet.ts";
 export {
   defineSource,
