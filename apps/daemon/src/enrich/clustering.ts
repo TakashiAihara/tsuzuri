@@ -40,7 +40,11 @@ export type ClusteringService = {
   runPass: () => Promise<PassResult>;
 };
 
-/** Items claimed per pass. Each is a few small queries, so this bounds a pass to well under a second. */
+/**
+ * Items claimed per pass. Each is compared with every clustered item published
+ * within CLUSTER_WINDOW_HOURS, so a pass grows with how much arrives in that
+ * window, not with the size of the corpus.
+ */
 const PASS_SIZE = 200;
 /** Gap between passes once clustering has caught up. */
 const IDLE_INTERVAL_MS = 30_000;

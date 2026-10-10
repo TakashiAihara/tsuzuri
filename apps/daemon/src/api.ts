@@ -2,6 +2,7 @@ import { searchTerms } from "@tsuzuri/core";
 import {
   clusterMemberIds,
   clusters,
+  clustersOfSource,
   type Database,
   DEFAULT_USER_ID,
   hybridSearch,
@@ -9,6 +10,7 @@ import {
   itemSources,
   itemState,
   items,
+  refreshCluster,
   sources,
 } from "@tsuzuri/db";
 import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
@@ -120,12 +122,20 @@ export function createApi(deps: ApiDeps) {
   });
 
   app.delete("/sources/:id", async (c) => {
-    const deleted = await db
-      .delete(sources)
-      .where(eq(sources.id, c.req.param("id")))
-      .returning({ id: sources.id });
-    if (deleted.length === 0) return c.json({ error: "not found" }, 404);
-    return c.json({ deleted: deleted.length });
+    const sourceId = c.req.param("id");
+    // The clusters this subscription's items belong to are refreshed in the
+    // same transaction as the deletion. A representative carried only by this
+    // subscription can no longer be listed, and the collapsed timeline shows a
+    // story through its representative alone -- so without the refresh the
+    // whole story, reports from feeds still followed included, would vanish.
+    const deleted = await rawSql.begin(async (tx) => {
+      const affected = await clustersOfSource(tx, sourceId);
+      const rows = await tx`DELETE FROM sources WHERE id = ${sourceId}::uuid RETURNING id`;
+      for (const clusterId of affected) await refreshCluster(tx, clusterId);
+      return rows.length;
+    });
+    if (deleted === 0) return c.json({ error: "not found" }, 404);
+    return c.json({ deleted });
   });
 
   app.post("/sources/import-opml", async (c) => {
@@ -191,7 +201,11 @@ export function createApi(deps: ApiDeps) {
   app.get("/items", async (c) => {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
-    const { unread, limit, sourceId, collapse } = parsed.data;
+    const { unread, limit, sourceId } = parsed.data;
+    // Within one subscription there is nothing to collapse: a story never holds
+    // two items from the same feed, so collapsing could only hide this feed's
+    // own reports behind another outlet's representative.
+    const collapse = parsed.data.collapse && !sourceId;
     const sort = parsed.data.sort ?? config.TIMELINE_DEFAULT_SORT;
 
     /**
@@ -355,30 +369,45 @@ export function createApi(deps: ApiDeps) {
     if (body.data.starred !== undefined) patch.starredAt = body.data.starred ? now : null;
     if (body.data.skipped !== undefined) patch.skippedAt = body.data.skipped ? now : null;
 
-    const [row] = await db
-      .insert(itemState)
-      .values({ userId: DEFAULT_USER_ID, itemId: resolved.id, ...patch })
-      .onConflictDoUpdate({
-        target: [itemState.userId, itemState.itemId],
-        set: { ...patch, updatedAt: now },
-      })
-      .returning();
+    const others =
+      body.data.scope === "cluster" && body.data.read !== undefined
+        ? (await clusterMemberIds(rawSql, resolved.id)).filter((id) => id !== resolved.id)
+        : [];
 
-    if (body.data.scope === "cluster" && body.data.read !== undefined) {
-      const others = (await clusterMemberIds(rawSql, resolved.id)).filter(
-        (id) => id !== resolved.id,
-      );
+    // One transaction, so a propagation that fails does not leave the named
+    // item read and the rest of its story unread behind a 500.
+    const row = await db.transaction(async (tx) => {
+      const [written] = await tx
+        .insert(itemState)
+        .values({ userId: DEFAULT_USER_ID, itemId: resolved.id, ...patch })
+        .onConflictDoUpdate({
+          target: [itemState.userId, itemState.itemId],
+          set: { ...patch, updatedAt: now },
+        })
+        .returning();
+
       if (others.length > 0) {
-        const readAt = body.data.read ? now : null;
-        await db
+        await tx
           .insert(itemState)
-          .values(others.map((itemId) => ({ userId: DEFAULT_USER_ID, itemId, readAt })))
+          .values(
+            others.map((itemId) => ({
+              userId: DEFAULT_USER_ID,
+              itemId,
+              readAt: body.data.read ? now : null,
+            })),
+          )
           .onConflictDoUpdate({
             target: [itemState.userId, itemState.itemId],
-            set: { readAt, updatedAt: now },
+            set: {
+              // A report already read keeps its own read time. Resetting it to
+              // now would make an old read look fresh to the interest profile.
+              readAt: body.data.read ? sql`COALESCE(${itemState.readAt}, excluded.read_at)` : null,
+              updatedAt: now,
+            },
           });
       }
-    }
+      return written;
+    });
 
     return c.json({ state: row });
   });

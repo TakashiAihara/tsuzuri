@@ -5,6 +5,7 @@ export {
   type ClusterMatch,
   clusteringCounts,
   clusterMemberIds,
+  clustersOfSource,
   foundCluster,
   joinCluster,
   type MatchedBy,
@@ -12,6 +13,7 @@ export {
   matchedBy,
   type PendingClusterItem,
   pendingClusterItems,
+  refreshCluster,
   writeSimhash,
 } from "./clustering.ts";
 export {

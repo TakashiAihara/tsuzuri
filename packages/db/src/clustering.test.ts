@@ -184,6 +184,67 @@ describeIfDb("duplicate clustering", () => {
     await handle.sql`DELETE FROM sources`;
   });
 
+  test("a series cannot join through another outlet's copy of one of its parts", async () => {
+    // part-1 (feed A) and a cross-post of it (feed B) are one story. part-2
+    // (feed A) matches the cross-post, a different feed -- but the story
+    // already holds part-1 from feed A, so it must not join.
+    const sources = await handle.sql<Array<{ id: string }>>`
+      INSERT INTO sources (user_id, kind, url)
+      VALUES ('00000000-0000-0000-0000-000000000001', 'feed', 'https://a.example/feed'),
+             ('00000000-0000-0000-0000-000000000001', 'feed', 'https://b.example/feed')
+      RETURNING id
+    `;
+    const [feedA, feedB] = sources.map((row) => row.id as string);
+    await seed("part-1", "2026-10-01T00:00:00Z");
+    await seed("cross-post", "2026-10-01T01:00:00Z");
+    await seed("part-2", "2026-10-01T02:00:00Z");
+    for (const [itemId, sourceId] of [
+      ["part-1", feedA],
+      ["cross-post", feedB],
+      ["part-2", feedA],
+    ] as const) {
+      await handle.sql`INSERT INTO item_sources (item_id, source_id) VALUES (${itemId}, ${sourceId as string})`;
+    }
+    await insertEmbeddings(handle.sql, [
+      { itemId: "part-1", vector: "[1,0,0]" },
+      { itemId: "cross-post", vector: "[1,0,0]" },
+      { itemId: "part-2", vector: "[1,0,0]" },
+    ]);
+    const clusterId = await foundCluster(handle.sql, "part-1");
+    await joinCluster(handle.sql, { itemId: "cross-post", clusterId, matchedBy: "embedding" });
+
+    expect(await bestClusterMatch(handle.sql, match("part-2", true))).toBeNull();
+
+    await handle.sql`DELETE FROM sources`;
+  });
+
+  test("an item no subscription carries any more does not represent the story", async () => {
+    // "unfollowed" is earliest, so it would win on date; with its feed gone
+    // it cannot be listed, and the story must be shown through "followed".
+    const [source] = await handle.sql<Array<{ id: string }>>`
+      INSERT INTO sources (user_id, kind, url)
+      VALUES ('00000000-0000-0000-0000-000000000001', 'feed', 'https://still.example/feed')
+      RETURNING id
+    `;
+    await seed("unfollowed", "2026-10-01T00:00:00Z");
+    await seed("followed", "2026-10-01T05:00:00Z");
+    await handle.sql`INSERT INTO item_sources (item_id, source_id) VALUES ('followed', ${source?.id as string})`;
+    const clusterId = await foundCluster(handle.sql, "followed");
+    await joinCluster(handle.sql, { itemId: "unfollowed", clusterId, matchedBy: "embedding" });
+
+    const [row] =
+      await handle.sql`SELECT representative_item_id AS rep FROM clusters WHERE id = ${clusterId}::uuid`;
+    expect(row?.rep).toBe("followed");
+
+    await handle.sql`DELETE FROM sources`;
+  });
+
+  test("matchedBy refuses a match that meets neither threshold", () => {
+    expect(() => matchedBy({ clusterId: "c", distance: 0.5, bits: 40 }, thresholds)).toThrow(
+      "neither threshold",
+    );
+  });
+
   test("a report outside the window is a different story", async () => {
     await seed("old", "2026-10-01T00:00:00Z");
     await seed("later", "2026-10-05T00:00:00Z");
@@ -211,11 +272,13 @@ describeIfDb("duplicate clustering", () => {
 
   test("the representative is the earliest real date, not an earlier guessed one", async () => {
     // "guessed" is the fetch time standing in for a missing date, and sorts
-    // first by timestamp; a real date must still win (D23).
+    // first by timestamp; a real date must still win (D23). "guessed" founds
+    // the cluster, so the assertion only holds if the join recomputes the
+    // representative -- a founder that never gave way would pass otherwise.
     await seed("real", "2026-10-01T05:00:00Z");
     await seed("guessed", "2026-10-01T01:00:00Z", { estimated: true });
-    const clusterId = await foundCluster(handle.sql, "real");
-    await joinCluster(handle.sql, { itemId: "guessed", clusterId, matchedBy: "simhash" });
+    const clusterId = await foundCluster(handle.sql, "guessed");
+    await joinCluster(handle.sql, { itemId: "real", clusterId, matchedBy: "simhash" });
 
     const [row] = await handle.sql`
       SELECT representative_item_id AS rep, size, first_published_at AS first

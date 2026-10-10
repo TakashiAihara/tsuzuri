@@ -24,7 +24,10 @@ export type PendingClusterItem = {
  * later reports join.
  *
  * With the embedding signal in use, an item is not clustered until the
- * backfill has given it a vector (or has given up on it). Clustering it before
+ * backfill has given it a vector, or the provider has rejected it outright --
+ * a failure row is only written for a permanent rejection, never for an outage,
+ * so an unreachable model holds clustering back rather than letting items
+ * through without their vector. Clustering it before
  * that would decide its membership with one signal missing, and a decision is
  * never revisited -- so a story told in different words would be split
  * permanently by nothing more than the order two workers happened to run in.
@@ -119,18 +122,23 @@ export async function bestClusterMatch(
       ${embeddingJoins}
       WHERE me.id = ${options.itemId}
         AND ci.id <> me.id
-        -- Two items that share a subscription are never one story told twice.
-        -- A feed does not report the same news twice; what looks alike inside
-        -- one feed is a series or a follow-up. Measured on a real corpus: the
-        -- three same-feed pairs that matched were parts 1-3 of one series, at
-        -- cosine distances 0.122-0.132, between the true cross-outlet matches
-        -- at 0.119-0.149 -- so no distance threshold separates them, and this
+        -- A story never holds two items that share a subscription. A feed does
+        -- not report the same news twice; what looks alike inside one feed is
+        -- a series or a follow-up. Measured on a real corpus: the three
+        -- same-feed pairs that matched were parts 1-3 of one series, at cosine
+        -- distances 0.122-0.132, between the true cross-outlet matches at
+        -- 0.119-0.149 -- so no distance threshold separates them, and this
         -- does, exactly.
+        --
+        -- Checked against every member of the candidate's cluster, not only
+        -- the candidate: otherwise part 2 joins part 1 through another
+        -- outlet's copy of part 1, and the series collapses after all.
         AND NOT EXISTS (
           SELECT 1
-          FROM item_sources mine
-          JOIN item_sources theirs ON theirs.source_id = mine.source_id
-          WHERE mine.item_id = me.id AND theirs.item_id = ci.id
+          FROM item_clusters peer
+          JOIN item_sources theirs ON theirs.item_id = peer.item_id
+          JOIN item_sources mine ON mine.source_id = theirs.source_id
+          WHERE peer.cluster_id = ic.cluster_id AND mine.item_id = me.id
         )
     ) candidates
     -- A NaN distance (a zero-length vector) compares false here, so it can
@@ -158,7 +166,10 @@ export function matchedBy(
   const bySimhash = match.bits !== null && match.bits <= thresholds.maxBits;
   if (byEmbedding && bySimhash) return "both";
   if (byEmbedding) return "embedding";
-  return "simhash";
+  if (bySimhash) return "simhash";
+  // Unreachable while the query and this function apply the same thresholds.
+  // If they ever drift, a silently mislabelled row would be worse than this.
+  throw new Error(`match meets neither threshold: distance ${match.distance}, bits ${match.bits}`);
 }
 
 /**
@@ -172,7 +183,7 @@ export function matchedBy(
  * than updated incrementally, because a member can arrive with an earlier date
  * than everything already in the cluster.
  */
-async function refreshCluster(sql: SqlLike, clusterId: string): Promise<void> {
+export async function refreshCluster(sql: SqlLike, clusterId: string): Promise<void> {
   await sql`
     UPDATE clusters c
     SET size = agg.size,
@@ -189,7 +200,12 @@ async function refreshCluster(sql: SqlLike, clusterId: string): Promise<void> {
                FROM item_clusters rc
                JOIN items r ON r.id = rc.item_id
                WHERE rc.cluster_id = ${clusterId}::uuid
-               ORDER BY r.published_at_estimated, r.published_at, length(r.search_text) DESC, r.id
+               -- A member no subscription carries any more cannot be listed,
+               -- so it must not stand for the story: if it did, unsubscribing
+               -- from the representative's feed would hide the whole story,
+               -- including the reports from feeds still followed.
+               ORDER BY NOT EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = r.id),
+                        r.published_at_estimated, r.published_at, length(r.search_text) DESC, r.id
                LIMIT 1
              ) AS representative
       FROM item_clusters ic
@@ -261,4 +277,21 @@ export async function clusteringCounts(sql: SqlLike): Promise<ClusteringCounts> 
             WHERE NOT EXISTS (SELECT 1 FROM item_clusters ic WHERE ic.item_id = i.id)) AS pending
   `;
   return row ?? { clusters: 0, clusteredItems: 0, pending: 0 };
+}
+
+/**
+ * Clusters with a member that a subscription carries.
+ *
+ * Read before the subscription is deleted, since the deletion removes the very
+ * rows this looks at; the clusters are then refreshed so none is left
+ * represented by an item that can no longer be listed.
+ */
+export async function clustersOfSource(sql: SqlLike, sourceId: string): Promise<string[]> {
+  const rows = await sql<{ clusterId: string }[]>`
+    SELECT DISTINCT ic.cluster_id AS "clusterId"
+    FROM item_sources s
+    JOIN item_clusters ic ON ic.item_id = s.item_id
+    WHERE s.source_id = ${sourceId}::uuid
+  `;
+  return rows.map((row) => row.clusterId);
 }

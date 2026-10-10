@@ -249,7 +249,9 @@ For each item with no cluster, look at items published within `CLUSTER_WINDOW_HO
 - cosine distance below `CLUSTER_MAX_DISTANCE`, default 0.15 — much tighter than search's 0.6, because search wants related and this wants same;
 - or Hamming distance at most `CLUSTER_SIMHASH_MAX_BITS`, default 6 of 64.
 
-Either signal alone is enough; `matched_by` records which fired. An item joins the cluster of its best match, or opens a new cluster of one. This is single-link agglomeration over a window, which can chain — A near B, B near C, A not near C — and at these thresholds a chain means the pair really is one story told twice. Tightening further would split real duplicates apart, which is the failure the issue is about.
+Either signal alone is enough; `matched_by` records which fired. An item joins the cluster of its best match, or opens a new cluster of one. This is single-link agglomeration over a window, which can chain — A near B, B near C, A not near C — and at these thresholds a chain means the pair really is one story told twice. Tightening further would split real duplicates apart, which is the failure the issue is about. Chaining also means the window bounds each join, not the cluster: a story that keeps drawing follow-ups can span longer than 72 hours.
+
+Corrected while implementing: a cluster never holds two items that share a subscription. A feed does not report the same news twice; what looks alike inside one feed is a series or a follow-up. On a real corpus of 145 articles, parts 1-3 of one series matched each other at cosine distances 0.122-0.132, between the true cross-outlet matches at 0.119-0.149, so no distance threshold separates them; whether the two items share a subscription separates them exactly. The check runs against every member of the candidate's cluster rather than the candidate alone — otherwise part 2 joins part 1 through another outlet's copy of part 1. This is also what the issue's title, "across sources", says.
 
 The worker runs on the same shape as the embedding backfill: poll for items with no `item_clusters` row, no queue table, resumable, and safe to run repeatedly. `CLUSTERING_ENABLED` defaults to false.
 
@@ -263,9 +265,11 @@ Corrected while implementing: the draft expressed this as `DISTINCT ON (COALESCE
 
 The representative is the cluster member with the earliest non-estimated `published_at`, ties broken by longest `search_text`: the outlet that published first, and among simultaneous ones the version with the most content. Deterministic, and computable without reference to anything user-specific. An attractive alternative — the version from the subscription you read most — is recorded and not taken. See D23.
 
+Corrected while implementing: members still carried by a subscription come first. A collapsed listing shows a story through its representative alone, so a representative no subscription carries — its feed was unsubscribed — would hide the whole story, reports from feeds still followed included. Deleting a subscription recomputes the representatives of the clusters its items belong to, in the same transaction.
+
 When a listing is collapsed, marking the visible row read marks every member of its cluster read. Anything else resurfaces the same story under the next representative, which is exactly what the issue asks to stop. `POST /items/:id/state` gains `scope: item|cluster`, defaulting to `item`; the CLI passes `cluster` from `mark`, since `read` collapses by default. Only the read is carried: a star or a skip is about the article in front of you, and copying it to every syndicated copy would count one opinion several times in the interest profile. The MCP server's `mark_read` stays at `item`, because the ids it receives may come from `search_articles`, which never collapses, and it cannot tell which listing an id came from; a representative filter means a read that does not propagate still cannot bring the story back. Note that a propagated read is not noise for interest scoring: a cluster is one story by construction, so "you read this story" is true of every member. See D24.
 
-`--no-collapse` and `collapse=false` expand.
+`--no-collapse` and `collapse=false` expand. A listing filtered to one subscription never collapses: no cluster holds two items from one feed, so collapsing there could only hide that feed's own reports behind another outlet's representative.
 
 ## Part 3: LLM enrichment (#5)
 

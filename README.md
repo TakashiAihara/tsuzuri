@@ -208,7 +208,7 @@ They fail in different places. SimHash measures how much of the text changed, so
 
 The row is the outlet that published first. A guessed date never wins that, and between reports published at the same moment the one with the most text does. Marking it read reads every report of the story, so the duplicates do not come back under `--no-collapse` or count as unread; `tsuzuri mark --no-collapse` reads only the one you named. A star stays on the article you starred, since starring eight copies of one story would count one opinion eight times.
 
-Reports more than `CLUSTER_WINDOW_HOURS` apart are different stories, which is also what keeps the comparison cheap. Search never collapses: when you searched for something, every version of it is a result.
+A report joins a story only if it was published within `CLUSTER_WINDOW_HOURS` of a report already in it, which is also what keeps the comparison cheap; a story that keeps drawing follow-ups can therefore span longer than the window. Two reports from the same subscription never join one story, since a feed does not report the same news twice and what looks alike inside one feed is a series. `--source` never collapses, for the same reason. Search never collapses either: when you searched for something, every version of it is a result.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

@@ -32,6 +32,8 @@ describeIfDb("clustering", () => {
   let handle: ReturnType<typeof createDatabase>;
   let app: ReturnType<typeof createApi>;
   let clustering: ReturnType<typeof createClusteringService>;
+  let wireFeed: string;
+  let outletFeed: string;
 
   const readAt = async (itemId: string) => {
     const [row] = await handle.sql<Array<{ readAt: Date | null }>>`
@@ -84,7 +86,7 @@ describeIfDb("clustering", () => {
              (${DEFAULT_USER_ID}, 'feed', 'https://outlet.example/feed')
       RETURNING id
     `;
-    const [wireFeed, outletFeed] = sources.map((row) => row.id as string);
+    [wireFeed, outletFeed] = sources.map((row) => row.id as string) as [string, string];
     for (const [itemId, sourceId] of [
       [WIRE, wireFeed],
       [COPY, outletFeed],
@@ -179,6 +181,30 @@ describeIfDb("clustering", () => {
     expect(await starredAt(COPY)).toBeNull();
   });
 
+  test("one subscription's own view shows its reports, even ones another outlet represents", async () => {
+    // COPY came through the outlet's feed but is not the representative.
+    // Collapsing here would hide the outlet's only report of the story.
+    const { items } = await listing(`unread=false&sourceId=${outletFeed}`);
+    expect(items.map((item) => item.id)).toEqual([COPY]);
+  });
+
+  test("carrying a read across the story keeps a report's earlier read time", async () => {
+    await handle.sql`
+      INSERT INTO item_state (user_id, item_id, read_at)
+      VALUES (${DEFAULT_USER_ID}, ${COPY}, '2026-01-01T00:00:00Z')
+      ON CONFLICT (user_id, item_id) DO UPDATE SET read_at = excluded.read_at
+    `;
+    await setState(WIRE, { read: true, scope: "cluster" });
+    // COPY was read in January; reading the story now must not make that read
+    // look fresh to the interest profile.
+    // Raw queries return timestamptz as text here (drizzle swaps the parser).
+    expect(new Date((await readAt(COPY)) as unknown as string).toISOString()).toBe(
+      "2026-01-01T00:00:00.000Z",
+    );
+    expect(await readAt(WIRE)).not.toBeNull();
+    await setState(WIRE, { read: false, scope: "cluster" });
+  });
+
   test("doctor reports what clustering has done", async () => {
     const response = await app.fetch(new Request("http://test/doctor"));
     const body = (await response.json()) as { features: { clustering: unknown } };
@@ -188,5 +214,17 @@ describeIfDb("clustering", () => {
       clusteredItems: 3,
       pending: 0,
     });
+  });
+
+  test("unsubscribing from the representative's feed leaves the story visible", async () => {
+    // Last, because it removes a subscription from the shared fixture. WIRE
+    // represents the story and came only through the wire feed; once that is
+    // gone, COPY from the outlet must stand for the story.
+    expect(
+      (await app.fetch(new Request(`http://test/sources/${wireFeed}`, { method: "DELETE" })))
+        .status,
+    ).toBe(200);
+    const { items } = await listing("unread=false");
+    expect(items.map((item) => item.id)).toContain(COPY);
   });
 });
