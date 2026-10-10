@@ -837,6 +837,85 @@ describeIfDb("createEnrichmentService", () => {
     expect(asked).toHaveLength(3);
   });
 
+  test("a forced rerun the hour cuts short says so, and continuing it asks only what is left", async () => {
+    // Two kinds per article and an hour of three calls: the first run gets
+    // through a's summary and tags and b's summary, and leaves b's tags.
+    await seedItem("a", { hoursAgo: 6 * 24 });
+    await seedItem("b", { hoursAgo: 6 * 24 });
+    await summarised(handle.sql, "a", 3 * 60);
+    await summarised(handle.sql, "b", 2 * 60);
+    const { chat, asked } = stubChat(answerEachPrompt());
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
+
+    const first = await service(chat, {
+      ENRICH_TAGS: "true",
+      ENRICH_MAX_ITEMS_PER_HOUR: "3",
+    }).runOver({
+      since,
+      kind: null,
+      force: true,
+    });
+    expect(asked).toHaveLength(3);
+    expect(first.bounded).toBe(true);
+
+    // A later service with room left, continuing from the cutoff: what the
+    // first run wrote is answered, so only b's tags are asked.
+    const second = await service(chat, {
+      ENRICH_TAGS: "true",
+      ENRICH_MAX_ITEMS_PER_HOUR: "10",
+    }).runOver({
+      since,
+      kind: null,
+      force: true,
+      forceBefore: new Date(first.forceBefore as string),
+    });
+    expect(asked).toHaveLength(4);
+    expect(second.tagged).toBe(1);
+    expect(second.summarised).toBe(0);
+    expect(second.bounded).toBe(false);
+  });
+
+  test("a rerun the hour has already emptied is bounded, not finished", async () => {
+    await seedItem("a", { hoursAgo: 6 * 24 });
+    const { chat, asked } = stubChat(answerEachPrompt());
+    const enrichment = service(chat, { ENRICH_TAGS: "true", ENRICH_MAX_ITEMS_PER_HOUR: "2" });
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
+
+    // a's summary and tags spend the hour, then b arrives with nothing left.
+    await enrichment.runOver({ since, kind: null, force: false });
+    await seedItem("b", { hoursAgo: 6 * 24 });
+    const after = await enrichment.runOver({ since, kind: null, force: false });
+
+    expect(asked).toHaveLength(2);
+    expect(after.items).toBe(0);
+    expect(after.bounded).toBe(true);
+  });
+
+  test("a pass stops between kinds when the hour runs out", async () => {
+    await seedItem("a");
+    const { chat, asked } = stubChat(answerEachPrompt());
+
+    const result = await service(chat, {
+      ENRICH_TAGS: "true",
+      ENRICH_MAX_ITEMS_PER_HOUR: "1",
+    }).runPass();
+
+    // Summary paid, tags left: the hour, not the work, ended it.
+    expect(asked).toHaveLength(1);
+    expect(result.bounded).toBe(true);
+  });
+
+  test("a pass a configuration error stopped is idle, so it does not ask again at once", async () => {
+    await seedItem("a");
+    await seedItem("b");
+    const { chat } = stubChat(() => new ChatError("chat request failed (401)", "configuration"));
+
+    const result = await service(chat).runPass();
+
+    expect(result.error).not.toBeNull();
+    expect(result.idle).toBe(true);
+  });
+
   test("a forced rerun with an explicit cutoff measures against that, not the request", async () => {
     // "Re-run everything older than this" and "re-run everything" are different
     // questions, and only the caller knows which one it is asking.
@@ -1078,6 +1157,20 @@ describeIfDb("createEnrichmentService", () => {
     expect(again.cached).toBe(true);
     expect(again.text).toBe("the translated body");
     expect(asked).toHaveLength(0);
+  });
+
+  test("translate is refused once the hour is spent, like every other call", async () => {
+    await seedItem("a");
+    await seedItem("b");
+    const { chat, asked } = stubChat(answerEachPrompt());
+    const enrichment = service(chat, {
+      ENRICH_TRANSLATE_TO: "Japanese",
+      ENRICH_MAX_ITEMS_PER_HOUR: "1",
+    });
+
+    await enrichment.translateBody("a");
+    await expect(enrichment.translateBody("b")).rejects.toThrow(/ENRICH_MAX_ITEMS_PER_HOUR/);
+    expect(asked).toHaveLength(1);
   });
 
   test("translate refuses without a target language rather than guessing one", async () => {

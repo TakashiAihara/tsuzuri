@@ -51,7 +51,7 @@ export {
   type EnrichmentKind,
   type EnrichmentRow,
   type EnrichmentTarget,
-  enrichmentCallsBefore,
+  enrichmentCallsSince,
   enrichmentCandidates,
   enrichmentCounts,
   enrichmentInputs,

@@ -469,7 +469,7 @@ const enrich = program
       // articles it has already written.
       if (result.bounded && result.forceBefore) {
         log(
-          `continue the rest with: tsuzuri enrich --since ${opts.since} --force --force-before ${result.forceBefore}`,
+          `continue the rest with: tsuzuri enrich --since ${opts.since}${opts.kind ? ` --kind ${opts.kind}` : ""} --force --force-before ${result.forceBefore}`,
         );
       } else if (result.bounded) {
         log("stopped at ENRICH_MAX_ITEMS_PER_HOUR; run it again for the rest");

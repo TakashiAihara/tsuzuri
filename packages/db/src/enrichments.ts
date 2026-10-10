@@ -668,8 +668,8 @@ export type EnrichmentCounts = {
  * nothing about what this one would have said, and counting it would make a
  * model switch look like work this installation had already done.
  *
- * Failures carry no model, so they are counted whole and labelled as the
- * backlog rather than as this model's output.
+ * Failures are keyed by model and prompt version too, so they are scoped the
+ * same way.
  */
 export async function enrichmentCounts(
   sql: postgres.Sql,
@@ -708,7 +708,7 @@ export async function enrichmentCounts(
  * next_attempt_at is what the backoff reads and is always in the future for a
  * fresh failure, so the attempt itself is stamped on its own column.
  */
-export async function enrichmentCallsBefore(sql: postgres.Sql, since: Date): Promise<number> {
+export async function enrichmentCallsSince(sql: postgres.Sql, since: Date): Promise<number> {
   const rows = await sql<{ count: number }[]>`
     SELECT (
       (SELECT count(*)::int FROM enrichments

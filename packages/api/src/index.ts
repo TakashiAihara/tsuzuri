@@ -110,10 +110,9 @@ export type Item = z.infer<typeof itemSchema>;
  * field the listing carries, and the same reason: a reader cannot tell the
  * feed's summary from the model's without it.
  *
- * Always present, and never null: an article no model has touched has a summary
- * of its own to show, and `summarySource: "feed"` is what says where that came
- * from. A nullable field beside it would be a second way to say the same thing,
- * and a caller would have to handle both.
+ * The object is always present; `summary` is the model's and null when no model
+ * has written one, with `summarySource: "feed"` telling a caller to show the
+ * article's own summary instead.
  */
 export const itemEnrichmentSchema = z.strictObject({
   summary: z.string().nullable(),

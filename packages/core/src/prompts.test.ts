@@ -184,6 +184,35 @@ describe("completeJson", () => {
     expect(asked).toHaveLength(1);
   });
 
+  test("a brace in the prose that never closes does not hide the answer after it", async () => {
+    const { provider, asked } = stubProvider([
+      'Note: { this aside never closes. {"summary": "a short summary"}',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("a quote mark in the prose does not hide the answer after it", async () => {
+    const { provider, asked } = stubProvider(['The 5" disk: {"summary": "a short summary"}']);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("a whole-reply object whose value holds a fenced block is read whole", async () => {
+    // The case that tells the whole-reply step from the fence step: looking for
+    // a fence first would return the inner block, which has the wrong shape.
+    const inner = '```json\n{"other": 1}\n```';
+    const { provider, asked } = stubProvider([JSON.stringify({ summary: `see ${inner}` })]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: `see ${inner}` });
+    expect(asked).toHaveLength(1);
+  });
+
   test("a brace inside a string value does not end the object early", async () => {
     // The balanced span is what makes this parse: stopping at the first "}"
     // would hand JSON.parse half an object and spend the retry on it.

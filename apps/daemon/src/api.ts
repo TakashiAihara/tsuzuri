@@ -613,6 +613,11 @@ export function createApi(deps: ApiDeps) {
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
+    // A cutoff in the future counts nothing as answered, so every call would
+    // re-pick the same articles and never get past them.
+    if (forceBefore && forceBefore.getTime() > Date.now()) {
+      return c.json({ error: "forceBefore is in the future" }, 400);
+    }
 
     try {
       // 200 with the counts even when the run was cut short: a configuration

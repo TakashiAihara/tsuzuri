@@ -223,39 +223,43 @@ function unwrapJson(answer: string): string {
   return trimmed;
 }
 
-/** Every balanced `{ ... }` span in the text, outermost first and left to right. */
-function objectSpans(text: string): string[] {
-  const spans: string[] = [];
+/**
+ * The balanced `{ ... }` span starting at each `{`, left to right.
+ *
+ * Scanned from every opening brace rather than once over the whole reply,
+ * because the prose around the answer is not JSON: a stray `{` that never
+ * closes, or a `"` in `a 5" disk`, would otherwise throw the one scan off and
+ * hide the object that follows. Quotes are tracked only inside a span, where
+ * a brace in a string value is text.
+ */
+function* objectSpans(text: string): Generator<string> {
+  for (let start = text.indexOf("{"); start >= 0; start = text.indexOf("{", start + 1)) {
+    const end = closingBrace(text, start);
+    if (end >= 0) yield text.slice(start, end + 1);
+  }
+}
+
+function closingBrace(text: string, start: number): number {
   let depth = 0;
-  let start = -1;
   let inString = false;
   let escaped = false;
 
-  for (let index = 0; index < text.length; index += 1) {
+  for (let index = start; index < text.length; index += 1) {
     const char = text[index];
-
-    // A brace inside a string value is text, so the scan has to know about the
-    // quotes and the backslashes that escape them.
     if (inString) {
       if (escaped) escaped = false;
       else if (char === "\\") escaped = true;
       else if (char === '"') inString = false;
-      continue;
-    }
-    if (char === '"') {
+    } else if (char === '"') {
       inString = true;
-      continue;
-    }
-
-    if (char === "{") {
-      if (depth === 0) start = index;
+    } else if (char === "{") {
       depth += 1;
-    } else if (char === "}" && depth > 0) {
+    } else if (char === "}") {
       depth -= 1;
-      if (depth === 0 && start >= 0) spans.push(text.slice(start, index + 1));
+      if (depth === 0) return index;
     }
   }
-  return spans;
+  return -1;
 }
 
 function parses(candidate: string): boolean {

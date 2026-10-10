@@ -293,6 +293,23 @@ describe("enrichment commands", () => {
     );
   });
 
+  test("the printed continuation keeps --kind, so it continues the same rerun", async () => {
+    enrichResponse = {
+      items: 60,
+      summarised: 0,
+      tagged: 60,
+      translated: 0,
+      failed: 0,
+      bounded: true,
+      error: null,
+      forceBefore: "2026-10-10T12:00:00.000Z",
+    };
+    const { stderr } = await run(["enrich", "--since", "30d", "--kind", "tags", "--force"]);
+    expect(stderr).toMatch(
+      /tsuzuri enrich --since 30d --kind tags --force --force-before 2026-10-10T12:00:00\.000Z/,
+    );
+  });
+
   test("enrich says what stopped a rerun that the model refused", async () => {
     enrichResponse = {
       items: 4,

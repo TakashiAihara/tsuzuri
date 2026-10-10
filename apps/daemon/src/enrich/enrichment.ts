@@ -28,7 +28,7 @@ import {
   type EnrichmentInput,
   type EnrichmentKind,
   type EnrichmentTarget,
-  enrichmentCallsBefore,
+  enrichmentCallsSince,
   enrichmentCandidates,
   enrichmentCounts,
   enrichmentInputs,
@@ -547,7 +547,7 @@ export function createEnrichmentService(deps: {
     chat: ChatProvider,
     item: EnrichmentInput,
     wanted: readonly WantedEnrichment[],
-    force: boolean,
+    cutoff: Date | null,
     allowance: Allowance,
   ): Promise<EnrichmentRun> {
     const run = emptyRun();
@@ -563,8 +563,16 @@ export function createEnrichmentService(deps: {
       if (stopping) break;
       // Between kinds rather than once per item: one article can be several
       // calls -- one for each kind, plus a retry of an answer that did not
-      // parse -- and the hour is a budget of calls.
-      if (allowance.left <= 0) break;
+      // parse -- and the hour is a budget of calls. Checked before the call
+      // rather than reserved, so ENRICH_CONCURRENCY workers can each pass the
+      // check on the last call: the bound can be exceeded by up to
+      // ENRICH_CONCURRENCY - 1 calls, plus their parse retries.
+      if (allowance.left <= 0) {
+        // Kinds of this item were left unpaid, so the run is bounded even
+        // when every item was reached.
+        run.bounded = true;
+        break;
+      }
       const lang = want.lang ?? "";
       const target: EnrichmentTarget = {
         kind: want.kind,
@@ -572,18 +580,22 @@ export function createEnrichmentService(deps: {
         model: chat.model,
         promptVersion: want.promptVersion,
       };
-      if (!force && (await inBackoff(sql, item.id, target))) continue;
+      if (cutoff === null && (await inBackoff(sql, item.id, target))) continue;
       // Asked of the store rather than assumed from selection: writing a kind
-      // the item already has would spend a call to overwrite an answer.
-      const stored = force
-        ? []
-        : await currentEnrichments(sql, [item.id], {
-            kind: want.kind,
-            lang,
-            model: chat.model,
-            promptVersion: want.promptVersion,
-          });
-      if (stored.length > 0) continue;
+      // the item already has would spend a call to overwrite an answer. Under
+      // force the same cutoff as selection decides, so a kind this rerun (or
+      // the one it continues) already wrote is not asked again.
+      const stored = await currentEnrichments(sql, [item.id], {
+        kind: want.kind,
+        lang,
+        model: chat.model,
+        promptVersion: want.promptVersion,
+      });
+      const answered =
+        cutoff === null
+          ? stored.length > 0
+          : stored.some((row) => new Date(row.createdAt) >= cutoff);
+      if (answered) continue;
 
       asked = true;
       try {
@@ -630,7 +642,7 @@ export function createEnrichmentService(deps: {
   async function callsLeft(now: Date): Promise<number> {
     const hourAgo = now.getTime() - MS_PER_HOUR;
     if (seededCalls === null) {
-      seededCalls = await enrichmentCallsBefore(sql, new Date(hourAgo));
+      seededCalls = await enrichmentCallsSince(sql, new Date(hourAgo));
       seededAt = Date.now();
     }
 
@@ -639,6 +651,17 @@ export function createEnrichmentService(deps: {
     // dropped an hour after it was taken rather than living forever.
     const seed = seededAt >= hourAgo ? seededCalls : 0;
     return Math.max(0, config.ENRICH_MAX_ITEMS_PER_HOUR - seed - callTimes.length);
+  }
+
+  /**
+   * Whether the hour, rather than the work, ended a run: the allowance is spent
+   * and something it was asked to do is left -- an item not reached, or kinds
+   * of a reached item left unpaid. One rule for the pass and the rerun, because
+   * a rerun that says it finished while the hour cut it short is never resumed.
+   */
+  function hourRanOut(total: EnrichmentRun, allowance: Allowance, waiting: number): boolean {
+    if (allowance.left > 0) return false;
+    return total.bounded || waiting > total.items;
   }
 
   function emptyRun(): EnrichmentRun {
@@ -660,6 +683,7 @@ export function createEnrichmentService(deps: {
     total.tagged += part.tagged;
     total.translated += part.translated;
     total.failed += part.failed;
+    total.bounded ||= part.bounded;
   }
 
   /**
@@ -677,7 +701,7 @@ export function createEnrichmentService(deps: {
     chat: ChatProvider,
     items: readonly EnrichmentInput[],
     wanted: readonly WantedEnrichment[],
-    force: boolean,
+    cutoff: Date | null,
     allowance: Allowance,
   ): Promise<EnrichmentRun> {
     const total = emptyRun();
@@ -693,7 +717,7 @@ export function createEnrichmentService(deps: {
           // before the queue can start another one.
           if (refused) return emptyRun();
           try {
-            return await enrichOne(chat, item, wanted, force, allowance);
+            return await enrichOne(chat, item, wanted, cutoff, allowance);
           } catch (error) {
             if (isConfiguration(error)) refused = true;
             throw error;
@@ -784,17 +808,17 @@ export function createEnrichmentService(deps: {
     if (ids.length === 0) return { ...emptyRun(), idle: true };
 
     const inputs = await enrichmentInputs(sql, ids.slice(0, budget));
-    const total = await spend(counted, inputs, wanted, false, allowance);
-    // Bounded by the hour alone: the list is already cut to ENRICH_TOP_N and to
-    // the window, so what the pass did not reach is what the hour could not pay
-    // for -- either at selection or part of the way through spending it.
-    // Idle means nothing was spent, not that nothing was waiting. A pass the
-    // hourly bound empties would otherwise ask again every quarter of a second
-    // until the hour turned over.
+    const total = await spend(counted, inputs, wanted, null, allowance);
+    // The list is already cut to ENRICH_TOP_N and to the window, so what the
+    // pass did not reach is what the hour could not pay for.
+    // Idle when nothing more can happen until something changes: nothing was
+    // affordable, or a configuration error stopped the spend. A pass stopped
+    // by a 401 would otherwise ask again every quarter of a second, spending
+    // the hour on refusals.
     return {
       ...total,
-      bounded: ids.length > budget || (allowance.left <= 0 && total.items < inputs.length),
-      idle: inputs.length === 0,
+      bounded: hourRanOut(total, allowance, ids.length),
+      idle: inputs.length === 0 || total.error !== null,
     };
   }
 
@@ -842,9 +866,10 @@ export function createEnrichmentService(deps: {
    * would otherwise be 50 round trips, which is the difference between a
    * listing and a page that takes a second.
    *
-   * Every id asked about gets an entry, carrying the feed's summary where
-   * nothing has been written, because the caller asked what is there and "the
-   * feed's" is an answer rather than an absence.
+   * Every id asked about gets an entry. Where no model has written a summary
+   * the entry says so (`summarySource: "feed"`, no summary) and the caller
+   * shows the article's own, because "the feed's" is an answer rather than an
+   * absence.
    */
   async function enrichmentForItems(
     itemIds: readonly string[],
@@ -1004,13 +1029,12 @@ export function createEnrichmentService(deps: {
 
         const ids = selection.candidates;
         const inputs = await enrichmentInputs(sql, ids.slice(0, allowance.left));
-        const total = await spend(counted, inputs, wanted, force, allowance);
+        const total = await spend(counted, inputs, wanted, cutoff, allowance);
         // From what matched rather than from what was fetched: the fetch is
-        // capped by the hour, so asking whether the fetch was full can only say
-        // the hour was empty.
+        // capped by the hour, so a full fetch says nothing about what waits.
         return {
           ...total,
-          bounded: selection.matched > ids.length,
+          bounded: hourRanOut(total, allowance, selection.matched),
           forceBefore: cutoff ? cutoff.toISOString() : null,
         };
       });
@@ -1065,6 +1089,14 @@ export function createEnrichmentService(deps: {
       });
       const answered = bodyTranslationReplySchema.safeParse(stored[0]?.content);
       if (answered.success) return { itemId, lang, text: answered.data.text, cached: true };
+      // The same hour as every other call: a body translation is the largest
+      // call there is, and one that ignored the bound would make it a bound on
+      // everything except the expensive part.
+      if ((await callsLeft(new Date())) <= 0) {
+        throw new EnrichmentPreconditionError(
+          "ENRICH_MAX_ITEMS_PER_HOUR is spent for this hour; try again later",
+        );
+      }
 
       const [item] = await enrichmentInputs(sql, [itemId]);
       if (!item) throw new EnrichmentPreconditionError(`no item with id ${itemId}`);

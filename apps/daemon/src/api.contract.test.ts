@@ -277,7 +277,7 @@ describeIfDb("api contract", () => {
   });
 
   test("POST /enrich continues a forced rerun from the cutoff it was given", async () => {
-    const cutoff = new Date(Date.now() + 1000).toISOString();
+    const cutoff = new Date().toISOString();
 
     const body = await parsed(enrichRunSchema, "/enrich", {
       method: "POST",
@@ -285,10 +285,25 @@ describeIfDb("api contract", () => {
       body: JSON.stringify({ since: "7d", force: true, forceBefore: cutoff }),
     });
 
-    // Nothing here was written before a cutoff in the future, so every article
-    // in the period is waiting again.
+    // Every summary here was written before the cutoff, so each article in the
+    // period counts as unanswered and is asked again.
     expect(body.summarised).toBe(3);
     expect(body.forceBefore).toBe(cutoff);
+  });
+
+  test("POST /enrich refuses a cutoff in the future", async () => {
+    const response = await app.fetch(
+      new Request("http://test/enrich", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          since: "7d",
+          force: true,
+          forceBefore: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      }),
+    );
+    expect(response.status).toBe(400);
   });
 
   test("POST /enrich answers 200 with the counts when a refusal ends a rerun", async () => {

@@ -9,7 +9,7 @@ import {
   clearEnrichmentFailure,
   currentEnrichments,
   type EnrichmentTarget,
-  enrichmentCallsBefore,
+  enrichmentCallsSince,
   enrichmentCandidates,
   enrichmentCounts,
   enrichmentInputs,
@@ -1379,8 +1379,8 @@ describeIfDb("enrichments", () => {
 
       // Three rows written, one of them by the refusal: four calls spent, not
       // two items.
-      expect(await enrichmentCallsBefore(handle.sql, new Date(Date.now() - 3600_000))).toBe(4);
-      expect(await enrichmentCallsBefore(handle.sql, new Date(Date.now() + 3600_000))).toBe(0);
+      expect(await enrichmentCallsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(4);
+      expect(await enrichmentCallsSince(handle.sql, new Date(Date.now() + 3600_000))).toBe(0);
     });
 
     test("one item answered twice is two calls, not one", async () => {
@@ -1402,7 +1402,7 @@ describeIfDb("enrichments", () => {
         content: { tags: [], candidates: [] },
       });
 
-      expect(await enrichmentCallsBefore(handle.sql, new Date(Date.now() - 3600_000))).toBe(2);
+      expect(await enrichmentCallsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(2);
     });
 
     test("a failure from yesterday does not count against today's hour", async () => {
@@ -1414,7 +1414,7 @@ describeIfDb("enrichments", () => {
         new Date(Date.now() - 3 * 60 * 60_000),
       );
 
-      expect(await enrichmentCallsBefore(handle.sql, new Date(Date.now() - 3600_000))).toBe(0);
+      expect(await enrichmentCallsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(0);
     });
   });
 
