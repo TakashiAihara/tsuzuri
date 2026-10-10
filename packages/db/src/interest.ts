@@ -294,17 +294,6 @@ export type ScoredItem = {
 };
 
 /**
- * Keep only rows that stand for a story: an item no cluster has claimed, or
- * the stored representative of its cluster.
- *
- * Not DISTINCT ON over the filtered list. That would pick, per cluster, the
- * first row surviving the unread filter -- so reading the representative would
- * promote the next unread member into its place, and the story would come
- * back. A fixed representative cannot be replaced by a filter.
- */
-const STORY_ROW = `(ic.cluster_id IS NULL OR cl.representative_item_id = i.id)`;
-
-/**
  * The reports a row stands for, counting only members a subscription still
  * carries: `clusters.size` keeps every member, and a report from a feed you
  * left cannot be shown by `--no-collapse`, so it must not be in the "+N".
@@ -314,6 +303,22 @@ export const LISTED_CLUSTER_SIZE = `(CASE WHEN ic.cluster_id IS NULL THEN 1 ELSE
   WHERE m.cluster_id = ic.cluster_id
     AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = m.item_id)
 ) END)`;
+
+/**
+ * Only these rows stand for a story: an item no cluster has claimed, or the
+ * stored representative of its cluster.
+ *
+ * Not DISTINCT ON over the filtered list. That would pick, per cluster, the
+ * first row surviving the unread filter -- so reading the representative would
+ * promote the next unread member into its place, and the story would come
+ * back. A fixed representative cannot be replaced by a filter.
+ *
+ * Exported rather than written beside every query that needs it. A second copy
+ * of this rule would decide the same question twice, and the failure of a
+ * disagreeing copy is invisible: one syndicated story either collapses or it
+ * does not, with no error anywhere.
+ */
+export const STORY_ROW = `(ic.cluster_id IS NULL OR cl.representative_item_id = i.id)`;
 
 export type ScoreOptions = {
   userId: string;
@@ -328,6 +333,16 @@ export type ScoreOptions = {
   windowDays: number;
   /** One row per story rather than one per report of it. */
   collapse: boolean;
+  /**
+   * Score only these items; null scores everything in the window.
+   *
+   * For callers that have already chosen a set and want it in interest order
+   * rather than in date order. Enrichment selection uses it to spend its calls
+   * on the top of its own candidates: the window it looks at and the ranking
+   * window are different, and filtering after ranking would leave the top of
+   * the ranked list occupied by items the pass has already paid for.
+   */
+  ids?: readonly string[] | null;
 };
 
 /**
@@ -413,6 +428,10 @@ export async function scoreItems(
     LEFT JOIN clusters cl ON cl.id = ic.cluster_id
     WHERE (${!options.unreadOnly} OR st.read_at IS NULL)
       AND (${!options.collapse} OR ${sql.unsafe(STORY_ROW)})
+      AND (
+        ${options.ids === null || options.ids === undefined}::boolean
+        OR i.id = ANY(${[...(options.ids ?? [])]}::text[])
+      )
       AND (
         ${options.sourceId}::uuid IS NULL
         OR EXISTS (

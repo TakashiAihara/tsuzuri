@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   embeddingStatusSchema,
+  enrichPruneResponseSchema,
+  enrichRunSchema,
   errorResponseSchema,
   importOpmlResponseSchema,
   ingestRunResponseSchema,
@@ -8,10 +10,15 @@ import {
   itemResponseSchema,
   itemStateResponseSchema,
   itemsResponseSchema,
+  llmStatusSchema,
   rankedItemsResponseSchema,
   searchResponseSchema,
   sourcesResponseSchema,
+  tagStatusResponseSchema,
+  tagsResponseSchema,
+  translateResponseSchema,
 } from "@tsuzuri/api";
+import type { ChatProvider, ChatRequest } from "@tsuzuri/core";
 import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
 import type { z } from "zod";
 
@@ -19,6 +26,7 @@ import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 
 /**
@@ -38,6 +46,30 @@ import { createInterestService } from "./enrich/interest.ts";
  */
 const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
+
+/**
+ * A chat model that answers every prompt the same way.
+ *
+ * The endpoints have to be exercised against a running daemon rather than a
+ * mocked service, and the pass is what a configured install actually does on
+ * its first request -- so the endpoints are driven by one that is switched on.
+ */
+const chat: ChatProvider = {
+  id: "openai-compatible",
+  model: "contract-stub",
+  async complete(request: ChatRequest) {
+    if (request.system.includes("summarise articles")) {
+      return '{"summary": "The model said this."}';
+    }
+    if (request.system.includes("tag articles")) {
+      return '{"tags": ["databases"], "candidates": ["query planners"]}';
+    }
+    if (request.system.includes("article bodies")) {
+      return '{"text": "the body, translated"}';
+    }
+    return '{"title": "題", "text": "要約"}';
+  },
+};
 
 describeIfDb("api contract", () => {
   let handle: ReturnType<typeof createDatabase>;
@@ -74,12 +106,21 @@ describeIfDb("api contract", () => {
       `;
     }
 
-    const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
+    const config = loadConfig({
+      DATABASE_URL: DATABASE_URL as string,
+      ENRICH_TRANSLATE_TO: "Japanese",
+    });
     const embeddings = createEmbeddingService({ sql: handle.sql, config });
     await embeddings.start();
     const interest = createInterestService({ sql: handle.sql, config, embeddings });
     await interest.start();
     const clustering = createClusteringService({ sql: handle.sql, config, embeddings });
+    const enrichment = createEnrichmentService({
+      sql: handle.sql,
+      config,
+      interest,
+      provider: chat,
+    });
     app = createApi({
       db: handle.db,
       sql: handle.sql,
@@ -88,6 +129,7 @@ describeIfDb("api contract", () => {
       embeddings,
       interest,
       clustering,
+      enrichment,
     });
   });
 
@@ -122,6 +164,8 @@ describeIfDb("api contract", () => {
     // Only the item with a subscription; the twins exist to make a prefix
     // ambiguous and are not attached to one.
     expect(body.items).toHaveLength(1);
+    // Nothing has been enriched yet, so the summary on offer is the feed's.
+    expect(body.items[0]?.summarySource).toBe("feed");
   });
 
   test("GET /items/:id", async () => {
@@ -151,6 +195,99 @@ describeIfDb("api contract", () => {
     expect(body.scoring.active).toBe(false);
     expect(body.items).toHaveLength(1);
     expect(body.items[0]?.exploration).toBe(false);
+    expect(body.items[0]?.summarySource).toBe("feed");
+  });
+
+  test("POST /enrich", async () => {
+    const body = await parsed(enrichRunSchema, "/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ since: "7d" }),
+    });
+    expect(body.items).toBe(1);
+    expect(body.summarised).toBe(1);
+    expect(body.bounded).toBe(false);
+  });
+
+  test("a listing carries the model's summary, and says where it came from", async () => {
+    // The reason summarySource exists: without it a response cannot answer
+    // whether enrichment is doing anything (D35).
+    const body = await parsed(itemsResponseSchema, "/items?unread=false");
+    expect(body.items[0]?.summary).toBe("The model said this.");
+    expect(body.items[0]?.summarySource).toBe("model");
+
+    const search = await parsed(searchResponseSchema, "/search?q=Rust");
+    expect(search.results[0]?.summarySource).toBe("model");
+  });
+
+  test("GET /tags", async () => {
+    // The pass suggested two tags the vocabulary does not hold, and
+    // TAG_CANDIDATE_PROMOTION_THRESHOLD is 5: one observation is not yet
+    // anybody's problem.
+    const body = await parsed(tagsResponseSchema, "/tags");
+    expect(body.tags).toEqual([]);
+  });
+
+  test("POST /tags/:slug/approve", async () => {
+    const body = await parsed(tagStatusResponseSchema, "/tags/databases/approve", {
+      method: "POST",
+    });
+    expect(body.tag).toEqual({ slug: "databases", status: "approved" });
+
+    const rejected = await parsed(tagStatusResponseSchema, "/tags/query-planners/reject", {
+      method: "POST",
+    });
+    expect(rejected.tag.status).toBe("rejected");
+
+    // Neither is waiting for a decision any more: an approved tag is not a
+    // candidate for anything, and a rejected one has been answered.
+    const review = await parsed(tagsResponseSchema, "/tags");
+    expect(review.tags).toEqual([]);
+  });
+
+  test("POST /items/:id/translate", async () => {
+    const body = await parsed(translateResponseSchema, `/items/${ITEM_ID}/translate`, {
+      method: "POST",
+    });
+    expect(body).toEqual({
+      itemId: ITEM_ID,
+      lang: "Japanese",
+      text: "the body, translated",
+      cached: false,
+    });
+
+    const again = await parsed(translateResponseSchema, `/items/${ITEM_ID}/translate`, {
+      method: "POST",
+    });
+    expect(again.cached).toBe(true);
+  });
+
+  test("POST /enrich/prune", async () => {
+    // A prompt version this build does not run, written by hand: what --force
+    // replays against, and what a prune is for.
+    await handle.sql`
+      INSERT INTO enrichments (item_id, kind, model, prompt_version, content)
+      VALUES (${ITEM_ID}, 'summary', 'contract-stub', 'summary.v0', '{"summary":"old prompt"}'::jsonb)
+    `;
+
+    const body = await parsed(enrichPruneResponseSchema, "/enrich/prune", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keepCurrent: true }),
+    });
+    expect(body.pruned).toBe(1);
+  });
+
+  test("GET /doctor reports what enrichment is configured with", async () => {
+    const response = await app.fetch(new Request("http://test/doctor"));
+    const body = (await response.json()) as { features: { llm: unknown } };
+    const llm = llmStatusSchema.parse(body.features.llm);
+
+    expect(llm.enabled).toBe(true);
+    expect(llm.provider).toBe("openai-compatible");
+    expect(llm.model).toBe("contract-stub");
+    expect(llm.promptVersions.summary).toBe("summary.v1");
+    expect(llm.counts.summarised).toBe(1);
   });
 
   test("GET /interest/status", async () => {
@@ -187,6 +324,28 @@ describeIfDb("api contract", () => {
       { name: "id prefix too short", path: "/items/abc", status: 400 },
       { name: "missing query", path: "/search", status: 400 },
       { name: "unreadable since", path: "/search?q=x&since=whenever", status: 400 },
+      // A rerun with no period would be the whole corpus in one request.
+      { name: "enrich without a period", path: "/enrich", status: 400, init: { method: "POST" } },
+      // Naming nothing keeps nothing, so an unstated keepCurrent must not be
+      // read as "delete every enrichment this installation has".
+      {
+        name: "prune without keepCurrent",
+        path: "/enrich/prune",
+        status: 400,
+        init: { method: "POST" },
+      },
+      {
+        name: "approve a tag nobody suggested",
+        path: "/tags/never-suggested/approve",
+        status: 404,
+        init: { method: "POST" },
+      },
+      {
+        name: "reject a tag nobody suggested",
+        path: "/tags/never-suggested/reject",
+        status: 404,
+        init: { method: "POST" },
+      },
       {
         name: "refused subscription",
         path: "/sources",

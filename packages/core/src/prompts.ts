@@ -26,6 +26,7 @@ export type Prompt = {
 export const SUMMARY_PROMPT_VERSION = "summary.v1";
 export const TRANSLATION_PROMPT_VERSION = "translation.v1";
 export const TAGS_PROMPT_VERSION = "tags.v1";
+export const BODY_TRANSLATION_PROMPT_VERSION = "translation-body.v1";
 
 export const summaryPrompt: Prompt = {
   version: SUMMARY_PROMPT_VERSION,
@@ -84,6 +85,29 @@ export type SummaryReply = z.infer<typeof summaryReplySchema>;
 
 export const translationReplySchema = z.object({ title: z.string(), text: z.string() });
 export type TranslationReply = z.infer<typeof translationReplySchema>;
+
+/**
+ * A body, on request (`tsuzuri translate <id>`).
+ *
+ * A different prompt from the title-and-summary one and therefore a different
+ * version: both write kind `translation` for the same language and model, so
+ * sharing a version would have one overwrite the other on the same key. The
+ * pass's answer is two short fields; this one is a whole article, and asking
+ * for it is the deliberate act the cost deserves (D30).
+ */
+export function bodyTranslationPrompt(targetLanguage: string): Prompt {
+  return {
+    version: BODY_TRANSLATION_PROMPT_VERSION,
+    system:
+      `You translate article bodies into ${targetLanguage}. ` +
+      'Answer with a JSON object of the form {"text": "..."} and nothing else. ' +
+      "Translate the whole body faithfully: do not summarise it, do not drop paragraphs, " +
+      "and do not add notes. Leave proper nouns, product names and identifiers in their original form.",
+  };
+}
+
+export const bodyTranslationReplySchema = z.object({ text: z.string() });
+export type BodyTranslationReply = z.infer<typeof bodyTranslationReplySchema>;
 
 export const tagsReplySchema = z.object({
   // Defaulted rather than required: an article the approved vocabulary does not

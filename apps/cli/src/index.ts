@@ -2,12 +2,16 @@
 import { readFile } from "node:fs/promises";
 import type {
   EmbeddingStatus,
+  EnrichRunResponse,
   Item,
   ItemSummary,
   RankedItem,
   ScoringState,
   SearchResponse,
   Source,
+  Tag,
+  TagStatusResponse,
+  TranslateResponse,
 } from "@tsuzuri/api";
 import { snippetToText } from "@tsuzuri/core";
 import { Command } from "commander";
@@ -391,6 +395,120 @@ program
   .action(async () => {
     const report = await call<Record<string, unknown>>(globals(), "/doctor");
     printJson(report);
+  });
+
+/**
+ * Re-running enrichment over history.
+ *
+ * `--since` is required rather than defaulted: a rerun spends model calls, and
+ * the period to spend them on is the one thing the daemon cannot guess. It is
+ * also what makes the command useful -- a new prompt version is evaluated
+ * against articles already stored, without refetching anything.
+ */
+const enrich = program
+  .command("enrich")
+  .description("re-run enrichment over stored articles")
+  // Checked rather than declared with requiredOption, which commander would
+  // then also demand of `enrich prune`, which has no period to give.
+  .option("--since <when>", "how far back to go, e.g. 7d or an ISO date")
+  .option("--kind <kind>", "summary, tags or translation; all of them by default")
+  .option("--force", "re-run articles that already have an answer for this prompt")
+  .action(async (opts: { since?: string; kind?: string; force?: boolean }) => {
+    if (!opts.since) {
+      log("enrich needs --since, e.g. --since 7d: it spends model calls, and no period is a guess");
+      process.exit(2);
+    }
+    const body = JSON.stringify({
+      since: opts.since,
+      ...(opts.kind ? { kind: opts.kind } : {}),
+      force: Boolean(opts.force),
+    });
+    const result = await call<EnrichRunResponse>(globals(), "/enrich", {
+      method: "POST",
+      raw: body,
+    });
+    if (globals().json) return printJson(result);
+    log(
+      `enriched ${result.items} articles: ${result.summarised} summarised, ` +
+        `${result.tagged} tagged, ${result.translated} translated, ${result.failed} failed`,
+    );
+    // Said rather than inferred from a smaller-than-expected count: a run
+    // stopped by the hourly limit looks exactly like one with nothing to do.
+    if (result.bounded) {
+      log("stopped at ENRICH_MAX_ITEMS_PER_HOUR; run it again for the rest");
+    }
+  });
+
+enrich
+  .command("prune")
+  .description("delete enrichments that are not current")
+  // Required because the alternative deletes everything: naming nothing keeps
+  // nothing, and the comparison between prompt versions is the reason the rows
+  // are kept at all (D27).
+  .requiredOption(
+    "--keep-current",
+    "keep the configured model at this build's prompt versions; everything else goes",
+  )
+  .action(async () => {
+    const result = await call<{ pruned: number }>(globals(), "/enrich/prune", {
+      method: "POST",
+      raw: JSON.stringify({ keepCurrent: true }),
+    });
+    if (globals().json) return printJson(result);
+    log(`pruned ${result.pruned} enrichments`);
+  });
+
+const tags = program.command("tags").description("review the tags the model has suggested");
+
+tags
+  .command("review")
+  .description("list suggested tags that have been seen often enough to decide on")
+  .action(async () => {
+    const { tags: candidates } = await call<{ tags: Tag[] }>(globals(), "/tags");
+    if (globals().json) return printJson(candidates);
+    if (candidates.length === 0) return log("nothing waiting for a decision");
+    for (const tag of candidates) {
+      out(`${String(tag.observations).padStart(4)}  ${tag.slug}`);
+    }
+    log("approve one with: tsuzuri tags approve <slug>");
+  });
+
+for (const [name, status] of [
+  ["approve", "approved"],
+  ["reject", "rejected"],
+] as const) {
+  tags
+    .command(`${name} <slug>`)
+    .description(
+      status === "approved"
+        ? "make a suggested tag a real one, attached to articles from now on"
+        : "answer a suggested tag; it will not be offered again",
+    )
+    .action(async (slug: string) => {
+      const result = await call<TagStatusResponse>(
+        globals(),
+        `/tags/${encodeURIComponent(slug)}/${name}`,
+        { method: "POST" },
+      );
+      if (globals().json) return printJson(result);
+      log(`${status} ${slug}`);
+    });
+}
+
+program
+  .command("translate <id>")
+  .description("translate one article's body into ENRICH_TRANSLATE_TO")
+  // Not automatic: a body is a large call on text nobody has decided to read,
+  // so asking is the point (D30). Bounded by CHAT_MAX_OUTPUT_TOKENS.
+  .action(async (id: string) => {
+    const result = await call<TranslateResponse>(globals(), `/items/${id}/translate`, {
+      method: "POST",
+    });
+    if (globals().json) return printJson(result);
+    out(result.text);
+    // Silent on a cached answer would read as "the model was called again",
+    // which is the difference between a free repeat and a paid one.
+    if (result.cached) log(`(stored translation of ${result.lang}, no call made)`);
   });
 
 await program.parseAsync(process.argv);

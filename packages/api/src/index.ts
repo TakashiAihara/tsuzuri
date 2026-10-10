@@ -62,6 +62,16 @@ export const itemSummarySchema = z.strictObject({
   publishedAt: z.string(),
   publishedAtEstimated: z.boolean(),
   summary: z.string().nullable(),
+  /**
+   * Which of the two summaries this is: the one a chat model wrote for the
+   * current prompt, or the one the feed supplied.
+   *
+   * Without it "is enrichment doing anything" cannot be answered from a
+   * response -- the same failure `mode` and `reason` exist to prevent on a
+   * search. An item with no summary at all reports `feed`, because the feed is
+   * the only source that could have supplied one (D35).
+   */
+  summarySource: z.enum(["feed", "model"]),
   readAt: z.string().nullable(),
   starredAt: z.string().nullable(),
   /**
@@ -117,6 +127,8 @@ export const searchHitSchema = z.strictObject({
   title: z.string().nullable(),
   publishedAt: z.string(),
   summary: z.string().nullable(),
+  /** As on itemSummarySchema. */
+  summarySource: z.enum(["feed", "model"]),
   snippet: z.string().nullable(),
   rrf: z.number(),
   textRank: z.number().nullable(),
@@ -196,6 +208,8 @@ export const rankedItemSchema = z.strictObject({
   publishedAt: z.string(),
   publishedAtEstimated: z.boolean(),
   summary: z.string().nullable(),
+  /** As on itemSummarySchema. */
+  summarySource: z.enum(["feed", "model"]),
   readAt: z.string().nullable(),
   starredAt: z.string().nullable(),
   interest: z.number(),
@@ -272,6 +286,96 @@ export const ingestRunResponseSchema = z.strictObject({
 
 /** Every error the API returns has this shape, whatever the status. */
 export const errorResponseSchema = z.strictObject({ error: z.unknown() });
+
+export const tagSchema = z.strictObject({
+  id: z.string(),
+  slug: z.string(),
+  label: z.string(),
+  status: z.enum(["approved", "candidate", "rejected"]),
+  observations: z.number(),
+});
+export type Tag = z.infer<typeof tagSchema>;
+
+/**
+ * Candidates the model has proposed often enough to be worth a decision.
+ *
+ * A candidate is not a tag. Nothing in this list is attached to an article
+ * until somebody approves it, which is why an install that has never run
+ * `tsuzuri tags review` has a growing list and no tags (D28).
+ */
+export const tagsResponseSchema = z.strictObject({ tags: z.array(tagSchema) });
+
+export const tagStatusResponseSchema = z.strictObject({
+  tag: z.strictObject({ slug: z.string(), status: z.enum(["approved", "rejected"]) }),
+});
+export type TagStatusResponse = z.infer<typeof tagStatusResponseSchema>;
+
+/**
+ * What one run of the pass or of a rerun did.
+ *
+ * `bounded` says the hourly spend limit stopped it with candidates waiting,
+ * which is otherwise indistinguishable from there being nothing left to do.
+ */
+export const enrichRunSchema = z.strictObject({
+  items: z.number(),
+  summarised: z.number(),
+  tagged: z.number(),
+  translated: z.number(),
+  failed: z.number(),
+  bounded: z.boolean(),
+});
+export type EnrichRunResponse = z.infer<typeof enrichRunSchema>;
+
+export const enrichPruneResponseSchema = z.strictObject({ pruned: z.number() });
+
+/** One body translated on request. */
+export const translateResponseSchema = z.strictObject({
+  itemId: z.string(),
+  lang: z.string(),
+  text: z.string(),
+  /** True when the stored answer was returned without a call. */
+  cached: z.boolean(),
+});
+export type TranslateResponse = z.infer<typeof translateResponseSchema>;
+
+/**
+ * What enrichment is configured with and what it has produced.
+ *
+ * `promptVersions` is what a rerun would write under and what `enrich prune
+ * --keep-current` keeps; they are the code's, not the operator's, which is why
+ * doctor reports them rather than accepting them.
+ */
+export const llmStatusSchema = z.strictObject({
+  enabled: z.boolean(),
+  provider: z.string().nullable(),
+  model: z.string().nullable(),
+  promptVersions: z.strictObject({
+    summary: z.string(),
+    tags: z.string(),
+    translation: z.string(),
+    bodyTranslation: z.string(),
+  }),
+  counts: z.strictObject({
+    summarised: z.number(),
+    tagged: z.number(),
+    translated: z.number(),
+    failed: z.number(),
+  }),
+});
+export type LlmStatus = z.infer<typeof llmStatusSchema>;
+
+export type EnrichRunRequest = {
+  /** A duration back from now, or an absolute instant. */
+  since: string;
+  kind?: "summary" | "translation" | "tags";
+  /** Re-run items that already have a row for the current model and prompt. */
+  force?: boolean;
+};
+
+export type EnrichPruneRequest = {
+  /** Keep the configured model at the prompt versions this build runs. */
+  keepCurrent: boolean;
+};
 
 export type ItemStatePatch = {
   read?: boolean;

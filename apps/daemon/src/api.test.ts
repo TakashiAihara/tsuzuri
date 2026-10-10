@@ -5,6 +5,7 @@ import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 
 /**
@@ -62,6 +63,12 @@ describeIfDb("api", () => {
     const interest = createInterestService({ sql: handle.sql, config, embeddings });
     await interest.start();
     const clustering = createClusteringService({ sql: handle.sql, config, embeddings });
+    const enrichment = createEnrichmentService({
+      sql: handle.sql,
+      config,
+      interest,
+      provider: null,
+    });
     app = createApi({
       db: handle.db,
       sql: handle.sql,
@@ -70,6 +77,7 @@ describeIfDb("api", () => {
       embeddings,
       interest,
       clustering,
+      enrichment,
     });
   });
 
@@ -240,6 +248,68 @@ describeIfDb("api", () => {
       expect(body.enabled).toBe(false);
       expect(body.active).toBe(false);
       expect(body.builtAt).toBeNull();
+    });
+  });
+
+  describe("enrichment", () => {
+    /**
+     * This install has no chat model, which is the configuration every one
+     * starts in. Asking it to spend money is a 400 naming the variable, not a
+     * 500 and not a cheerful 200 that did nothing.
+     */
+    const post = (path: string, body?: unknown) =>
+      app.fetch(
+        new Request(`http://test${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        }),
+      );
+
+    test("a rerun refuses without a chat model and names the variable", async () => {
+      const response = await post("/enrich", { since: "7d" });
+      expect(response.status).toBe(400);
+      expect((await json<{ error: string }>(response)).error).toMatch(/CHAT_PROVIDER/);
+    });
+
+    test("a rerun refuses a period it cannot read", async () => {
+      const response = await post("/enrich", { since: "last tuesday" });
+      expect(response.status).toBe(400);
+    });
+
+    test("a rerun refuses a kind that is not one of the three", async () => {
+      const response = await post("/enrich", { since: "7d", kind: "sentiment" });
+      expect(response.status).toBe(400);
+    });
+
+    test("pruning to the current combination refuses without a chat model", async () => {
+      const response = await post("/enrich/prune", { keepCurrent: true });
+      expect(response.status).toBe(400);
+      expect((await json<{ error: string }>(response)).error).toMatch(/CHAT_PROVIDER/);
+    });
+
+    test("translating a body refuses without a chat model", async () => {
+      const response = await post(`/items/${idC.slice(0, 8)}/translate`);
+      expect(response.status).toBe(400);
+      expect((await json<{ error: string }>(response)).error).toMatch(/CHAT_PROVIDER/);
+    });
+
+    test("translating a body resolves an abbreviated id like every other route", async () => {
+      const response = await post("/items/abc/translate");
+      expect(response.status).toBe(400);
+    });
+
+    test("tag review answers with an empty list rather than 404ing", async () => {
+      const body = await json<{ tags: unknown[] }>(await get("/tags"));
+      expect(body.tags).toEqual([]);
+    });
+
+    test("doctor says enrichment is off, rather than that it is not implemented", async () => {
+      const body = await json<{ features: { llm: { enabled: boolean; model: string | null } } }>(
+        await get("/doctor"),
+      );
+      expect(body.features.llm.enabled).toBe(false);
+      expect(body.features.llm.model).toBeNull();
     });
   });
 });

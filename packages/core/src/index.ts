@@ -50,6 +50,10 @@ export {
 } from "./kmeans.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export {
+  BODY_TRANSLATION_PROMPT_VERSION,
+  type BodyTranslationReply,
+  bodyTranslationPrompt,
+  bodyTranslationReplySchema,
   completeJson,
   type Prompt,
   PromptParseError,

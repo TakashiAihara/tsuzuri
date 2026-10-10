@@ -12,6 +12,7 @@ import {
   items,
   refreshCluster,
   sources,
+  type TagStatus,
 } from "@tsuzuri/db";
 import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
@@ -22,6 +23,7 @@ import { z } from "zod";
 import type { Config } from "./config.ts";
 import type { ClusteringService } from "./enrich/clustering.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
+import { EnrichmentPreconditionError, type EnrichmentService } from "./enrich/enrichment.ts";
 import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
@@ -46,6 +48,7 @@ export type ApiDeps = {
   embeddings: EmbeddingService;
   interest: InterestService;
   clustering: ClusteringService;
+  enrichment: EnrichmentService;
 };
 
 const addSourceSchema = z.object({
@@ -83,7 +86,7 @@ const listItemsSchema = z.object({
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
-  const { db, sql: rawSql, fetcher, config, embeddings, interest, clustering } = deps;
+  const { db, sql: rawSql, fetcher, config, embeddings, interest, clustering, enrichment } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -225,21 +228,52 @@ export function createApi(deps: ApiDeps) {
         sourceId: sourceId ?? null,
         collapse,
       });
-      if (page.scoring.active) return c.json({ items: page.items, scoring: page.scoring });
+      if (page.scoring.active) {
+        return c.json({ items: await withModelSummaries(page.items), scoring: page.scoring });
+      }
       const fallback = await listRecent({ unread, limit, sourceId, collapse });
       return c.json({
-        items: fallback.map((item) => ({
-          ...item,
-          interest: 0,
-          affinitySimilarity: 0,
-          exploration: false,
-        })),
+        items: await withModelSummaries(
+          fallback.map((item) => ({
+            ...item,
+            interest: 0,
+            affinitySimilarity: 0,
+            exploration: false,
+          })),
+        ),
         scoring: page.scoring,
       });
     }
 
-    return c.json({ items: await listRecent({ unread, limit, sourceId, collapse }) });
+    return c.json({
+      items: await withModelSummaries(await listRecent({ unread, limit, sourceId, collapse })),
+    });
   });
+
+  /**
+   * Carry the model's summary where there is one, and say which it is.
+   *
+   * A listing returns whatever the feed supplied, which is not what enrichment
+   * is for. The current summary replaces it when one exists, and
+   * `summarySource` says which of the two the reader is looking at -- without
+   * it "is enrichment doing anything" cannot be answered from a response, which
+   * is the failure `mode` and `reason` exist to prevent on a search (D35).
+   *
+   * "feed" therefore covers an item with no summary at all: the feed is the
+   * only source that could have supplied one, and no summary is not a summary
+   * from the model.
+   */
+  async function withModelSummaries<T extends { id: string; summary: string | null }>(rows: T[]) {
+    const summaries = await enrichment.currentSummaries(rows.map((row) => row.id));
+    return rows.map((row) => {
+      const fromModel = summaries.get(row.id);
+      return {
+        ...row,
+        summary: fromModel ?? row.summary,
+        summarySource: fromModel === undefined ? ("feed" as const) : ("model" as const),
+      };
+    });
+  }
 
   /** The reverse-chronological listing, shared by the plain and degraded paths. */
   async function listRecent(options: {
@@ -464,7 +498,7 @@ export function createApi(deps: ApiDeps) {
     return c.json({
       mode: result.mode,
       ...(embedded.status === "unavailable" ? { reason: embedded.reason } : {}),
-      results: result.hits,
+      results: await withModelSummaries(result.hits),
     });
   });
 
@@ -525,6 +559,120 @@ export function createApi(deps: ApiDeps) {
     }
   });
 
+  /**
+   * Re-run enrichment over history.
+   *
+   * `since` is required rather than defaulted: an unbounded rerun would spend
+   * the whole corpus in one request, and every caller who wants one knows what
+   * period they mean. Awaited, like the profile rebuild, because it runs in
+   * bounded time and its result is the answer.
+   */
+  app.post("/enrich", async (c) => {
+    const parsed = z
+      .object({
+        since: z.string().min(1),
+        kind: z.enum(["summary", "translation", "tags"]).optional(),
+        /** Re-run items that already have a row for this model and prompt. */
+        force: z.stringbool().default(false),
+      })
+      .safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
+
+    let since: Date | null;
+    try {
+      since = parseSince(parsed.data.since);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    if (!since) return c.json({ error: "since is required" }, 400);
+
+    try {
+      return c.json(
+        await enrichment.runOver({
+          since,
+          kind: parsed.data.kind ?? null,
+          force: parsed.data.force,
+        }),
+      );
+    } catch (error) {
+      // As with the profile rebuild: only a precondition is the caller's fault,
+      // and a database failure answered as 400 would tell a client its request
+      // was malformed when retrying would have worked.
+      if (error instanceof EnrichmentPreconditionError) {
+        return c.json({ error: error.message }, 400);
+      }
+      console.error("enrichment rerun failed:", error);
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  });
+
+  /**
+   * Delete enrichments that are not kept.
+   *
+   * `keepCurrent` is required, and required to be stated: naming nothing keeps
+   * nothing, so a request that left it out would delete every answer this
+   * installation has -- including the comparison between prompt versions that
+   * the key exists to make possible (D27). Pruning happens here and never on a
+   * timer, for the same reason.
+   */
+  app.post("/enrich/prune", async (c) => {
+    const parsed = z
+      .object({ keepCurrent: z.boolean() })
+      .safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
+
+    try {
+      return c.json({ pruned: await enrichment.prune({ keepCurrent: parsed.data.keepCurrent }) });
+    } catch (error) {
+      if (error instanceof EnrichmentPreconditionError) {
+        return c.json({ error: error.message }, 400);
+      }
+      console.error("enrichment prune failed:", error);
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  });
+
+  /** Translate one body, on request. See D30 for why this is not automatic. */
+  app.post("/items/:id/translate", async (c) => {
+    const resolved = await resolveItemId(c.req.param("id"));
+    if ("error" in resolved) return c.json({ error: resolved.error }, resolved.status);
+
+    try {
+      return c.json(await enrichment.translateBody(resolved.id));
+    } catch (error) {
+      if (error instanceof EnrichmentPreconditionError) {
+        return c.json({ error: error.message }, 400);
+      }
+      console.error("translation failed:", error);
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  });
+
+  /**
+   * Candidates the model has proposed often enough to be worth a decision.
+   *
+   * Candidates only: an approved tag is not waiting for anybody and a rejected
+   * one has already been answered. Nothing here is a tag yet, which is why the
+   * response says `tags` and the command says review (D28).
+   */
+  app.get("/tags", async (c) => c.json({ tags: await enrichment.tagsForReview() }));
+
+  app.post("/tags/:slug/approve", async (c) => {
+    const moved = await moveTag(c.req.param("slug"), "approved");
+    return moved ? c.json(moved) : c.json({ error: "not found" }, 404);
+  });
+
+  app.post("/tags/:slug/reject", async (c) => {
+    const moved = await moveTag(c.req.param("slug"), "rejected");
+    return moved ? c.json(moved) : c.json({ error: "not found" }, 404);
+  });
+
+  /** Move a tag, or report that there is no such tag to move. */
+  async function moveTag(slug: string, status: TagStatus) {
+    if (!(await enrichment.setTagStatus(slug, status))) return null;
+    return { tag: { slug, status } };
+  }
+
   /** What is configured and what is not, so nobody debugs a component they never enabled. */
   app.get("/doctor", async (c) => {
     const extensions = await db.execute<{ extname: string; extversion: string }>(
@@ -550,9 +698,7 @@ export function createApi(deps: ApiDeps) {
         },
         scoring: await interest.status(),
         clustering: await clustering.status(),
-        // Everything below arrives in a later phase. Reporting it as "not
-        // configured" beats leaving people to wonder why search is empty.
-        llm: { enabled: false, reason: "not implemented until P3" },
+        llm: await enrichment.status(),
         headless: { enabled: false, reason: "not implemented until P6" },
       },
       sourceKinds: ["feed"],

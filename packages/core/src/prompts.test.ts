@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import { ChatError, type ChatProvider, type ChatRequest } from "./chat.ts";
 import {
+  BODY_TRANSLATION_PROMPT_VERSION,
+  bodyTranslationPrompt,
+  bodyTranslationReplySchema,
   completeJson,
   PromptParseError,
   SUMMARY_PROMPT_VERSION,
@@ -51,13 +54,15 @@ describe("prompt versions", () => {
     expect(SUMMARY_PROMPT_VERSION).toBe("summary.v1");
     expect(TRANSLATION_PROMPT_VERSION).toBe("translation.v1");
     expect(TAGS_PROMPT_VERSION).toBe("tags.v1");
+    expect(BODY_TRANSLATION_PROMPT_VERSION).toBe("translation-body.v1");
 
     const versions = new Set([
       summaryPrompt.version,
       translationPrompt("Japanese").version,
       tagsPrompt([]).version,
+      bodyTranslationPrompt("Japanese").version,
     ]);
-    expect(versions.size).toBe(3);
+    expect(versions.size).toBe(4);
   });
 
   test("a built prompt carries the version it was built from", () => {
@@ -92,6 +97,24 @@ describe("prompt text", () => {
     const prompt = tagsPrompt([]);
     expect(prompt.system).toContain("no tags are approved yet");
   });
+
+  test("the body prompt asks for the body alone and names the language", () => {
+    const prompt = bodyTranslationPrompt("English");
+    expect(prompt.system).toContain("English");
+    expect(prompt.system).toContain('"text"');
+    // It asks for a whole article rather than the two short fields the pass
+    // asks for, so it must not demand a title it would then throw away.
+    expect(prompt.system).not.toContain('"title"');
+  });
+
+  test("a body translation is a different answer from the pass's, so it is a different version", () => {
+    // Both write kind `translation` for one language and model, which is one
+    // row per (item, kind, lang, model, prompt version). A shared version would
+    // have `tsuzuri translate <id>` overwrite the title and summary the pass
+    // wrote, and the other way round.
+    expect(BODY_TRANSLATION_PROMPT_VERSION).toBe("translation-body.v1");
+    expect(bodyTranslationPrompt("English").version).not.toBe(translationPrompt("English").version);
+  });
 });
 
 describe("reply schemas", () => {
@@ -109,6 +132,16 @@ describe("reply schemas", () => {
       title: "題",
       text: "本文",
     });
+  });
+
+  test("a body translation reply carries the text and nothing else", () => {
+    // A title in the reply is not part of the shape and does not survive: the
+    // caller asked for the body, and the pass's title-and-summary row already
+    // holds a title.
+    expect(bodyTranslationReplySchema.parse({ title: "題", text: "本文" })).toEqual({
+      text: "本文",
+    });
+    expect(bodyTranslationReplySchema.safeParse({ title: "題" }).success).toBe(false);
   });
 
   test("an article the vocabulary does not reach answers with no tags at all", () => {
@@ -199,7 +232,12 @@ describe("completeJson", () => {
   test("answers a translation prompt with both halves of the item", async () => {
     const { provider } = stubProvider([JSON.stringify({ title: "題", text: "本文" })]);
     const result = await completeJson(provider, REQUEST, translationReplySchema);
-
     expect(result).toEqual({ title: "題", text: "本文" });
+  });
+
+  test("answers a body prompt with the body", async () => {
+    const { provider } = stubProvider([JSON.stringify({ text: "本文" })]);
+    const result = await completeJson(provider, REQUEST, bodyTranslationReplySchema);
+    expect(result).toEqual({ text: "本文" });
   });
 });

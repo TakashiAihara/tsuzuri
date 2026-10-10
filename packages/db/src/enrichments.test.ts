@@ -8,6 +8,10 @@ import {
   attachTags,
   clearEnrichmentFailure,
   currentEnrichments,
+  enrichedItemsSince,
+  enrichmentCandidates,
+  enrichmentCounts,
+  enrichmentInputs,
   pruneEnrichments,
   recordEnrichmentFailure,
   setTagStatus,
@@ -16,7 +20,7 @@ import {
   writeEnrichment,
 } from "./enrichments.ts";
 import { migrate } from "./migrate.ts";
-import { enrichments, itemTags, tagVocabulary } from "./schema.ts";
+import { DEFAULT_USER_ID, enrichments, itemTags, tagVocabulary } from "./schema.ts";
 
 /**
  * The enrichments key is the whole of the replay story -- a prompt change has
@@ -688,6 +692,351 @@ describeIfDb("enrichments", () => {
         SELECT count(*)::int AS count FROM item_tags
       `);
       expect(attached).toEqual([{ count: 0 }]);
+    });
+  });
+
+  describe("candidate selection", () => {
+    const wantSummary = [{ kind: "summary" as const, promptVersion: PROMPT_VERSION }];
+
+    beforeEach(async () => {
+      // Enrichment only spends on articles a subscription delivers; a listing
+      // joins item_sources, so one nothing carries could be paid for unseen.
+      await handle.sql`
+        INSERT INTO sources (user_id, kind, url)
+        VALUES (${DEFAULT_USER_ID}, 'feed', 'https://selection.example/feed')
+        ON CONFLICT DO NOTHING
+      `;
+    });
+
+    /** Items published `hoursAgo` before now, newest first by name. */
+    async function seed(
+      spec: ReadonlyArray<{ id: string; hoursAgo: number; starred?: boolean }>,
+    ): Promise<void> {
+      for (const { id, hoursAgo, starred } of spec) {
+        await handle.sql`
+          INSERT INTO items (id, url, canonical_url, title, published_at, search_text)
+          VALUES (
+            ${id}, ${`https://example.com/${id}`}, ${`https://example.com/${id}`},
+            ${`title ${id}`},
+            now() - make_interval(hours => ${hoursAgo}::int),
+            ${`body of ${id}`}
+          )
+        `;
+        await handle.sql`
+          INSERT INTO item_sources (item_id, source_id)
+          SELECT ${id}, id FROM sources LIMIT 1
+        `;
+        if (starred) {
+          await handle.sql`
+            INSERT INTO item_state (user_id, item_id, starred_at)
+            VALUES (${DEFAULT_USER_ID}, ${id}, now())
+          `;
+        }
+      }
+    }
+
+    const select = (overrides: Record<string, unknown> = {}) =>
+      enrichmentCandidates(handle.sql, {
+        userId: DEFAULT_USER_ID,
+        model: MODEL,
+        wanted: wantSummary,
+        windowHours: 48,
+        collapse: false,
+        limit: 10,
+        ...overrides,
+      } as Parameters<typeof enrichmentCandidates>[1]);
+
+    test("takes the newest items that have no current enrichment", async () => {
+      await seed([
+        { id: "old", hoursAgo: 40 },
+        { id: "newest", hoursAgo: 1 },
+        { id: "middle", hoursAgo: 10 },
+      ]);
+      await writeEnrichment(handle.sql, {
+        itemId: "newest",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: PROMPT_VERSION,
+        content: { summary: "already summarised" },
+      });
+
+      const { candidates, matched } = await select();
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["middle", "old"]);
+      expect(matched).toBe(2);
+    });
+
+    test("an item outside the window is not a candidate", async () => {
+      // The window bounds spend: a week-old article is not what a reader is
+      // deciding about this morning.
+      await seed([{ id: "ancient", hoursAgo: 24 * 7 }]);
+
+      const { candidates } = await select();
+      expect(candidates).toEqual([]);
+    });
+
+    test("a row from another model does not make an item enriched", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: "chat-other",
+        promptVersion: PROMPT_VERSION,
+        content: { summary: "somebody else's answer" },
+      });
+
+      const { candidates } = await select();
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+    });
+
+    test("a previous prompt version does not make an item enriched", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: "summary.v0",
+        content: { summary: "written by the old prompt" },
+      });
+
+      const { candidates } = await select();
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+    });
+
+    test("an item missing one wanted kind is still a candidate for the others", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: PROMPT_VERSION,
+        content: { summary: "summarised" },
+      });
+
+      const withTags = await select({
+        wanted: [...wantSummary, { kind: "tags", promptVersion: "tags.v1" }],
+      });
+      expect(withTags.candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect((await select()).candidates).toEqual([]);
+    });
+
+    test("a kind inside its retry backoff is left alone, and the other is not", async () => {
+      // Otherwise one article the model refuses for tags would park its summary
+      // behind it, and then be re-selected on every pass forever.
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await recordEnrichmentFailure(handle.sql, "a", "summary", "the model refused");
+
+      const { candidates } = await select({
+        wanted: [...wantSummary, { kind: "tags", promptVersion: "tags.v1" }],
+      });
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+
+      // The summary alone is inside its backoff, so the item waits.
+      expect((await select()).candidates).toEqual([]);
+    });
+
+    test("a backoff that has expired no longer holds the item", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await recordEnrichmentFailure(
+        handle.sql,
+        "a",
+        "summary",
+        "the model refused",
+        new Date(Date.now() - 2 * 60 * 60_000),
+      );
+
+      const { candidates } = await select();
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+    });
+
+    test("--force re-runs an item that already has a row", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: PROMPT_VERSION,
+        content: { summary: "already summarised" },
+      });
+
+      const { candidates } = await select({ force: true });
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+    });
+
+    test("since reaches back past the window a pass looks at", async () => {
+      // The rerun over history is the whole point of --since: a prompt change
+      // is evaluated against articles the pass would never have selected.
+      await seed([{ id: "ancient", hoursAgo: 24 * 20 }]);
+
+      expect((await select()).candidates).toEqual([]);
+      const { candidates } = await select({ since: new Date(Date.now() - 30 * 24 * 3600_000) });
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["ancient"]);
+    });
+
+    test("the starred arm returns starred items however old they are", async () => {
+      // A star is an explicit request, so it is not subject to the window that
+      // bounds the ranked arm's spend.
+      await seed([
+        { id: "stale-star", hoursAgo: 24 * 9, starred: true },
+        { id: "plain", hoursAgo: 1 },
+      ]);
+
+      const { candidates } = await select({ starredOnly: true });
+      expect(candidates).toEqual([{ id: "stale-star", starred: true }]);
+    });
+
+    test("only the cluster representative is a candidate while clustering is on", async () => {
+      // One syndicated story is one summary, not eight: this is where clustering
+      // pays for enrichment (D29).
+      await seed([
+        { id: "wire", hoursAgo: 2 },
+        { id: "copy", hoursAgo: 1 },
+      ]);
+      await handle.sql`
+        INSERT INTO clusters (representative_item_id, size, first_published_at, last_published_at)
+        VALUES ('wire', 2, now() - make_interval(hours => 2), now())
+      `;
+      await handle.sql`
+        INSERT INTO item_clusters (item_id, cluster_id)
+        SELECT item.id, c.id FROM items item, clusters c WHERE c.representative_item_id = 'wire'
+      `;
+
+      const collapsed = await select({ collapse: true });
+      expect(collapsed.candidates.map((candidate) => candidate.id)).toEqual(["wire"]);
+      const expanded = await select({ collapse: false });
+      expect(expanded.candidates.map((candidate) => candidate.id)).toEqual(["copy", "wire"]);
+    });
+
+    test("the limit bounds the list, and matched still counts the rest", async () => {
+      await seed([
+        { id: "a", hoursAgo: 3 },
+        { id: "b", hoursAgo: 2 },
+        { id: "c", hoursAgo: 1 },
+      ]);
+
+      const { candidates, matched } = await select({ limit: 2 });
+      expect(candidates.map((candidate) => candidate.id)).toEqual(["c", "b"]);
+      // So a pass that stops at the hourly bound can report a backlog rather
+      // than a truncated list it believes is all of it.
+      expect(matched).toBe(3);
+    });
+
+    test("an item no subscription carries is not a candidate", async () => {
+      // Listings join item_sources, so an item nothing delivers could be paid
+      // for and never shown.
+      await handle.sql`
+        INSERT INTO items (id, url, canonical_url, title, published_at, search_text)
+        VALUES ('orphan', 'https://example.com/o', 'https://example.com/o', 't', now(), 'body')
+      `;
+
+      const { candidates } = await select();
+      expect(candidates).toEqual([]);
+    });
+
+    test("wanting nothing selects nothing", async () => {
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      expect(await select({ wanted: [] })).toEqual({ candidates: [], matched: 0 });
+    });
+
+    test("fetching the bodies of chosen items returns the title and the text", async () => {
+      await seed([
+        { id: "a", hoursAgo: 1 },
+        { id: "b", hoursAgo: 2 },
+      ]);
+
+      const inputs = await enrichmentInputs(handle.sql, ["a", "b"]);
+      expect(inputs).toEqual([
+        { id: "a", title: "title a", summary: null, searchText: "body of a" },
+        { id: "b", title: "title b", summary: null, searchText: "body of b" },
+      ]);
+      expect(await enrichmentInputs(handle.sql, [])).toEqual([]);
+    });
+  });
+
+  describe("counts", () => {
+    beforeEach(async () => {
+      await seedItems(["a", "b"]);
+    });
+
+    const PROMPT_VERSIONS = ["summary.v1", "tags.v1", "translation.v1"];
+
+    test("counts each kind once per item for the configured model", async () => {
+      for (const itemId of ["a", "b"]) {
+        await writeEnrichment(handle.sql, {
+          itemId,
+          kind: "summary",
+          model: MODEL,
+          promptVersion: "summary.v1",
+          content: { summary: "s" },
+        });
+      }
+      // Two languages of one kind are one item summarised, not two.
+      for (const lang of ["ja", "fr"]) {
+        await writeEnrichment(handle.sql, {
+          itemId: "a",
+          kind: "translation",
+          lang,
+          model: MODEL,
+          promptVersion: "translation.v1",
+          content: { title: "t", text: "x" },
+        });
+      }
+
+      const counts = await enrichmentCounts(handle.sql, {
+        model: MODEL,
+        promptVersions: PROMPT_VERSIONS,
+      });
+      expect(counts).toEqual({ summarised: 2, tagged: 0, translated: 1, failed: 0 });
+    });
+
+    test("an answer from another model, or an old prompt, is not this model's work", async () => {
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: "chat-other",
+        promptVersion: "summary.v1",
+        content: { summary: "s" },
+      });
+      await writeEnrichment(handle.sql, {
+        itemId: "b",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: "summary.v0",
+        content: { summary: "s" },
+      });
+
+      expect(
+        await enrichmentCounts(handle.sql, { model: MODEL, promptVersions: PROMPT_VERSIONS }),
+      ).toEqual({ summarised: 0, tagged: 0, translated: 0, failed: 0 });
+    });
+
+    test("failures are counted as a backlog whatever produced them", async () => {
+      await recordEnrichmentFailure(handle.sql, "a", "summary", "refused");
+
+      expect(
+        await enrichmentCounts(handle.sql, { model: MODEL, promptVersions: PROMPT_VERSIONS }),
+      ).toEqual({ summarised: 0, tagged: 0, translated: 0, failed: 1 });
+    });
+
+    test("the hourly bound counts items answered since an instant, once each", async () => {
+      for (const kind of ["summary", "tags"] as const) {
+        await writeEnrichment(handle.sql, {
+          itemId: "a",
+          kind,
+          model: MODEL,
+          promptVersion: PROMPT_VERSIONS[0] as string,
+          content: { summary: "s", tags: [], candidates: [] },
+        });
+      }
+      await writeEnrichment(handle.sql, {
+        itemId: "b",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: "summary.v1",
+        content: { summary: "s" },
+      });
+
+      expect(await enrichedItemsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(2);
+      expect(await enrichedItemsSince(handle.sql, new Date(Date.now() + 3600_000))).toBe(0);
     });
   });
 

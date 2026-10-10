@@ -1,3 +1,4 @@
+import { createChatProvider } from "@tsuzuri/core";
 import { createDatabase, migrate } from "@tsuzuri/db";
 import PQueue from "p-queue";
 
@@ -5,6 +6,7 @@ import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
+import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
 import { dueSources, ingestSource } from "./ingest/run.ts";
@@ -103,7 +105,43 @@ try {
   console.error("clustering could not be started:", error);
 }
 
-const app = createApi({ db, sql, fetcher, config, embeddings, interest, clustering });
+/**
+ * The chat model, resolved once.
+ *
+ * A half-configured provider is a startup error rather than silence, and the
+ * configuration schema has already refused it, so this cannot throw here: the
+ * point of building it here is that /doctor can report the model it will use
+ * from the first request.
+ */
+const chat = createChatProvider({
+  provider: config.CHAT_PROVIDER,
+  baseUrl: config.CHAT_BASE_URL,
+  apiKey: config.CHAT_API_KEY,
+  model: config.CHAT_MODEL,
+  requestTimeoutMs: config.CHAT_REQUEST_TIMEOUT_MS,
+});
+
+/**
+ * Enrichment starts last: it spends on the ranking the other two produce, so
+ * running it before them would mean paying for articles nothing had ordered.
+ */
+const enrichment = createEnrichmentService({ sql, config, interest, provider: chat });
+try {
+  await enrichment.start();
+} catch (error) {
+  console.error("enrichment could not be started:", error);
+}
+
+const app = createApi({
+  db,
+  sql,
+  fetcher,
+  config,
+  embeddings,
+  interest,
+  clustering,
+  enrichment,
+});
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
@@ -113,6 +151,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     stopping = true;
     await server.stop();
+    await enrichment.stop();
     await interest.stop();
     await clustering.stop();
     await embeddings.stop();
