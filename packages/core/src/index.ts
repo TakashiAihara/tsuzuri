@@ -1,4 +1,14 @@
 export {
+  ChatError,
+  type ChatProvider,
+  type ChatProviderConfig,
+  type ChatProviderId,
+  type ChatRequest,
+  createChatProvider,
+  DEFAULT_ANTHROPIC_VERSION,
+  DEFAULT_CHAT_REQUEST_TIMEOUT_MS,
+} from "./chat.ts";
+export {
   type ParseFeedDateOptions,
   parseFeedDate,
   timeZoneOffsetMinutes,
@@ -39,6 +49,23 @@ export {
   sphericalKMeans,
 } from "./kmeans.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
+export {
+  completeJson,
+  type Prompt,
+  PromptParseError,
+  SUMMARY_PROMPT_VERSION,
+  type SummaryReply,
+  summaryPrompt,
+  summaryReplySchema,
+  TAGS_PROMPT_VERSION,
+  type TagsReply,
+  TRANSLATION_PROMPT_VERSION,
+  type TranslationReply,
+  tagsPrompt,
+  tagsReplySchema,
+  translationPrompt,
+  translationReplySchema,
+} from "./prompts.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
 export { hammingDistance, simhash } from "./simhash.ts";
 export { snippetToText } from "./snippet.ts";

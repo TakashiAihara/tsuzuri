@@ -186,6 +186,93 @@ export const itemClusters = pgTable(
   (table) => [index("item_clusters_by_cluster").on(table.clusterId)],
 );
 
+/**
+ * What a chat model said about an item, from 0006_enrichments.sql.
+ *
+ * model and prompt_version are part of the key, so a prompt change writes
+ * beside the previous answer rather than over it. The CHECK limiting kind to
+ * the three there are lives in the migration; this mirror states what it can.
+ */
+export const enrichments = pgTable(
+  "enrichments",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
+
+    /** The language a translation targets; empty for every other kind. */
+    lang: text("lang").notNull().default(""),
+
+    model: text("model").notNull(),
+    promptVersion: text("prompt_version").notNull(),
+    content: jsonb("content").$type<unknown>().notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
+    }),
+    index("enrichments_by_item").on(table.itemId, table.kind),
+  ],
+);
+
+export const enrichmentFailures = pgTable(
+  "enrichment_failures",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
+    failures: integer("failures").notNull().default(1),
+    lastError: text("last_error"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.itemId, table.kind] })],
+);
+
+/**
+ * The closed set of tags a model may choose from.
+ *
+ * Deliberately not seeded: an empty vocabulary runs tagging in suggest-only
+ * mode until somebody approves its first tags (D28).
+ */
+export const tagVocabulary = pgTable(
+  "tag_vocabulary",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull(),
+    label: text("label").notNull(),
+    status: text("status")
+      .$type<"approved" | "candidate" | "rejected">()
+      .notNull()
+      .default("candidate"),
+    observations: integer("observations").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+  },
+  (table) => [unique("tag_vocabulary_slug_key").on(table.slug)],
+);
+
+export const itemTags = pgTable(
+  "item_tags",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    tagId: uuid("tag_id")
+      .notNull()
+      .references(() => tagVocabulary.id, { onDelete: "cascade" }),
+    source: text("source").$type<"model" | "manual">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.itemId, table.tagId] }),
+    index("item_tags_by_tag").on(table.tagId),
+  ],
+);
+
 export type SourceRow = typeof sources.$inferSelect;
 export type NewSourceRow = typeof sources.$inferInsert;
 export type ItemRow = typeof items.$inferSelect;
