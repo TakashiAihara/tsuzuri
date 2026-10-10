@@ -378,7 +378,10 @@ export function createApi(deps: ApiDeps) {
 
     const [row] = await db.select().from(items).where(eq(items.id, resolved.id));
     if (!row) return c.json({ error: "not found" }, 404);
-    return c.json({ item: row });
+    // What a model said about it, beside the article. Writing a translation and
+    // a set of tags nobody can read is not enrichment, it is cost.
+    const said = await enrichment.currentForItems([resolved.id]);
+    return c.json({ item: row, enrichment: said.get(resolved.id) ?? null });
   });
 
   /** Mark read / unread / starred. All of these feed interest scoring later. */
@@ -570,21 +573,34 @@ export function createApi(deps: ApiDeps) {
   app.post("/enrich", async (c) => {
     const parsed = z
       .object({
-        since: z.string().min(1),
+        /**
+         * Trimmed before the length check, so a request that sends only
+         * whitespace is a 400 here rather than an absent period reaching
+         * parseSince as a null the caller then has to re-check.
+         */
+        since: z.string().trim().min(1),
         kind: z.enum(["summary", "translation", "tags"]).optional(),
-        /** Re-run items that already have a row for this model and prompt. */
-        force: z.stringbool().default(false),
+        /**
+         * Re-run items the store already holds something for, ignoring any
+         * retry backoff.
+         *
+         * A JSON boolean because that is what the CLI sends; z.stringbool()
+         * would accept `force=true` from a query string and reject the boolean
+         * every other client sends.
+         */
+        force: z.boolean().default(false),
       })
       .safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
 
-    let since: Date | null;
+    let since: Date;
     try {
-      since = parseSince(parsed.data.since);
+      // Trimmed and non-empty above, so parseSince answers with a Date or
+      // throws; it returns null only for an absent value.
+      since = parseSince(parsed.data.since) as Date;
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
-    if (!since) return c.json({ error: "since is required" }, 400);
 
     try {
       return c.json(
@@ -607,22 +623,18 @@ export function createApi(deps: ApiDeps) {
   });
 
   /**
-   * Delete enrichments that are not kept.
+   * Delete enrichments that are not the current ones.
    *
-   * `keepCurrent` is required, and required to be stated: naming nothing keeps
-   * nothing, so a request that left it out would delete every answer this
-   * installation has -- including the comparison between prompt versions that
-   * the key exists to make possible (D27). Pruning happens here and never on a
-   * timer, for the same reason.
+   * No parameter saying which to keep, and that is the whole point: a prune
+   * that could be asked to keep nothing would delete every answer this
+   * installation has, including the comparison between prompt versions that
+   * the key exists to make possible (D27). The CLI still makes the person type
+   * `--keep-current`, because naming the intent is worth something even when
+   * the API cannot express the alternative.
    */
   app.post("/enrich/prune", async (c) => {
-    const parsed = z
-      .object({ keepCurrent: z.boolean() })
-      .safeParse(await c.req.json().catch(() => ({})));
-    if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
-
     try {
-      return c.json({ pruned: await enrichment.prune({ keepCurrent: parsed.data.keepCurrent }) });
+      return c.json({ pruned: await enrichment.prune() });
     } catch (error) {
       if (error instanceof EnrichmentPreconditionError) {
         return c.json({ error: error.message }, 400);

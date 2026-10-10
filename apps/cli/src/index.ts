@@ -4,6 +4,7 @@ import type {
   EmbeddingStatus,
   EnrichRunResponse,
   Item,
+  ItemEnrichment,
   ItemSummary,
   RankedItem,
   ScoringState,
@@ -28,6 +29,7 @@ import { Command } from "commander";
  */
 
 type RankedItemsResponse = { items: RankedItem[]; scoring: ScoringState };
+type ItemWithEnrichment = { item: Item; enrichment: ItemEnrichment | null };
 
 const DEFAULT_ENDPOINT = process.env.TSUZURI_ENDPOINT ?? "http://127.0.0.1:8787";
 
@@ -289,13 +291,25 @@ program
   .command("show <id>")
   .description("print one item")
   .action(async (id: string) => {
-    const { item } = await call<{ item: Item }>(globals(), `/items/${id}`);
-    if (globals().json) return printJson(item);
+    const { item, enrichment } = await call<ItemWithEnrichment>(
+      globals(),
+      `/items/${encodeURIComponent(id)}`,
+    );
+    if (globals().json) return printJson({ item, enrichment });
     out(item.title ?? "(untitled)");
     out(item.url);
     if (item.author) out(`by ${item.author}`);
-    out("");
-    out(item.searchText || item.summary || "(no body)");
+    // The model's summary in place of the feed's, and the feed's when there is
+    // no model one: without the field the two are indistinguishable, and
+    // `summarySource` says which this is (D35).
+    const summary = enrichment?.summary ?? item.summary;
+    if (summary) out(`\n${summary}`);
+    if (enrichment?.translation) {
+      out(`\n${enrichment.translation.title} (${enrichment.translation.lang})`);
+      out(enrichment.translation.text);
+    }
+    if (enrichment && enrichment.tags.length > 0) out(`\ntags: ${enrichment.tags.join(" ")}`);
+    out(`\n${item.searchText || "(no body)"}`);
   });
 
 program
@@ -412,7 +426,7 @@ const enrich = program
   // then also demand of `enrich prune`, which has no period to give.
   .option("--since <when>", "how far back to go, e.g. 7d or an ISO date")
   .option("--kind <kind>", "summary, tags or translation; all of them by default")
-  .option("--force", "re-run articles that already have an answer for this prompt")
+  .option("--force", "re-run articles already answered for this prompt, ignoring any retry backoff")
   .action(async (opts: { since?: string; kind?: string; force?: boolean }) => {
     if (!opts.since) {
       log("enrich needs --since, e.g. --since 7d: it spends model calls, and no period is a guess");
@@ -442,9 +456,10 @@ const enrich = program
 enrich
   .command("prune")
   .description("delete enrichments that are not current")
-  // Required because the alternative deletes everything: naming nothing keeps
-  // nothing, and the comparison between prompt versions is the reason the rows
-  // are kept at all (D27).
+  // Required, and sent nowhere: the daemon always keeps the current
+  // combinations and there is no request that says otherwise. Typing it is
+  // still worth a moment, because the flag names the one thing that makes this
+  // command safe to run at all (D27).
   .requiredOption(
     "--keep-current",
     "keep the configured model at this build's prompt versions; everything else goes",
@@ -452,7 +467,6 @@ enrich
   .action(async () => {
     const result = await call<{ pruned: number }>(globals(), "/enrich/prune", {
       method: "POST",
-      raw: JSON.stringify({ keepCurrent: true }),
     });
     if (globals().json) return printJson(result);
     log(`pruned ${result.pruned} enrichments`);
@@ -499,11 +513,14 @@ program
   .command("translate <id>")
   .description("translate one article's body into ENRICH_TRANSLATE_TO")
   // Not automatic: a body is a large call on text nobody has decided to read,
-  // so asking is the point (D30). Bounded by CHAT_MAX_OUTPUT_TOKENS.
+  // so asking is the point (D30). Answered under a larger output bound than a
+  // summary, and refused outright for a body too long to send whole.
   .action(async (id: string) => {
-    const result = await call<TranslateResponse>(globals(), `/items/${id}/translate`, {
-      method: "POST",
-    });
+    const result = await call<TranslateResponse>(
+      globals(),
+      `/items/${encodeURIComponent(id)}/translate`,
+      { method: "POST" },
+    );
     if (globals().json) return printJson(result);
     out(result.text);
     // Silent on a cached answer would read as "the model was called again",

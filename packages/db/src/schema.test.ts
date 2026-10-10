@@ -54,6 +54,23 @@ describeIfDb("schema", () => {
     expect(rows.map((r) => r.id)).toEqual([DEFAULT_USER_ID]);
   });
 
+  test("the hourly spend bound has the indexes it scans", async () => {
+    // The bound counts rows by when they were written, on both the answered
+    // side and the failed side. An index the count does not use costs a write
+    // per call; one it needs and does not have costs a scan.
+    const rows = await handle.sql<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename IN ('enrichments', 'enrichment_failures')
+      ORDER BY indexname
+    `;
+    const names = rows.map((row) => row.indexname);
+    expect(names).toContain("enrichments_by_created_at");
+    expect(names).toContain("enrichment_failures_by_attempt");
+    // The draft's (item_id, kind) index repeated a prefix of the primary key,
+    // so every write through it was a write for nothing.
+    expect(names).not.toContain("enrichments_by_item");
+  });
+
   test("round-trips a source, an item and its state through Drizzle", async () => {
     const [source] = await db
       .insert(sources)

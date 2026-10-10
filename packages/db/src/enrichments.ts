@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 
-import { retryBackoffSeconds } from "./embeddings.ts";
+import { instant, MAX_RETRY_BACKOFF_SECONDS, retryBackoffSeconds } from "./embeddings.ts";
 import { STORY_ROW } from "./interest.ts";
 
 /**
@@ -47,10 +47,6 @@ export type TagRow = {
  * note on ISO_PUBLISHED_AT in search.ts.
  */
 const ISO_INSTANT = `to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
-
-function instant(at: Date): string {
-  return at.toISOString();
-}
 
 /**
  * Store one enrichment.
@@ -132,16 +128,13 @@ export async function currentEnrichments(
 }
 
 /**
- * The longest an item waits between enrichment attempts.
+ * Record one attempt that failed, and when it was made.
  *
- * Spelled out here rather than imported because the doubling has to be
- * computed inside the statement below, from the row's stored count, so that two
- * workers cannot both read "1" and both schedule the same retry. It is the
- * same day the embedding backoff stops at, and the arithmetic itself is
- * retryBackoffSeconds().
+ * last_attempt_at is stamped rather than read off next_attempt_at because the
+ * backoff is computed from now and always lands in the future, so it says when
+ * to try again and nothing about when the call was spent. The hourly spend
+ * bound needs the second of those.
  */
-const MAX_RETRY_BACKOFF_SECONDS = 24 * 60 * 60;
-
 export async function recordEnrichmentFailure(
   sql: postgres.Sql,
   itemId: string,
@@ -151,11 +144,15 @@ export async function recordEnrichmentFailure(
 ): Promise<void> {
   const first = new Date(now.getTime() + retryBackoffSeconds(1) * 1000);
   await sql`
-    INSERT INTO enrichment_failures (item_id, kind, failures, last_error, next_attempt_at)
-    VALUES (${itemId}, ${kind}, 1, ${error.slice(0, 1000)}, ${instant(first)}::timestamptz)
+    INSERT INTO enrichment_failures (item_id, kind, failures, last_error, last_attempt_at, next_attempt_at)
+    VALUES (
+      ${itemId}, ${kind}, 1, ${error.slice(0, 1000)},
+      ${instant(now)}::timestamptz, ${instant(first)}::timestamptz
+    )
     ON CONFLICT (item_id, kind) DO UPDATE
       SET failures = enrichment_failures.failures + 1,
           last_error = EXCLUDED.last_error,
+          last_attempt_at = ${instant(now)}::timestamptz,
           next_attempt_at = ${instant(now)}::timestamptz + make_interval(
             secs => LEAST(
               60 * pow(2, enrichment_failures.failures),
@@ -163,6 +160,26 @@ export async function recordEnrichmentFailure(
             )::int
           )
   `;
+}
+
+/**
+ * Which of these kinds are waiting out a backoff for this item.
+ *
+ * Asked of the store rather than assumed from the selection, because selection
+ * only promises the item lacks a wanted combination: an item chosen for
+ * tagging may still be inside a summary backoff, and running the summary anyway
+ * spends a call the backoff was holding.
+ */
+export async function kindsInBackoff(
+  sql: postgres.Sql,
+  itemId: string,
+  now = new Date(),
+): Promise<Set<EnrichmentKind>> {
+  const rows = await sql<{ kind: EnrichmentKind }[]>`
+    SELECT kind FROM enrichment_failures
+    WHERE item_id = ${itemId} AND next_attempt_at > ${instant(now)}::timestamptz
+  `;
+  return new Set(rows.map((row) => row.kind));
 }
 
 export async function clearEnrichmentFailure(
@@ -174,19 +191,37 @@ export async function clearEnrichmentFailure(
 }
 
 /**
- * Record a tag the model proposed, or count one more proposal of it.
+ * How many distinct articles have proposed this tag.
+ *
+ * Counted from the stored `tags` enrichments rather than incremented per
+ * proposal, because the question the number answers is "how many articles is
+ * this about". A counter incremented on each suggestion answers a different
+ * one -- "how many times did a model say it" -- and re-running one article five
+ * times is enough to reach a promotion threshold on its own.
+ *
+ * The suggestions are already written down: every `tags` enrichment row holds
+ * what the model named for that article, so counting distinct items that named
+ * this slug reads the store rather than keeping a second tally beside it.
  *
  * An approved or rejected row is left exactly as it is, observations included:
  * its status is a decision somebody made, and a later suggestion is not an
- * argument that overturns it. Counting proposals against a row that is no
- * longer a candidate for anything would put a number there meaning nothing.
+ * argument that overturns it.
  */
 export async function suggestTag(sql: postgres.Sql, slug: string, label: string): Promise<void> {
+  const seen = sql`
+    SELECT count(DISTINCT e.item_id)::int
+    FROM enrichments e
+    WHERE e.kind = 'tags'
+      AND (
+        (e.content->'tags') ?| ${[slug]}::text[]
+        OR (e.content->'candidates') ?| ${[slug]}::text[]
+      )`;
+
   await sql`
     INSERT INTO tag_vocabulary (slug, label, status, observations)
-    VALUES (${slug}, ${label}, 'candidate', 1)
+    VALUES (${slug}, ${label}, 'candidate', (${seen}))
     ON CONFLICT (slug) DO UPDATE
-      SET observations = tag_vocabulary.observations + 1
+      SET observations = (${seen})
       WHERE tag_vocabulary.status = 'candidate'
   `;
 }
@@ -227,6 +262,11 @@ export async function approvedTagIds(
  *
  * approved_at is stamped on approval and cleared on anything else, so the
  * column cannot go on claiming a tag is approved after it stops being one.
+ *
+ * Rejecting also detaches the tag from every article carrying it. Leaving it
+ * attached would mean `tsuzuri tags reject` answers a question about future
+ * prompts while the filter people use today still has the tag on it -- the
+ * article stays tagged by something nobody chose to call that any more.
  */
 export async function setTagStatus(
   sql: postgres.Sql,
@@ -240,7 +280,13 @@ export async function setTagStatus(
     WHERE slug = ${slug}
     RETURNING slug
   `;
-  return rows.length > 0;
+  if (rows.length === 0 || status !== "rejected") return rows.length > 0;
+
+  await sql`
+    DELETE FROM item_tags
+    WHERE tag_id = (SELECT id FROM tag_vocabulary WHERE slug = ${slug})
+  `;
+  return true;
 }
 
 /**
@@ -294,6 +340,35 @@ export async function attachTags(
 }
 
 /**
+ * The tags attached to these items, by slug.
+ *
+ * Read by slug rather than by id because that is what a caller shows, and a
+ * filter built from these values is what `search_articles --tags` will be
+ * given. Only approved tags can be attached, so nothing here needs to say so.
+ */
+export async function tagsOfItems(
+  sql: postgres.Sql,
+  itemIds: readonly string[],
+): Promise<Map<string, string[]>> {
+  const attached = new Map<string, string[]>();
+  if (itemIds.length === 0) return attached;
+
+  const rows = await sql<{ itemId: string; slug: string }[]>`
+    SELECT it.item_id AS "itemId", t.slug
+    FROM item_tags it
+    JOIN tag_vocabulary t ON t.id = it.tag_id
+    WHERE it.item_id = ANY(${[...itemIds]}::text[])
+    ORDER BY it.item_id, t.slug
+  `;
+  for (const row of rows) {
+    const slugs = attached.get(row.itemId);
+    if (slugs) slugs.push(row.slug);
+    else attached.set(row.itemId, [row.slug]);
+  }
+  return attached;
+}
+
+/**
  * Delete every enrichment that is not one of the named combinations, and
  * report how many rows went.
  *
@@ -336,14 +411,15 @@ export type WantedEnrichment = {
   promptVersion: string;
 };
 
-/** An item worth spending a model call on, and whether it was starred. */
-export type EnrichmentCandidate = {
-  id: string;
-  starred: boolean;
-};
-
 export type CandidateSelection = {
-  candidates: EnrichmentCandidate[];
+  /**
+   * Items worth a call, in the order the query chose them.
+   *
+   * Ids rather than rows: the star is a filter in the query, not something the
+   * caller acts on, and a field nobody reads is a field that drifts from what
+   * the query actually does.
+   */
+  candidates: string[];
   /**
    * How many items matched before `limit` cut the list short.
    *
@@ -364,17 +440,32 @@ export type CandidateOptions = {
   /** A rerun over history: everything published at or after this instant. */
   since?: Date | null | undefined;
   /**
-   * Re-run items that already have a row, and ignore any retry backoff.
+   * Re-run items the store already holds something for, and ignore any retry
+   * backoff.
    *
    * An explicit rerun asked for by a person is treated as the decision the
    * backoff was waiting for; a scheduled pass never sets this.
+   *
+   * A row written at or after `now` does not count towards the item already
+   * having one. Without that, a rerun limited by the hourly bound re-picks the
+   * same newest items on every call and never reaches the rest, because each
+   * call sees the rows the previous one wrote and re-runs them anyway. A row
+   * written before this request began does count, which is what leaves each
+   * call with the articles the one before it did not reach.
    */
   force?: boolean | undefined;
   /** One row per story, as in scoreItems. */
   collapse: boolean;
   /** Every starred item rather than the newest ones, regardless of rank. */
   starredOnly?: boolean | undefined;
-  limit: number;
+  /**
+   * How many to return. Omitted means every candidate there is.
+   *
+   * The default arm of a pass ranks its whole window and then takes the top N,
+   * so a limit here would decide the order by publication date for everything
+   * past it.
+   */
+  limit?: number | undefined;
   now?: Date | undefined;
 };
 
@@ -388,12 +479,15 @@ export type CandidateOptions = {
  *     spend bound that keeps it affordable is the hourly one.
  *   - What is missing. An item qualifies when it lacks at least one wanted
  *     combination, so an article with a summary and no tags is still selected
- *     for tagging. `force` removes this filter, which is what re-running an
- *     item means.
+ *     for tagging. `force` keeps the same test and moves its cutoff: the item
+ *     qualifies whenever it lacked a combination as of `now`, which is what
+ *     leaves the next call something the last one did not write.
  *   - Retry backoff. A kind is skipped while its failure row says to wait, and
  *     only that kind: one kind failing must not park the others behind it.
  *   - The representative. With clustering on, a story is one call through one
- *     item, so members are not candidates (D29).
+ *     item, so members are not candidates (D29). The starred arm is exempt: a
+ *     star names one article, and an article nobody chose because another
+ *     outlet published it first is still the one being asked for.
  *
  * The text is deliberately not selected. Ranking a pool of candidates pulls in
  * every item a window holds, and article bodies are large; the caller asks for
@@ -420,31 +514,47 @@ export async function enrichmentCandidates(
       : sql`i.published_at > ${instant(now)}::timestamptz
                 - make_interval(hours => ${options.windowHours ?? 0}::int)`;
 
-  const missing = options.force
+  // Under `force`, "already answered" means as of the instant this request
+  // began: a row written since then is this request's own, not an answer the
+  // person asking already had.
+  const answered = options.force
+    ? sql`
+        SELECT 1 FROM enrichments e
+        WHERE e.item_id = i.id
+          AND e.model = ${options.model}
+          AND e.kind = want.kind
+          AND e.prompt_version = want.prompt_version
+          AND e.lang = want.lang
+          AND e.created_at < ${instant(now)}::timestamptz`
+    : sql`
+        SELECT 1 FROM enrichments e
+        WHERE e.item_id = i.id
+          AND e.model = ${options.model}
+          AND e.kind = want.kind
+          AND e.prompt_version = want.prompt_version
+          AND e.lang = want.lang`;
+
+  // An explicit rerun is the decision a backoff was waiting for, so it asks
+  // past one; a scheduled pass does not.
+  const notWaitingOut = options.force
     ? sql`TRUE`
-    : sql`EXISTS (
+    : sql`NOT EXISTS (
+          SELECT 1 FROM enrichment_failures f
+          WHERE f.item_id = i.id
+            AND f.kind = want.kind
+            AND f.next_attempt_at > ${instant(now)}::timestamptz
+        )`;
+
+  const missing = sql`EXISTS (
           SELECT 1
           FROM unnest(${kinds}::text[], ${promptVersions}::text[], ${langs}::text[])
                AS want(kind, prompt_version, lang)
-          WHERE NOT EXISTS (
-            SELECT 1 FROM enrichments e
-            WHERE e.item_id = i.id
-              AND e.model = ${options.model}
-              AND e.kind = want.kind
-              AND e.prompt_version = want.prompt_version
-              AND e.lang = want.lang
-          )
-            AND NOT EXISTS (
-              SELECT 1 FROM enrichment_failures f
-              WHERE f.item_id = i.id
-                AND f.kind = want.kind
-                AND f.next_attempt_at > ${instant(now)}::timestamptz
-            )
+          WHERE NOT EXISTS (${answered})
+            AND ${notWaitingOut}
         )`;
 
-  const rows = await sql<Array<{ id: string; starred: boolean; matched: number }>>`
+  const rows = await sql<Array<{ id: string; matched: number }>>`
     SELECT i.id,
-           (st.starred_at IS NOT NULL) AS starred,
            count(*) OVER ()::int AS matched
     FROM items i
     -- Left, not inner: most items have never been acted on and must still be
@@ -456,20 +566,21 @@ export async function enrichmentCandidates(
     WHERE ${horizon}
       AND ${missing}
       AND (NOT ${options.starredOnly ?? false}::boolean OR st.starred_at IS NOT NULL)
-      AND (NOT ${options.collapse}::boolean OR ${sql.unsafe(STORY_ROW)})
+      AND (
+        NOT ${options.collapse}::boolean
+        OR ${options.starredOnly ?? false}::boolean
+        OR ${sql.unsafe(STORY_ROW)}
+      )
       AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = i.id)
     ORDER BY ${
       options.starredOnly
         ? sql`st.starred_at DESC NULLS LAST, i.published_at DESC, i.id`
         : sql`i.published_at DESC, i.id`
     }
-    LIMIT ${options.limit}
+    ${options.limit === undefined ? sql`` : sql`LIMIT ${options.limit}`}
   `;
 
-  return {
-    candidates: rows.map((row) => ({ id: row.id, starred: row.starred })),
-    matched: rows[0]?.matched ?? 0,
-  };
+  return { candidates: rows.map((row) => row.id), matched: rows[0]?.matched ?? 0 };
 }
 
 /** What a model is asked about: the title and the body, as stored. */
@@ -537,17 +648,31 @@ export async function enrichmentCounts(
 }
 
 /**
- * How many distinct items this store has answered for since an instant.
+ * How many calls this store has spent on since an instant.
  *
- * The hourly spend bound is counted from the rows rather than from memory: a
- * counter that starts empty on every restart would let a daemon that is
- * restarted hourly spend ENRICH_MAX_ITEMS_PER_HOUR on each restart.
+ * Counted from the rows rather than from memory: a counter that starts empty on
+ * every restart would let a daemon that is restarted hourly spend
+ * ENRICH_MAX_ITEMS_PER_HOUR on each restart.
+ *
+ * Attempts and not only successes, because a bound counted over successes is
+ * not a bound at all: a model that refuses every article writes nothing and
+ * keeps being called, which is the opposite of what the setting is for.
+ *
+ * Both sides are counted as distinct items rather than rows, so an article
+ * summarised and translated is one item of spend and an article whose two kinds
+ * both failed is one too. next_attempt_at is what the backoff reads and is
+ * always in the future for a fresh failure, so the attempt itself is stamped
+ * on its own column.
  */
-export async function enrichedItemsSince(sql: postgres.Sql, since: Date): Promise<number> {
+export async function enrichmentAttemptsSince(sql: postgres.Sql, since: Date): Promise<number> {
   const rows = await sql<{ count: number }[]>`
-    SELECT count(DISTINCT item_id)::int AS count
-    FROM enrichments
-    WHERE created_at >= ${instant(since)}::timestamptz
+    SELECT (
+      (SELECT count(DISTINCT item_id) FROM enrichments
+       WHERE created_at >= ${instant(since)}::timestamptz)
+      +
+      (SELECT count(DISTINCT item_id) FROM enrichment_failures
+       WHERE last_attempt_at >= ${instant(since)}::timestamptz)
+    )::int AS count
   `;
   return rows[0]?.count ?? 0;
 }

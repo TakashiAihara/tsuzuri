@@ -1,11 +1,12 @@
 export {
+  ANTHROPIC_VERSION,
   ChatError,
+  type ChatErrorKind,
   type ChatProvider,
   type ChatProviderConfig,
   type ChatProviderId,
   type ChatRequest,
   createChatProvider,
-  DEFAULT_ANTHROPIC_VERSION,
   DEFAULT_CHAT_REQUEST_TIMEOUT_MS,
 } from "./chat.ts";
 export {
@@ -51,20 +52,16 @@ export {
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export {
   BODY_TRANSLATION_PROMPT_VERSION,
-  type BodyTranslationReply,
   bodyTranslationPrompt,
   bodyTranslationReplySchema,
   completeJson,
   type Prompt,
   PromptParseError,
   SUMMARY_PROMPT_VERSION,
-  type SummaryReply,
   summaryPrompt,
   summaryReplySchema,
   TAGS_PROMPT_VERSION,
-  type TagsReply,
   TRANSLATION_PROMPT_VERSION,
-  type TranslationReply,
   tagsPrompt,
   tagsReplySchema,
   translationPrompt,

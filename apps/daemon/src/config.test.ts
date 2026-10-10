@@ -98,6 +98,37 @@ describe("chat enrichment", () => {
     expect(config.CHAT_MAX_OUTPUT_TOKENS).toBe(512);
   });
 
+  test("a base url that is not a URL is a startup error naming the variable", () => {
+    // The provider builder refuses it too, but it runs where nothing can report
+    // it as a configuration problem, and the message a reader gets says
+    // nothing about which variable to fix.
+    expect(() =>
+      loadConfig({
+        ...base,
+        CHAT_PROVIDER: "openai-compatible",
+        CHAT_BASE_URL: "localhost:11434/v1",
+        CHAT_MODEL: "qwen3",
+      }),
+    ).toThrow(/CHAT_BASE_URL/);
+
+    expect(() =>
+      loadConfig({
+        ...base,
+        CHAT_PROVIDER: "gemini",
+        CHAT_BASE_URL: "ftp://example.com",
+        CHAT_MODEL: "gemini-local",
+      }),
+    ).toThrow(/CHAT_BASE_URL/);
+  });
+
+  test("a base url nobody is using is not checked at all", () => {
+    // Enrichment off means the value is not read, and refusing an install for a
+    // variable it never sends is the failure this rule exists to avoid.
+    expect(() =>
+      loadConfig({ ...base, CHAT_PROVIDER: "none", CHAT_BASE_URL: "not a url" }),
+    ).not.toThrow();
+  });
+
   test("what a pass does is decided separately from whether one exists", () => {
     // Defaults from the configuration table, spelled out here rather than read
     // from the implementation: a test that asserted config.ENRICH_TOP_N === 20

@@ -304,6 +304,8 @@ Tagging and summarisation ask for JSON and validate the reply with a zod schema;
 
 Not the providers' structured-output modes. Those are three different mechanisms — `output_config.format`, `response_format`, `responseSchema` — and the OpenAI-compatible implementation is the one that covers Ollama, LM Studio, vLLM and OpenRouter, most of which implement none of them or implement them partially. A capability that works on one of three providers is a capability the pipeline cannot rely on, and the fallback path would have to exist anyway. See D26.
 
+Corrected while implementing (2026-10-10, review of PR #41): the recorded failure is narrowed to what is evidence about the article. A 401, 403, 404 or 400 from the provider names this installation's configuration rather than the request — every item would fail it identically — so it stops the pass and is reported through `doctor.features.llm.lastError` instead, on the same rule as a retryable outage. The same applies to an answer that stopped because it reached the output bound: each provider says so in its own field (`finish_reason: "length"`, `stop_reason: "max_tokens"`, `finishReason: "MAX_TOKENS"`), and an answer whose content is empty but which carries a reasoning field is the same event rather than an empty answer. Retrying it with the same bound buys the same truncated answer; raising `CHAT_MAX_OUTPUT_TOKENS` is the fix.
+
 ### Schema
 
 ```sql
@@ -319,16 +321,25 @@ CREATE TABLE enrichments (
   created_at     timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (item_id, kind, lang, model, prompt_version)
 );
-CREATE INDEX enrichments_by_item ON enrichments (item_id, kind);
+-- Corrected while implementing (2026-10-10, review of PR #41): the draft
+-- indexed (item_id, kind), which only repeats a prefix of the primary key, and
+-- indexed nothing the hourly spend bound reads. An index on created_at is what
+-- that count needs.
+CREATE INDEX enrichments_by_created_at ON enrichments (created_at);
 
 CREATE TABLE enrichment_failures (
   item_id         text NOT NULL REFERENCES items (id) ON DELETE CASCADE,
   kind            text NOT NULL,
   failures        integer NOT NULL DEFAULT 1 CHECK (failures > 0),
   last_error      text,
+  -- Added while implementing (2026-10-10, review of PR #41): the hourly bound
+  -- counts failed calls as well as answered ones, and next_attempt_at is
+  -- always in the future, so it cannot say when a call was spent.
+  last_attempt_at timestamptz NOT NULL DEFAULT now(),
   next_attempt_at timestamptz NOT NULL,
   PRIMARY KEY (item_id, kind)
 );
+CREATE INDEX enrichment_failures_by_attempt ON enrichment_failures (last_attempt_at);
 
 CREATE TABLE tag_vocabulary (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -336,7 +347,8 @@ CREATE TABLE tag_vocabulary (
   label        text NOT NULL,
   status       text NOT NULL DEFAULT 'candidate'
                CHECK (status IN ('approved', 'candidate', 'rejected')),
-  -- How many times a candidate has been suggested. The promotion threshold.
+  -- How many distinct articles have suggested this candidate. The promotion
+  -- threshold.
   observations integer NOT NULL DEFAULT 0,
   created_at   timestamptz NOT NULL DEFAULT now(),
   approved_at  timestamptz
@@ -354,11 +366,13 @@ CREATE INDEX item_tags_by_tag ON item_tags (tag_id);
 
 The primary key of `enrichments` includes `model` and `prompt_version`, so a prompt change writes a new row beside the old one instead of overwriting it. That is the whole of the issue's completion criterion — a prompt change evaluated against yesterday's articles without refetching — and it is a property of the key, not of a feature built on top. The current enrichment for an item is the row matching the configured model and the code's current prompt version. See D27.
 
-Unbounded growth is real and bounded by hand: `tsuzuri enrich prune --keep-current` deletes rows for combinations that are neither current nor named. Automatic pruning would delete the comparison the table exists to make.
+Unbounded growth is real and bounded by hand: `tsuzuri enrich prune --keep-current` deletes rows for combinations that are neither current nor named. Automatic pruning would delete the comparison the table exists to make. Corrected while implementing (2026-10-10, review of PR #41): the endpoint no longer takes a parameter saying which combinations to keep, because `keepCurrent: false` was a request that deletes every answer the installation had, including the current ones every response reads. The command still requires `--keep-current` — it names the intent, and the intent is worth a moment of typing — but the API can only be asked for the safe one.
 
 ### Tagging
 
 Tagging is classification against `tag_vocabulary`, never generation. The prompt carries the approved slugs and asks for a subset, plus optional free-text suggestions for concepts the list does not cover. Only approved tags are attached to items. Suggestions become or increment `candidate` rows, and a candidate reaching `TAG_CANDIDATE_PROMOTION_THRESHOLD` observations (default 5) is surfaced by `tsuzuri tags review`; `tsuzuri tags approve <slug>` and `tsuzuri tags reject <slug>` resolve them.
+
+Corrected while implementing (2026-10-10, review of PR #41): `observations` counts distinct articles, not proposals, and is computed from the stored `tags` enrichments rather than incremented. A counter incremented per proposal answers "how many times did a model say this", and re-running one article five times is enough to reach the promotion threshold on its own — which is the question the threshold exists to ask, answered wrongly. Rejecting a tag also deletes its `item_tags` rows: leaving them attached means the filter somebody uses today still carries a word they have just answered about. Approving does not attach it to articles that already named it, because the pass that named them never saw it as approved; `tsuzuri enrich --since <span> --kind tags --force` is the command that does.
 
 There is no seed vocabulary. Shipping one would put one person's interests in every installation, which is the same rule that keeps personal destinations out of the notifier layer. An empty vocabulary means tagging runs in suggest-only mode: nothing is tagged, candidates accumulate, and the first `tsuzuri tags review` a few days in has real material in it. This is documented so it does not read as a bug. See D28.
 
@@ -370,17 +384,33 @@ When clustering is on, only the cluster representative is enriched. A widely syn
 
 `ENRICH_MAX_ITEMS_PER_HOUR` (default 60) bounds spend, and `ENRICH_CONCURRENCY` (default 2) bounds pressure on a local runtime, matching `EMBEDDING_CONCURRENCY` and for the same reason.
 
-Re-running over history is `tsuzuri enrich --since 7d [--kind summary] [--force]`, and `--force` is what re-runs items that already have a row for the current model and prompt version.
+Re-running over history is `tsuzuri enrich --since 7d [--kind summary] [--force]`, and `--force` is what gets past the retry backoff an article is waiting out after a refusal.
+
+Corrected while implementing (2026-10-10, review of PR #41), five things the draft left wrong or unstated:
+
+- **The bound counts attempts, not answers.** Counted over successes it is not a bound at all: a model that refuses every article writes no rows and would be called again on every pass for as long as the outage lasts. Failures are counted as distinct items alongside successes, which is why `enrichment_failures` carries the moment the call was spent.
+- **Ranking covers the whole window.** The implementation ranked the newest `5 × ENRICH_TOP_N` candidates and took the top N of those, which hands the decision to publication date for exactly the articles the score exists to promote. The window bounds the pool; the score orders it.
+- **A star beats the representative filter.** The representative rule answers "one story is one call" for the ranked arm. A star names one article, and an article somebody starred is not made less interesting by another outlet having published it first, so the starred arm is exempt from it.
+- **`--force` is measured from the instant the request began.** A row written before it counts as the answer it is; one written after it does not, which is what makes a second call of a bounded rerun reach past what the first wrote rather than re-picking the same newest items. The flag's other job is unchanged: an explicit rerun ignores a retry backoff, because asking again is the decision the backoff was waiting for. The bound that reports this is `matched`, the count of what matched before the fetch was cut short, rather than the size of the cut list.
+- **One thing at a time.** An explicit rerun takes the same slot the background pass does. Both count against one allowance, so two at once overshoot it. A rerun is bounded per invocation rather than drawing from the shared hour, because otherwise asking twice would be how to get twice the work; the background pass is the one that has to stop itself.
+
+The pass also checks `stopping` before each article and passes one `AbortSignal` through to the provider, so shutting the daemon down does not wait out a request deadline and does not record the interrupted calls as failures against articles.
 
 ### Translation
 
 Off unless `ENRICH_TRANSLATE_TO` names a language. It translates the title and the summary, not the body. A body translation is a large call on text you may not read, and the point of a translated summary is deciding whether to read the body at all. `tsuzuri translate <id>` translates one body on request, which is the deliberate act the cost deserves. See D30.
+
+Corrected while implementing (2026-10-10, review of PR #41): that one body used to be silently cut at 8,000 characters and answered under the summary's output bound, which is two or three sentences wide. A translation that stops mid-article reads like a translation, so a body over the input bound is refused with the bound named, and the output bound for one is `CHAT_MAX_OUTPUT_TOKENS` times eight. No new configuration key: the multiple is a property of the two prompts, not an operator's choice.
 
 ### The summary a response carries
 
 Listings currently return `items.summary`, which is whatever the feed supplied. They now return the current enrichment summary when one exists and fall back to the feed's, with a `summarySource` field of `feed` or `model` beside it.
 
 Without that field the two are indistinguishable, and "is enrichment doing anything" becomes unanswerable from a response — the same failure `mode` and `reason` were added to `/search` to prevent in P2. `itemSummarySchema` and `searchHitSchema` gain the field, and `api.contract.test.ts` covers it. See D35.
+
+Corrected while implementing (2026-10-10, review of PR #41): translations and item tags were written and nothing read them. `GET /items/:id` returns the current enrichment beside the article — the model summary with its source, the translated title and summary with the language they are in, and the slugs of the tags attached — and `tsuzuri show <id>` prints all three. Writing an answer nobody can reach is not enrichment, it is cost.
+
+The provider configuration also loses `anthropicVersion`. It was described as configurable and nothing set it, so the value sent in the `anthropic-version` header is now a constant of the request this module sends rather than an option that suggests an endpoint might need a different one.
 
 ## Part 4: digest, notifiers, exporters (#7)
 
@@ -490,7 +520,9 @@ This is also why no request-templating syntax appears anywhere in this document.
 
 ### `doctor`
 
-`features.llm` stops being `not implemented until P3` and reports `{ enabled, provider, model, promptVersions, counts: { summarised, tagged, translated, failed } }`. Two more appear: `features.scoring` with `{ active, reason, signals, required, clusters, builtAt }`, and `features.clustering` with `{ enabled, clusters, clusteredItems, pending }`.
+`features.llm` stops being `not implemented until P3` and reports `{ enabled, provider, model, promptVersions, counts: { summarised, tagged, translated, failed }, lastError }`. Two more appear: `features.scoring` with `{ active, reason, signals, required, clusters, builtAt }`, and `features.clustering` with `{ enabled, clusters, clusteredItems, pending }`.
+
+Corrected while implementing (2026-10-10, review of PR #41): `lastError` was not in the draft. The failures that are true of every article equally are recorded nowhere, because recording them against an item would park the whole corpus behind a backoff for a variable that takes a second to change — so `doctor` is the only place an operator can see that a stop was the configuration rather than the corpus.
 
 ### Testing
 

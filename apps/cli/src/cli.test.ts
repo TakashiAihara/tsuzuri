@@ -25,6 +25,7 @@ let enrichResponse: unknown = {
 };
 let tagsResponse: unknown = { tags: [] };
 let translateResponse: unknown = { itemId: "aa11", lang: "Japanese", text: "", cached: false };
+let showResponse: unknown = { item: null, enrichment: null };
 /** Every path the stub was asked for, with the body it was given. */
 const requests: { path: string; method: string; body: unknown }[] = [];
 
@@ -56,6 +57,7 @@ const daemon = Bun.serve({
       });
     }
     if (url.pathname.endsWith("/translate")) return Response.json(translateResponse);
+    if (url.pathname.startsWith("/items/")) return Response.json(showResponse);
     return Response.json({ error: "no stub" }, { status: 404 });
   },
 });
@@ -87,6 +89,24 @@ const hit = (overrides: Record<string, unknown> = {}) => ({
   rrf: 0.016,
   textRank: 1,
   vectorRank: null,
+  ...overrides,
+});
+
+const article = (overrides: Record<string, unknown> = {}) => ({
+  id: `aa11bb22${"0".repeat(56)}`,
+  url: "https://example.com/a",
+  canonicalUrl: "https://example.com/a",
+  title: "Rust 1.90 released",
+  author: "nobody",
+  guid: null,
+  publishedAt: new Date().toISOString(),
+  publishedAtEstimated: false,
+  contentHtml: null,
+  summary: "The feed's own summary.",
+  searchText: "The body, as stored.",
+  rawHtmlKey: null,
+  fetchedAt: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
   ...overrides,
 });
 
@@ -234,7 +254,9 @@ describe("enrichment commands", () => {
   test("enrich prune keeps the current combination and says what went", async () => {
     const { code, stderr } = await run(["enrich", "prune", "--keep-current"]);
     expect(code).toBe(0);
-    expect(lastRequest("/enrich/prune")?.body).toEqual({ keepCurrent: true });
+    // No body at all: the daemon always keeps the current combinations, and a
+    // request saying otherwise is not one that can be made.
+    expect(lastRequest("/enrich/prune")?.body).toBeUndefined();
     expect(stderr).toMatch(/pruned 4/);
   });
 
@@ -294,5 +316,49 @@ describe("enrichment commands", () => {
     // Silence here would read as "the model was asked again", which is the
     // difference between a free repeat and a paid one.
     expect(stderr).toMatch(/no call made/);
+  });
+
+  test("translate encodes the id, so a slash in one is not a different path", async () => {
+    // An unencoded slash makes the daemon look up a different article, or none,
+    // and the person is told the article they named does not exist.
+    translateResponse = { itemId: "a/b", lang: "Japanese", text: "訳文", cached: false };
+    const { code, stderr } = await run(["translate", "a/b"]);
+    expect(code).toBe(0);
+    expect(lastRequest("/items/a%2Fb/translate")?.method).toBe("POST");
+    expect(stderr).toBe("");
+  });
+});
+
+describe("show", () => {
+  test("prints the model's summary, its translation and the tags", async () => {
+    // A translation and tags nothing reads is not enrichment, it is cost.
+    showResponse = {
+      item: article(),
+      enrichment: {
+        summary: "The model's own summary.",
+        summarySource: "model",
+        translation: { lang: "Japanese", title: "Rust 1.90 がリリースされました", text: "要約" },
+        tags: ["rust", "compilers"],
+      },
+    };
+    const { stdout, code } = await run(["show", "aa11bb22"]);
+    expect(code).toBe(0);
+    expect(stdout).toContain("The model's own summary.");
+    expect(stdout).toContain("Rust 1.90 がリリースされました (Japanese)");
+    expect(stdout).toContain("要約");
+    expect(stdout).toContain("tags: rust compilers");
+    // The body still comes last: the summary is a decision about whether to
+    // read it, not a replacement for it.
+    expect(stdout.indexOf("The body, as stored.")).toBeGreaterThan(
+      stdout.indexOf("tags: rust compilers"),
+    );
+  });
+
+  test("falls back to the article alone when no model has touched it", async () => {
+    showResponse = { item: article(), enrichment: null };
+    const { stdout, code } = await run(["show", "aa11bb22"]);
+    expect(code).toBe(0);
+    expect(stdout).toContain("The feed's own summary.");
+    expect(stdout).toContain("The body, as stored.");
   });
 });

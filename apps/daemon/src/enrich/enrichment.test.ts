@@ -6,6 +6,7 @@ import {
   insertEmbeddings,
   interestClustersExists,
   migrate,
+  recordEnrichmentFailure,
   writeEnrichment,
   writeInterestProfile,
 } from "@tsuzuri/db";
@@ -43,14 +44,14 @@ type Answer = string | Error;
  * test say "it asked about the title and the summary, not the body": a queue
  * would make the assertion about position rather than about the request.
  */
-function stubChat(answer: (request: ChatRequest) => Answer) {
+function stubChat(answer: (request: ChatRequest) => Answer | Promise<Answer>) {
   const asked: ChatRequest[] = [];
   const chat: ChatProvider = {
     id: "openai-compatible",
     model: MODEL,
     async complete(request) {
       asked.push(request);
-      const next = answer(request);
+      const next = await answer(request);
       if (next instanceof Error) throw next;
       return next;
     },
@@ -428,7 +429,7 @@ describeIfDb("createEnrichmentService", () => {
     // nothing about the article, and a failure row would park it for a backoff
     // it did nothing to earn.
     await seedItem("a");
-    const { chat } = stubChat(() => new ChatError("chat request failed (503)", true));
+    const { chat } = stubChat(() => new ChatError("chat request failed (503)", "retryable"));
 
     await expect(service(chat).runPass()).rejects.toThrow(/503/);
     expect(await failures()).toEqual([]);
@@ -436,7 +437,9 @@ describeIfDb("createEnrichmentService", () => {
 
   test("a permanent refusal is recorded, and the item waits its turn", async () => {
     await seedItem("a");
-    const { chat } = stubChat(() => new ChatError("chat request failed (400)", false));
+    const { chat, asked } = stubChat(
+      () => new ChatError("the model would not answer", "permanent"),
+    );
 
     const result = await service(chat).runPass();
 
@@ -444,8 +447,46 @@ describeIfDb("createEnrichmentService", () => {
     expect(result.summarised).toBe(0);
     expect(await failures()).toEqual([{ itemId: "a", kind: "summary" }]);
     // And the next pass leaves it alone rather than paying for it again now.
+    // Asserted on the calls, not on the failure rows: the backoff filter is
+    // what makes the second pass free, and only a call count can fail when it
+    // is removed.
+    asked.length = 0;
     await service(chat).runPass();
+    expect(asked).toHaveLength(0);
     expect(await failures()).toEqual([{ itemId: "a", kind: "summary" }]);
+  });
+
+  test("a configuration error is not recorded, and says so in the status", async () => {
+    // Every item would fail this identically, so parking one behind a backoff
+    // for a variable that takes a second to fix is the wrong answer twice.
+    await seedItem("a");
+    const { chat } = stubChat(() => new ChatError("chat request failed (401)", "configuration"));
+    const enrichment = service(chat);
+
+    await expect(enrichment.runPass()).rejects.toThrow(/401/);
+
+    expect(await failures()).toEqual([]);
+    const status = await enrichment.status();
+    expect(status.lastError?.message).toMatch(/401/);
+    // And an ISO instant, so "when" is answerable without reading the daemon's
+    // log to work out how long this has been happening.
+    expect(status.lastError?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test("an answer that hit the output bound is a configuration error too", async () => {
+    // Raising CHAT_MAX_OUTPUT_TOKENS is the fix, so this is not the article's
+    // fault and must not be retried against the same bound.
+    await seedItem("a");
+    const { chat, asked } = stubChat(
+      () => new ChatError("openai-compatible reached the 1024-token output bound", "configuration"),
+    );
+    const enrichment = service(chat);
+
+    await expect(enrichment.runPass()).rejects.toThrow(/output bound/);
+
+    expect(await failures()).toEqual([]);
+    expect(asked).toHaveLength(1);
+    expect((await enrichment.status()).lastError?.message).toMatch(/output bound/);
   });
 
   test("two unusable answers are recorded as a failure too", async () => {
@@ -463,7 +504,7 @@ describeIfDb("createEnrichmentService", () => {
     await seedItem("a");
     const { chat } = stubChat((request) =>
       request.system.includes("tag articles")
-        ? new ChatError("chat request failed (400)", false)
+        ? new ChatError("the model would not answer", "permanent")
         : '{"summary": "written anyway"}',
     );
 
@@ -518,6 +559,98 @@ describeIfDb("createEnrichmentService", () => {
     expect(asked).toHaveLength(0);
   });
 
+  test("the hourly bound counts calls that failed, so a refused article stops costing", async () => {
+    // Counting successes alone makes the bound unbounded in exactly the case
+    // it exists for: a model refusing every article writes no rows, and would
+    // be called again on every pass for as long as the outage lasts.
+    for (const id of ["a", "b", "c"]) await seedItem(id);
+    const { chat, asked } = stubChat(
+      () => new ChatError("the model would not answer", "permanent"),
+    );
+    const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "2" });
+
+    await enrichment.runPass();
+    expect(asked).toHaveLength(2);
+
+    asked.length = 0;
+    await enrichment.runPass();
+    await enrichment.runPass();
+
+    // Two of the hour's three calls are spent, so the third article waits for
+    // the next hour rather than being tried now.
+    expect(asked).toHaveLength(0);
+  });
+
+  test("--force over a bounded budget reaches every item, once each", async () => {
+    // Re-picking the newest items on every call would make --since a way to
+    // re-run the same two articles until the hour turned over.
+    for (const id of ["a", "b", "c", "d", "e"]) {
+      await seedItem(id, { hoursAgo: 6 * 24 });
+    }
+    const { chat } = stubChat(answerEachPrompt());
+    const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "2" });
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
+    const run = () => enrichment.runOver({ since, kind: "summary", force: true });
+
+    const results = [await run(), await run(), await run()];
+
+    expect(results.map((result) => result.summarised)).toEqual([2, 2, 1]);
+    expect(results.map((result) => result.bounded)).toEqual([true, true, false]);
+    expect((await storedSummaries()).map((row) => row.itemId)).toEqual(["a", "b", "c", "d", "e"]);
+  });
+
+  test("a rerun reports bounded from what matched, not from what it fetched", async () => {
+    for (const id of ["a", "b", "c"]) await seedItem(id, { hoursAgo: 6 * 24 });
+    const { chat } = stubChat(answerEachPrompt());
+    const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "1" });
+
+    const result = await enrichment.runOver({
+      since: new Date(Date.now() - 7 * 24 * 60 * 60_000),
+      kind: "summary",
+      force: true,
+    });
+
+    expect(result.items).toBe(1);
+    expect(result.bounded).toBe(true);
+  });
+
+  test("a well-matching article older than the newest candidates is still chosen", async () => {
+    // Ranking a prefix of the window and then taking the top N would hand the
+    // choice to publication date for exactly the articles the score exists to
+    // promote.
+    for (let index = 0; index < 7; index += 1) {
+      await seedItem(`new-${index}`, { hoursAgo: index + 1 });
+    }
+    await seedItem("the-match", { hoursAgo: 40 });
+
+    const cfg = config({
+      EMBEDDING_PROVIDER: "openai-compatible",
+      EMBEDDING_BASE_URL: `http://127.0.0.1:${embeddings.port}/v1`,
+      EMBEDDING_MODEL: "stub",
+    });
+    const vectors = createEmbeddingService({ sql: handle.sql, config: cfg });
+    await vectors.start();
+    await vectors.stop();
+    await insertEmbeddings(handle.sql, [
+      { itemId: "the-match", vector: "[1,0,0]" },
+      ...Array.from({ length: 7 }, (_, index) => ({
+        itemId: `new-${index}`,
+        vector: "[0,1,0]",
+      })),
+    ]);
+    await writeInterestProfile(handle.sql, {
+      userId: DEFAULT_USER_ID,
+      clusters: [
+        { ordinal: 0, centroid: [1, 0, 0], positiveWeight: 3, skippedWeight: 0, members: 1 },
+      ],
+    });
+
+    const { chat } = stubChat(answerEachPrompt());
+    await service(chat, { ENRICH_TOP_N: "1" }, rankingActive).runPass();
+
+    expect((await storedSummaries()).map((row) => row.itemId)).toEqual(["the-match"]);
+  });
+
   test("--since reaches back past the window a pass looks at", async () => {
     await seedItem("last-week", { hoursAgo: 24 * 6 });
     const { chat } = stubChat(answerEachPrompt());
@@ -543,6 +676,36 @@ describeIfDb("createEnrichmentService", () => {
     expect((await enrichment.runOver({ since, kind: "summary", force: true })).summarised).toBe(1);
     expect((await enrichment.runOver({ since, kind: "summary", force: false })).items).toBe(0);
     expect(asked).toHaveLength(1);
+  });
+
+  test("a rerun and the background pass do not spend the hour at the same time", async () => {
+    // Both count against one allowance, so two running at once overshoot it.
+    // Each run is told apart by the articles it asks about: the pass only looks
+    // inside its window, the rerun only back to --since.
+    await seedItem("in-window-a", { hoursAgo: 1 });
+    await seedItem("in-window-b", { hoursAgo: 2 });
+    await seedItem("old-a", { hoursAgo: 24 * 6 });
+    await seedItem("old-b", { hoursAgo: 24 * 7 });
+    const asked: string[] = [];
+    const { chat } = stubChat(async (request) => {
+      asked.push(request.user.includes("in-window") ? "pass" : "rerun");
+      await Bun.sleep(20);
+      return '{"summary": "The model said this."}';
+    });
+    const enrichment = service(chat);
+
+    await Promise.all([
+      enrichment.runPass(),
+      enrichment.runOver({
+        since: new Date(Date.now() - 30 * 24 * 60 * 60_000),
+        kind: "summary",
+        force: true,
+      }),
+    ]);
+
+    // One run's calls, then the other's. Interleaved would be two runs
+    // spending one allowance at the same time.
+    expect(asked).toEqual(["pass", "pass", "rerun", "rerun"]);
   });
 
   test("a rerun answers 400 rather than running with no chat model", async () => {
@@ -623,6 +786,105 @@ describeIfDb("createEnrichmentService", () => {
     await expect(service(chat).translateBody("a")).rejects.toThrow(/ENRICH_TRANSLATE_TO/);
   });
 
+  test("translate refuses a body too long to send rather than cutting it", async () => {
+    // A translation that stops at 8,000 characters reads as a translation, and
+    // nobody finds out a third of the article is missing until they have read
+    // it in the wrong language.
+    await seedItem("long", { text: "x".repeat(8_001) });
+    const { chat, asked } = stubChat(answerEachPrompt());
+
+    await expect(
+      service(chat, { ENRICH_TRANSLATE_TO: "Japanese" }).translateBody("long"),
+    ).rejects.toThrow(/8001 characters, over the 8000 sent per call/);
+    expect(asked).toHaveLength(0);
+  });
+
+  test("translate answers a whole body under a larger output bound than a summary", async () => {
+    // A bound sized for two or three sentences stops a translated article
+    // mid-paragraph, which is not a shorter translation but a wrong one.
+    await seedItem("a", { text: "x".repeat(8_000) });
+    const { chat, asked } = stubChat(answerEachPrompt());
+
+    await service(chat, {
+      ENRICH_TRANSLATE_TO: "Japanese",
+      CHAT_MAX_OUTPUT_TOKENS: "512",
+    }).translateBody("a");
+
+    const body = asked.find((request) => request.system.includes("article bodies"));
+    expect(body?.maxOutputTokens).toBe(4096);
+  });
+
+  test("stop interrupts a call in flight and records nothing for it", async () => {
+    // A daemon shutting down would otherwise wait out the two-minute request
+    // deadline, and every article it had started on would be charged a failure
+    // it did not earn.
+    await seedItem("a");
+    let interrupted = false;
+    const chat: ChatProvider = {
+      id: "openai-compatible",
+      model: MODEL,
+      complete(_request, signal) {
+        // What fetch does on an aborted signal, which is what the abort in
+        // stop() has to be able to reach.
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            interrupted = true;
+            reject(new Error("The operation was aborted"));
+          });
+        });
+      },
+    };
+    const enrichment = service(chat);
+
+    const running = enrichment.runPass();
+    await Bun.sleep(50);
+    await enrichment.stop();
+    await running.catch(() => {});
+
+    expect(interrupted).toBe(true);
+    expect(await failures()).toEqual([]);
+    expect(await storedSummaries()).toEqual([]);
+  });
+
+  test("a kind in backoff is not paid for again on an item chosen for another", async () => {
+    // Selection only promises the item lacks one of the wanted combinations, so
+    // it is picked for its tags while its summary is still waiting out a
+    // backoff. Without this the tags pass re-runs the summary that failed.
+    await seedItem("a");
+    await recordEnrichmentFailure(handle.sql, "a", "summary", "the model would not answer");
+    const { chat, asked } = stubChat(answerEachPrompt());
+
+    const result = await service(chat, { ENRICH_TAGS: "true" }).runPass();
+
+    // One call, for the one kind that was owed, and both counts on it.
+    expect(asked).toHaveLength(1);
+    expect(asked[0]?.system).toContain("tag articles");
+    expect(result).toMatchObject({ items: 1, summarised: 0, tagged: 1, failed: 0 });
+    expect(await storedSummaries()).toEqual([]);
+  });
+
+  test("a starred copy of another outlet's story is enriched anyway", async () => {
+    await seedItem("wire", { hoursAgo: 2 });
+    await seedItem("copy", { hoursAgo: 1, starred: true });
+    await handle.sql`
+      INSERT INTO clusters (representative_item_id, size, first_published_at, last_published_at)
+      VALUES ('wire', 2, now() - interval '2 hours', now())
+    `;
+    await handle.sql`
+      INSERT INTO item_clusters (item_id, cluster_id)
+      SELECT item.id, c.id FROM items item, clusters c
+      WHERE c.representative_item_id = 'wire'
+    `;
+
+    const { chat } = stubChat(answerEachPrompt());
+    await service(chat, { CLUSTERING_ENABLED: "true" }).runPass();
+
+    // The representative filter answers "one story is one call" for the ranked
+    // arm. A star names one article, and this one is the article being asked
+    // about whichever outlet happened to publish first.
+    expect((await storedSummaries()).map((row) => row.itemId).sort()).toEqual(["copy", "wire"]);
+  });
+
   test("prune keeps the current combination and drops every other", async () => {
     await seedItem("a");
     await writeEnrichment(handle.sql, {
@@ -641,7 +903,7 @@ describeIfDb("createEnrichmentService", () => {
     });
     const { chat } = stubChat(answerEachPrompt());
 
-    expect(await service(chat).prune({ keepCurrent: true })).toBe(1);
+    expect(await service(chat).prune()).toBe(1);
 
     const left = await handle.sql<Array<{ model: string; summary: string }>>`
       SELECT model, content->>'summary' AS summary FROM enrichments
@@ -650,9 +912,7 @@ describeIfDb("createEnrichmentService", () => {
   });
 
   test("prune with no model configured has no current combination to keep", async () => {
-    await expect(service(null).prune({ keepCurrent: true })).rejects.toThrow(
-      EnrichmentPreconditionError,
-    );
+    await expect(service(null).prune()).rejects.toThrow(EnrichmentPreconditionError);
   });
 
   test("tags for review lists only the candidates past the threshold", async () => {
@@ -726,6 +986,66 @@ describeIfDb("createEnrichmentService", () => {
     expect([...summaries]).toEqual([["a", "The model said this."]]);
   });
 
+  test("what a response carries about an item is its summary, translation and tags", async () => {
+    // Writing a translation and a set of tags nothing reads is not enrichment,
+    // it is cost.
+    await seedItem("a", { title: "The plan", summary: "A feed summary." });
+    // Outside the window, so the pass leaves it and it stands for an article no
+    // model has been asked about.
+    await seedItem("untouched", { summary: "A feed summary.", hoursAgo: 24 * 10 });
+    await handle.sql`
+      INSERT INTO tag_vocabulary (slug, label, status)
+      VALUES ('rust', 'Rust', 'approved')
+    `;
+    const { chat } = stubChat(answerEachPrompt());
+    const enrichment = service(chat, { ENRICH_TRANSLATE_TO: "Japanese" });
+
+    await enrichment.runPass();
+    await handle.sql`
+      INSERT INTO item_tags (item_id, tag_id, source)
+      SELECT 'a', id, 'model' FROM tag_vocabulary WHERE slug = 'rust'
+    `;
+
+    const carried = await enrichment.currentForItems(["a", "untouched"]);
+    expect(carried.get("a")).toEqual({
+      summary: "The model said this.",
+      summarySource: "model",
+      translation: { lang: "Japanese", title: "題", text: "要約" },
+      tags: ["rust"],
+    });
+    // An item no model has touched still answers, saying which of the two
+    // summaries is on offer rather than being absent from the map.
+    expect(carried.get("untouched")).toEqual({
+      summary: null,
+      summarySource: "feed",
+      translation: null,
+      tags: [],
+    });
+  });
+
+  test("what a response carries is empty of model answers with no model configured", async () => {
+    await seedItem("a");
+    await handle.sql`
+      INSERT INTO tag_vocabulary (slug, label, status)
+      VALUES ('rust', 'Rust', 'approved'), ('go', 'Go', 'approved')
+    `;
+    await handle.sql`
+      INSERT INTO item_tags (item_id, tag_id, source)
+      SELECT 'a', id, 'manual' FROM tag_vocabulary
+    `;
+
+    const carried = await service(null).currentForItems(["a"]);
+
+    // Tags a person attached survive with no chat model configured: they are
+    // rows in the store, not something the model has to be switched on for.
+    expect(carried.get("a")).toEqual({
+      summary: null,
+      summarySource: "feed",
+      translation: null,
+      tags: ["go", "rust"],
+    });
+  });
+
   test("status reports what this build would record", async () => {
     await seedItem("a");
     const { chat } = stubChat(answerEachPrompt());
@@ -749,5 +1069,44 @@ describeIfDb("createEnrichmentService", () => {
       translated: 1,
       failed: 0,
     });
+    // Nothing has gone wrong yet, so there is nothing to report.
+    expect(status.lastError).toBeNull();
+  });
+
+  test("one article re-run five times leaves a tag with one observation", async () => {
+    await seedItem("a");
+    const chat = stubChat(
+      answerEachPrompt({ tags: '{"tags": [], "candidates": ["compilers"]}' }),
+    ).chat;
+    const enrichment = service(chat, { ENRICH_TAGS: "true" });
+    const since = new Date(Date.now() - 24 * 60 * 60_000);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await enrichment.runOver({ since, kind: "tags", force: true });
+    }
+
+    // The threshold is about how many articles a tag has come up for, so five
+    // runs over one of them must not be enough to reach a decision about it.
+    const review = await enrichment.tagsForReview();
+    expect(review).toEqual([]);
+    const [candidate] = await handle.sql<Array<{ observations: number }>>`
+      SELECT observations FROM tag_vocabulary WHERE slug = 'compilers'
+    `;
+    expect(candidate?.observations).toBe(1);
+  });
+
+  test("three articles that named a tag give it three observations", async () => {
+    for (const id of ["a", "b", "c"]) await seedItem(id);
+    const chat = stubChat(
+      answerEachPrompt({ tags: '{"tags": [], "candidates": ["compilers"]}' }),
+    ).chat;
+    const enrichment = service(chat, { ENRICH_TAGS: "true" });
+
+    await enrichment.runPass();
+
+    const [candidate] = await handle.sql<Array<{ observations: number }>>`
+      SELECT observations FROM tag_vocabulary WHERE slug = 'compilers'
+    `;
+    expect(candidate?.observations).toBe(3);
   });
 });

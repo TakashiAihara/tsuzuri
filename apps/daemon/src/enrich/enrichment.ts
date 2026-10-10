@@ -27,10 +27,11 @@ import {
   DEFAULT_USER_ID,
   type EnrichmentInput,
   type EnrichmentKind,
-  enrichedItemsSince,
+  enrichmentAttemptsSince,
   enrichmentCandidates,
   enrichmentCounts,
   enrichmentInputs,
+  kindsInBackoff,
   pruneEnrichments,
   recordEnrichmentFailure,
   scoreItems,
@@ -39,6 +40,7 @@ import {
   type TagRow,
   type TagStatus,
   tagsForReview,
+  tagsOfItems,
   type WantedEnrichment,
   writeEnrichment,
 } from "@tsuzuri/db";
@@ -68,15 +70,15 @@ import type { InterestService } from "./interest.ts";
 const MAX_INPUT_CHARS = 8_000;
 
 /**
- * Candidates ranked per pass, over the ENRICH_TOP_N actually spent on.
+ * Output bound for a whole-article translation, as a multiple of
+ * CHAT_MAX_OUTPUT_TOKENS.
  *
- * Ranking after selecting, rather than selecting after ranking: the top of the
- * ranked list over the whole window is made of items this pass has already paid
- * for, which would leave everything behind them unenriched until those aged
- * out. Looking further ahead than it spends is what makes the choice the ranked
- * one rather than the newest one.
+ * A summary is two or three sentences and fits the configured bound several
+ * times over; a translated body is the article. Answering it under a bound
+ * sized for a summary produces a translation that stops mid-paragraph, so this
+ * asks for a larger one rather than the operator learning a second variable.
  */
-const RANK_LOOKAHEAD = 5;
+const BODY_OUTPUT_TOKEN_MULTIPLE = 8;
 
 /** Gap between passes once enrichment has caught up. */
 const IDLE_INTERVAL_MS = 30_000;
@@ -117,6 +119,17 @@ export type EnrichmentStatus = {
     translated: number;
     failed: number;
   };
+  /**
+   * The last error a pass refused to record against an item, and when.
+   *
+   * A configuration error -- a key refused, a model that does not exist, an
+   * answer that ran out of tokens -- is true of every item equally, so nothing
+   * in the store records it and the pass looks like it had nothing to do. It
+   * is the one thing that explains why an install with a working chat model
+   * suddenly stops summarising, so it is reported here rather than only in the
+   * daemon's log.
+   */
+  lastError: { message: string; at: string } | null;
 };
 
 export type EnrichmentRun = {
@@ -145,6 +158,24 @@ export type BodyTranslation = {
   cached: boolean;
 };
 
+/** What a chat model has said about one article, as a response carries it. */
+export type ItemEnrichment = {
+  /**
+   * The current model summary, or null when there is none.
+   *
+   * The feed's own summary is on the item row, which the caller already has:
+   * returning it from here as well would make two answers to one question.
+   * `summarySource` says which of the two the caller should show.
+   */
+  summary: string | null;
+  /** Which of the two summaries this is, as on a listing (D35). */
+  summarySource: "feed" | "model";
+  /** Title and summary translated, with the language they are in. */
+  translation: { lang: string; title: string; text: string } | null;
+  /** Slugs of the tags attached to this article. */
+  tags: string[];
+};
+
 export type EnrichmentService = {
   start: () => Promise<void>;
   stop: () => Promise<void>;
@@ -157,14 +188,16 @@ export type EnrichmentService = {
     kind: EnrichmentKind | null;
     force: boolean;
   }) => Promise<EnrichmentRun>;
-  /** Delete every combination that is not kept. Naming nothing keeps nothing. */
-  prune: (options: { keepCurrent: boolean }) => Promise<number>;
+  /** Delete every combination that is not current. */
+  prune: () => Promise<number>;
   /** One body, translated on request. */
   translateBody: (itemId: string) => Promise<BodyTranslation>;
   tagsForReview: () => Promise<TagRow[]>;
   setTagStatus: (slug: string, status: TagStatus) => Promise<boolean>;
   /** The current model summary per item, for the summaries a response carries. */
   currentSummaries: (itemIds: readonly string[]) => Promise<Map<string, string>>;
+  /** The model summary, translation and tags of these items, per id. */
+  currentForItems: (itemIds: readonly string[]) => Promise<Map<string, ItemEnrichment>>;
 };
 
 const PROMPT_VERSIONS: PromptVersions = {
@@ -222,8 +255,14 @@ export function createEnrichmentService(deps: {
   let stopping = false;
   let wake: (() => void) | null = null;
   let loop: Promise<void> | null = null;
-  /** Single-flight: two passes would spend the hourly bound twice over. */
-  let running: Promise<PassResult> | null = null;
+  /**
+   * Cancellation for every request this service has in flight.
+   *
+   * Aborting rather than waiting is what makes a stop prompt: a daemon shutting
+   * down would otherwise hold a two-minute request deadline before it exits.
+   */
+  const inFlight = new AbortController();
+  let lastError: { message: string; at: string } | null = null;
 
   /** The target language, or "" when translation is switched off. */
   const targetLanguage = (): string => config.ENRICH_TRANSLATE_TO?.trim() ?? "";
@@ -237,35 +276,50 @@ export function createEnrichmentService(deps: {
    */
   function wantedKinds(kind: EnrichmentKind | null): WantedEnrichment[] {
     const lang = targetLanguage();
+    const wants = (name: EnrichmentKind): boolean => kind === null || kind === name;
     const wanted: WantedEnrichment[] = [];
-    if (config.ENRICH_SUMMARY && kind !== "tags" && kind !== "translation") {
+    if (config.ENRICH_SUMMARY && wants("summary")) {
       wanted.push({ kind: "summary", promptVersion: PROMPT_VERSIONS.summary });
     }
-    if (config.ENRICH_TAGS && kind !== "summary" && kind !== "translation") {
+    if (config.ENRICH_TAGS && wants("tags")) {
       wanted.push({ kind: "tags", promptVersion: PROMPT_VERSIONS.tags });
     }
-    if (lang.length > 0 && kind !== "summary" && kind !== "tags") {
+    if (lang.length > 0 && wants("translation")) {
       wanted.push({ kind: "translation", lang, promptVersion: PROMPT_VERSIONS.translation });
     }
     return wanted;
   }
 
-  function request(system: string, user: string): ChatRequest {
-    return { system, user, maxOutputTokens: config.CHAT_MAX_OUTPUT_TOKENS };
+  function request(system: string, user: string, maxOutputTokens?: number): ChatRequest {
+    return {
+      system,
+      user,
+      maxOutputTokens: maxOutputTokens ?? config.CHAT_MAX_OUTPUT_TOKENS,
+    };
   }
 
   /**
    * Record one failure, or refuse to.
    *
    * Only a permanent, provider-side rejection is evidence about the article.
-   * Everything else describes the run -- a retryable outage, a shutdown, a
-   * database error -- and charging it to the item would park it behind a backoff
-   * it did nothing to earn, on the rule the embedding backfill already follows.
-   * A second parse failure is the model twice refusing to answer the question
-   * asked, which is about the pair of them rather than about the endpoint.
+   * Everything else describes the run -- a retryable outage, a configuration
+   * mistake, a shutdown, a database error -- and charging it to the item would
+   * park it behind a backoff it did nothing to earn, on the rule the embedding
+   * backfill already follows. A second parse failure is the model twice
+   * refusing to answer the question asked, which is about the pair of them
+   * rather than about the endpoint.
+   *
+   * A configuration error is kept for `status()` to report, because it is the
+   * one failure with nothing in the store to show it: every item fails it
+   * identically, so there is no item to record it against.
    */
   async function fail(itemId: string, kind: EnrichmentKind, error: unknown): Promise<void> {
-    if (error instanceof ChatError && error.retryable) throw error;
+    if (error instanceof ChatError) {
+      if (error.kind === "configuration") {
+        lastError = { message: error.message, at: new Date().toISOString() };
+      }
+      if (error.kind !== "permanent") throw error;
+    }
     if (!(error instanceof ChatError) && !(error instanceof PromptParseError)) throw error;
     await recordEnrichmentFailure(sql, itemId, kind, error.message);
   }
@@ -275,6 +329,7 @@ export function createEnrichmentService(deps: {
       chat,
       request(summaryPrompt.system, articleText(item)),
       summaryReplySchema,
+      inFlight.signal,
     );
     await writeEnrichment(sql, {
       itemId: item.id,
@@ -294,6 +349,10 @@ export function createEnrichmentService(deps: {
    * anybody chose. Only approved tags reach item_tags, and attachTags checks
    * that again in SQL, because the vocabulary can change between the prompt and
    * the write.
+   *
+   * The row is written before the suggestions are counted, because the count is
+   * read back out of it: an observation is one article that named this tag, and
+   * this is the article that just did.
    */
   async function tag(chat: ChatProvider, item: EnrichmentInput): Promise<void> {
     const vocabulary = await approvedTags(sql);
@@ -301,6 +360,7 @@ export function createEnrichmentService(deps: {
       chat,
       request(tagsPrompt(vocabulary).system, articleText(item)),
       tagsReplySchema,
+      inFlight.signal,
     );
 
     const approved = new Set(vocabulary);
@@ -314,15 +374,6 @@ export function createEnrichmentService(deps: {
       .filter((slug) => slug !== null)
       .filter((slug) => !approved.has(slug));
 
-    const ids = await approvedTagIds(sql, chosen);
-    await attachTags(sql, item.id, ids, "model");
-    for (const slug of new Set(suggested)) {
-      // The label is the slug: a suggestion is a name with nothing behind it
-      // yet, and inventing a second display label would be another thing to
-      // keep true of a row nobody has approved.
-      await suggestTag(sql, slug, slug);
-    }
-
     await writeEnrichment(sql, {
       itemId: item.id,
       kind: "tags",
@@ -333,6 +384,16 @@ export function createEnrichmentService(deps: {
         candidates: [...new Set(suggested)],
       },
     });
+
+    const ids = await approvedTagIds(sql, chosen);
+    await attachTags(sql, item.id, ids, "model");
+    for (const slug of new Set(suggested)) {
+      // The label is the slug: a suggestion is a name with nothing behind it
+      // yet, and inventing a second display label would be another thing to
+      // keep true of a row nobody has approved.
+      await suggestTag(sql, slug, slug);
+    }
+
     await clearEnrichmentFailure(sql, item.id, "tags");
   }
 
@@ -356,6 +417,7 @@ export function createEnrichmentService(deps: {
         ),
       ),
       translationReplySchema,
+      inFlight.signal,
     );
     await writeEnrichment(sql, {
       itemId: item.id,
@@ -386,13 +448,20 @@ export function createEnrichmentService(deps: {
     force: boolean,
   ): Promise<EnrichmentRun> {
     const run = emptyRun();
+    if (stopping) return run;
     run.items = 1;
 
+    // Selection only promises the item lacks one of the wanted combinations,
+    // so the others it does want may still be inside a backoff from a previous
+    // pass. Asking the store per kind is what stops a summary that failed
+    // yesterday being paid for again today, on an item chosen for its tags.
+    const waiting = force ? new Set<EnrichmentKind>() : await kindsInBackoff(sql, item.id);
+
     for (const want of wanted) {
+      if (stopping) break;
       const lang = want.lang ?? "";
-      // Asked of the store rather than assumed from selection: selection only
-      // promises the item lacks one of the wanted combinations, and writing the
-      // others again would spend a call to overwrite an answer already there.
+      // Asked of the store rather than assumed from selection: writing a kind
+      // the item already has would spend a call to overwrite an answer.
       const stored = force
         ? []
         : await currentEnrichments(sql, [item.id], {
@@ -401,7 +470,7 @@ export function createEnrichmentService(deps: {
             model: chat.model,
             promptVersion: want.promptVersion,
           });
-      if (stored.length > 0) continue;
+      if (stored.length > 0 || waiting.has(want.kind)) continue;
 
       try {
         if (want.kind === "summary") {
@@ -410,11 +479,14 @@ export function createEnrichmentService(deps: {
         } else if (want.kind === "tags") {
           await tag(chat, item);
           run.tagged += 1;
-        } else if ((want.lang ?? "").length > 0) {
-          await translate(chat, item, want.lang as string);
+        } else {
+          await translate(chat, item, lang);
           run.translated += 1;
         }
       } catch (error) {
+        // An aborted call is a shutdown, not an answer: charging it to the item
+        // would park every article behind a backoff for the daemon going down.
+        if (stopping) break;
         await fail(item.id, want.kind, error);
         run.failed += 1;
       }
@@ -436,12 +508,12 @@ export function createEnrichmentService(deps: {
    * the pass a fresh allowance on the hour.
    */
   async function remainingBudget(now: Date): Promise<number> {
-    const spent = await enrichedItemsSince(sql, new Date(now.getTime() - MS_PER_HOUR));
+    const spent = await enrichmentAttemptsSince(sql, new Date(now.getTime() - MS_PER_HOUR));
     return Math.max(0, config.ENRICH_MAX_ITEMS_PER_HOUR - spent);
   }
 
-  function emptyRun(bounded = false): EnrichmentRun {
-    return { items: 0, summarised: 0, tagged: 0, translated: 0, failed: 0, bounded };
+  function emptyRun(): EnrichmentRun {
+    return { items: 0, summarised: 0, tagged: 0, translated: 0, failed: 0, bounded: false };
   }
 
   function add(total: EnrichmentRun, part: EnrichmentRun): void {
@@ -455,9 +527,10 @@ export function createEnrichmentService(deps: {
   /**
    * Spend on the chosen items, ENRICH_CONCURRENCY at a time.
    *
-   * A retryable failure propagates rather than being counted against the
-   * articles: it describes the endpoint, and the items stay candidates for the
-   * next pass. Everything already written stays written.
+   * A failure that is not about the article propagates rather than being
+   * counted against one: it describes the endpoint or the configuration, and
+   * the items stay candidates for the next pass. Everything already written
+   * stays written.
    */
   async function spend(
     chat: ChatProvider,
@@ -481,8 +554,19 @@ export function createEnrichmentService(deps: {
     return total;
   }
 
-  /** The candidate ids of one pass: the starred arm, then the ranked top N. */
-  async function choosePass(now: Date, budget: number): Promise<string[]> {
+  /**
+   * The candidate ids of one pass, and how many there were before the spend
+   * bound cut them.
+   *
+   * Every candidate in the window is ranked, not a lookahead prefix of them.
+   * The window bounds the pool; the interest score decides the order, and
+   * truncating before ranking would hand the decision to publication date for
+   * exactly the items the score exists to promote.
+   */
+  async function choosePass(
+    now: Date,
+    budget: number,
+  ): Promise<{ ids: string[]; matched: number }> {
     const wanted = wantedKinds(null);
     const chat = provider as ChatProvider;
     const common = {
@@ -496,7 +580,6 @@ export function createEnrichmentService(deps: {
     const ranked = await enrichmentCandidates(sql, {
       ...common,
       windowHours: config.ENRICH_WINDOW_HOURS,
-      limit: config.ENRICH_TOP_N * RANK_LOOKAHEAD,
     });
     // Starred items are added whatever their rank, so the top of the ranked
     // list is not what decides whether they are enriched at all.
@@ -505,11 +588,13 @@ export function createEnrichmentService(deps: {
       starredOnly: true,
       limit: Math.max(budget, 1),
     });
-    if (ranked.candidates.length === 0 && starred.candidates.length === 0) return [];
+    if (ranked.candidates.length === 0 && starred.candidates.length === 0) {
+      return { ids: [], matched: 0 };
+    }
 
-    const starredIds = starred.candidates.map((candidate) => candidate.id);
+    const starredIds = starred.candidates;
     const starredSet = new Set(starredIds);
-    let ordered = ranked.candidates.map((candidate) => candidate.id);
+    let ordered = ranked.candidates;
 
     if (ordered.length > 0 && (await interest.status()).active) {
       const scored = await scoreItems(sql, {
@@ -531,7 +616,7 @@ export function createEnrichmentService(deps: {
     }
 
     const top = ordered.slice(0, config.ENRICH_TOP_N).filter((id) => !starredSet.has(id));
-    return [...starredIds, ...top];
+    return { ids: [...starredIds, ...top], matched: ranked.matched };
   }
 
   async function pass(): Promise<PassResult> {
@@ -540,11 +625,11 @@ export function createEnrichmentService(deps: {
     if (!provider || wanted.length === 0) return { ...emptyRun(), idle: true };
 
     const budget = await remainingBudget(now);
-    const chosen = await choosePass(now, budget);
-    if (chosen.length === 0) return { ...emptyRun(), idle: true };
+    const { ids, matched } = await choosePass(now, budget);
+    if (ids.length === 0) return { ...emptyRun(), idle: true };
 
-    const bounded = chosen.length > budget;
-    const inputs = await enrichmentInputs(sql, chosen.slice(0, budget));
+    const bounded = matched > budget;
+    const inputs = await enrichmentInputs(sql, ids.slice(0, budget));
     const total = await spend(provider, inputs, wanted, false);
     // Idle means nothing was spent, not that nothing was waiting. A pass the
     // hourly bound empties would otherwise ask again every quarter of a second
@@ -552,13 +637,30 @@ export function createEnrichmentService(deps: {
     return { ...total, bounded, idle: inputs.length === 0 };
   }
 
-  function runOnce(): Promise<PassResult> {
-    if (running) return running;
-    const started = pass().finally(() => {
-      if (running === started) running = null;
-    });
-    running = started;
+  /**
+   * Run one thing at a time.
+   *
+   * Both a pass and an explicit rerun take the slot: the hourly bound is
+   * counted from rows both of them write, so two running at once spend against
+   * one allowance and overshoot it. A caller that arrives while the slot is
+   * taken waits for it and then takes the slot itself, rather than sharing a
+   * run it did not ask for -- a rerun over a different period or kind would be
+   * answered with the wrong one.
+   *
+   * Chained rather than guarded by a flag: three callers have to queue in the
+   * order they arrived, and a flag with a release step gets that wrong as soon
+   * as two are waiting at once.
+   */
+  let queue: Promise<unknown> = Promise.resolve();
+
+  function exclusive<T extends EnrichmentRun>(work: () => Promise<T>): Promise<T> {
+    const started = queue.then(work, work);
+    queue = started.catch(() => {});
     return started;
+  }
+
+  function runOnce(): Promise<PassResult> {
+    return exclusive(pass);
   }
 
   const sleep = (ms: number) =>
@@ -593,8 +695,12 @@ export function createEnrichmentService(deps: {
 
     async stop() {
       stopping = true;
+      // Before awaiting the run rather than after: a request already in flight
+      // is waiting on the endpoint, and the endpoint is not the thing being
+      // shut down.
+      inFlight.abort();
       wake?.();
-      await running?.catch(() => {});
+      await queue.catch(() => {});
       await loop;
     },
 
@@ -606,6 +712,7 @@ export function createEnrichmentService(deps: {
           model: null,
           promptVersions: PROMPT_VERSIONS,
           counts: { summarised: 0, tagged: 0, translated: 0, failed: 0 },
+          lastError,
         };
       }
       return {
@@ -617,6 +724,7 @@ export function createEnrichmentService(deps: {
           model: provider.model,
           promptVersions: Object.values(PROMPT_VERSIONS),
         }),
+        lastError,
       };
     },
 
@@ -633,7 +741,6 @@ export function createEnrichmentService(deps: {
     async runOver({ since, kind, force }) {
       if (!provider) throw new EnrichmentPreconditionError(NO_PROVIDER);
 
-      const now = new Date();
       const wanted = wantedKinds(kind);
       if (wanted.length === 0) {
         // Said rather than answered with an empty run: "nothing was enabled"
@@ -645,38 +752,56 @@ export function createEnrichmentService(deps: {
         );
       }
 
-      const budget = await remainingBudget(now);
-      const selection = await enrichmentCandidates(sql, {
-        userId,
-        model: provider.model,
-        wanted,
-        since,
-        force,
-        collapse: config.CLUSTERING_ENABLED,
-        limit: Math.max(budget, 1),
-        now,
-      });
+      return exclusive(async () => {
+        const now = new Date();
+        // Bounded by ENRICH_MAX_ITEMS_PER_HOUR but not drawn from the hour the
+        // background pass spends: a rerun is a foreground command somebody
+        // typed, and sharing the allowance would make asking twice the way to
+        // get twice the work -- which is what --since 30d is for. The pass is
+        // the one that has to stop itself, and that is the one reading the
+        // shared hour.
+        const budget = config.ENRICH_MAX_ITEMS_PER_HOUR;
+        const selection = await enrichmentCandidates(sql, {
+          userId,
+          model: provider.model,
+          wanted,
+          since,
+          force,
+          collapse: config.CLUSTERING_ENABLED,
+          limit: Math.max(budget, 1),
+          now,
+        });
 
-      const ids = selection.candidates.map((candidate) => candidate.id);
-      const inputs = await enrichmentInputs(sql, ids.slice(0, budget));
-      const total = await spend(provider, inputs, wanted, force);
-      return { ...total, bounded: ids.length > budget };
+        const ids = selection.candidates;
+        const inputs = await enrichmentInputs(sql, ids.slice(0, budget));
+        const total = await spend(provider, inputs, wanted, force);
+        // From what matched rather than from what was fetched: the fetch is
+        // capped at the budget, so asking whether the fetch was full can only
+        // say the budget was zero.
+        return { ...total, bounded: selection.matched > ids.length };
+      });
     },
 
-    async prune({ keepCurrent }) {
+    /**
+     * Delete every combination that is not current.
+     *
+     * Always keeping the current ones is the point of the command: they are
+     * what every response reads, and a prune that could be asked not to keep
+     * them is a prune that can delete an install's summaries by accident. The
+     * comparison between two prompt versions is what the pruning exists to
+     * protect, not to apply.
+     */
+    async prune() {
       const chat = provider;
-      if (keepCurrent && !chat) {
+      if (!chat) {
         throw new EnrichmentPreconditionError(
-          "there is no current combination to keep: set CHAT_PROVIDER, or prune without --keep-current",
+          "there is no current combination to keep: set CHAT_PROVIDER first",
         );
       }
-      const keep =
-        chat && keepCurrent
-          ? Object.values(PROMPT_VERSIONS).map((promptVersion) => ({
-              model: chat.model,
-              promptVersion,
-            }))
-          : [];
+      const keep = Object.values(PROMPT_VERSIONS).map((promptVersion) => ({
+        model: chat.model,
+        promptVersion,
+      }));
       return pruneEnrichments(sql, keep);
     },
 
@@ -709,11 +834,24 @@ export function createEnrichmentService(deps: {
 
       const [item] = await enrichmentInputs(sql, [itemId]);
       if (!item) throw new EnrichmentPreconditionError(`no item with id ${itemId}`);
+      // Refused rather than cut: a translation that stops at 8,000 characters
+      // looks like a translation, and nobody finds out that a third of the
+      // article is missing until they have read it in the wrong language.
+      if (item.searchText.length > MAX_INPUT_CHARS) {
+        throw new EnrichmentPreconditionError(
+          `this article is ${item.searchText.length} characters, over the ${MAX_INPUT_CHARS} sent per call`,
+        );
+      }
 
       const reply = await completeJson(
         chat,
-        request(bodyTranslationPrompt(lang).system, item.searchText.slice(0, MAX_INPUT_CHARS)),
+        request(
+          bodyTranslationPrompt(lang).system,
+          item.searchText,
+          config.CHAT_MAX_OUTPUT_TOKENS * BODY_OUTPUT_TOKEN_MULTIPLE,
+        ),
         bodyTranslationReplySchema,
+        inFlight.signal,
       );
       await writeEnrichment(sql, {
         itemId,
@@ -755,6 +893,63 @@ export function createEnrichmentService(deps: {
         if (parsed.success) summaries.set(row.itemId, parsed.data.summary);
       }
       return summaries;
+    },
+
+    /**
+     * Everything a chat model has said about these items.
+     *
+     * One query per kind rather than one per item: a response over 50 articles
+     * would otherwise be 50 round trips, which is the difference between a
+     * listing and a page that takes a second.
+     *
+     * An item with nothing stored still gets an entry, carrying the feed's
+     * summary and saying so, because the caller asked what is there and "the
+     * feed's" is an answer.
+     */
+    async currentForItems(itemIds) {
+      const found = new Map<string, ItemEnrichment>();
+      const lang = targetLanguage();
+      if (itemIds.length === 0) return found;
+
+      const ids = [...itemIds];
+      for (const id of ids) {
+        found.set(id, { summary: null, summarySource: "feed", translation: null, tags: [] });
+      }
+
+      const tags = await tagsOfItems(sql, ids);
+      for (const [id, slugs] of tags) {
+        const entry = found.get(id) as ItemEnrichment;
+        found.set(id, { ...entry, tags: slugs });
+      }
+      if (!provider) return found;
+
+      const filter = {
+        model: provider.model,
+        promptVersion: PROMPT_VERSIONS.summary,
+      };
+      for (const row of await currentEnrichments(sql, ids, { ...filter, kind: "summary" })) {
+        const parsed = summaryReplySchema.safeParse(row.content);
+        const entry = found.get(row.itemId);
+        if (!parsed.success || !entry) continue;
+        found.set(row.itemId, { ...entry, summary: parsed.data.summary, summarySource: "model" });
+      }
+      if (lang.length === 0) return found;
+
+      for (const row of await currentEnrichments(sql, ids, {
+        ...filter,
+        kind: "translation",
+        promptVersion: PROMPT_VERSIONS.translation,
+        lang,
+      })) {
+        const parsed = translationReplySchema.safeParse(row.content);
+        const entry = found.get(row.itemId);
+        if (!parsed.success || !entry) continue;
+        found.set(row.itemId, {
+          ...entry,
+          translation: { lang: row.lang, title: parsed.data.title, text: parsed.data.text },
+        });
+      }
+      return found;
     },
   };
 }

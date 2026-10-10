@@ -19,7 +19,6 @@ import type { ChatProvider, ChatRequest } from "./chat.ts";
  */
 
 export type Prompt = {
-  version: string;
   system: string;
 };
 
@@ -29,7 +28,6 @@ export const TAGS_PROMPT_VERSION = "tags.v1";
 export const BODY_TRANSLATION_PROMPT_VERSION = "translation-body.v1";
 
 export const summaryPrompt: Prompt = {
-  version: SUMMARY_PROMPT_VERSION,
   system:
     "You summarise articles for a reader deciding whether to open them. " +
     'Answer with a JSON object of the form {"summary": "..."} and nothing else. ' +
@@ -45,7 +43,6 @@ export const summaryPrompt: Prompt = {
  */
 export function translationPrompt(targetLanguage: string): Prompt {
   return {
-    version: TRANSLATION_PROMPT_VERSION,
     system:
       `You translate article titles and summaries into ${targetLanguage}. ` +
       'Answer with a JSON object of the form {"title": "...", "text": "..."} and nothing else. ' +
@@ -67,7 +64,6 @@ export function tagsPrompt(approvedSlugs: readonly string[]): Prompt {
     approvedSlugs.length > 0 ? approvedSlugs.join(", ") : "(no tags are approved yet)";
 
   return {
-    version: TAGS_PROMPT_VERSION,
     system:
       "You tag articles for a reader who subscribes to many of them. " +
       'Answer with a JSON object of the form {"tags": ["..."], "candidates": ["..."]} ' +
@@ -81,10 +77,8 @@ export function tagsPrompt(approvedSlugs: readonly string[]): Prompt {
 }
 
 export const summaryReplySchema = z.object({ summary: z.string() });
-export type SummaryReply = z.infer<typeof summaryReplySchema>;
 
 export const translationReplySchema = z.object({ title: z.string(), text: z.string() });
-export type TranslationReply = z.infer<typeof translationReplySchema>;
 
 /**
  * A body, on request (`tsuzuri translate <id>`).
@@ -97,7 +91,6 @@ export type TranslationReply = z.infer<typeof translationReplySchema>;
  */
 export function bodyTranslationPrompt(targetLanguage: string): Prompt {
   return {
-    version: BODY_TRANSLATION_PROMPT_VERSION,
     system:
       `You translate article bodies into ${targetLanguage}. ` +
       'Answer with a JSON object of the form {"text": "..."} and nothing else. ' +
@@ -107,7 +100,6 @@ export function bodyTranslationPrompt(targetLanguage: string): Prompt {
 }
 
 export const bodyTranslationReplySchema = z.object({ text: z.string() });
-export type BodyTranslationReply = z.infer<typeof bodyTranslationReplySchema>;
 
 export const tagsReplySchema = z.object({
   // Defaulted rather than required: an article the approved vocabulary does not
@@ -116,7 +108,6 @@ export const tagsReplySchema = z.object({
   tags: z.array(z.string()).default([]),
   candidates: z.array(z.string()).default([]),
 });
-export type TagsReply = z.infer<typeof tagsReplySchema>;
 
 /**
  * A reply that could not be turned into the shape the caller asked for.
@@ -142,15 +133,21 @@ const ATTEMPTS = 2;
  * The retry carries the parse error rather than a bare "try again", because a
  * model that answered with prose has to be told what was wrong with it or it
  * produces the same shape of answer and the second call buys nothing.
+ *
+ * The signal is the caller's shutdown, and it reaches the request rather than
+ * racing it: a second attempt is not made against a signal that has already
+ * been aborted.
  */
 export async function completeJson<T>(
   provider: ChatProvider,
   request: ChatRequest,
   schema: z.ZodType<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
   let reason = "";
 
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) throw signal.reason;
     const asked: ChatRequest =
       attempt === 0
         ? request
@@ -164,7 +161,7 @@ export async function completeJson<T>(
     // A ChatError is the caller's to handle: it says the endpoint or the
     // request failed, not that the answer was unusable, and retrying it here
     // would hide the difference between the two.
-    const answer = await provider.complete(asked);
+    const answer = await provider.complete(asked, signal);
     const read = readReply(answer, schema);
 
     if (read.ok) return read.data;
@@ -196,15 +193,23 @@ function readReply<T>(
 }
 
 /**
- * Strip the fence a model wrapped its JSON in.
+ * Take the JSON out of an answer that wrapped it in prose.
  *
- * Anchored to the whole trimmed answer on purpose: an unanchored pattern would
- * strip the braces out from under a JSON string that merely contains a backtick
- * pair, which is how a code sample inside a summary turns into a parse error
- * and costs another call.
+ * A fenced block is taken wherever it appears, and failing that the outermost
+ * object. Both are anchored to what actually contains the JSON rather than to
+ * the whole reply, because a model that adds a sentence before or after the
+ * object would otherwise spend the retry on an answer that was correct.
  */
 function unwrapJson(answer: string): string {
   const trimmed = answer.trim();
-  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/.exec(trimmed);
-  return fenced?.[1]?.trim() ?? trimmed;
+
+  const fenced = /```(?:json)?\s*\n?([\s\S]*?)\n?```/.exec(trimmed);
+  if (fenced?.[1]?.trim()) return fenced[1].trim();
+
+  // Outermost, so a brace inside a string value does not end the object early.
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) return trimmed.slice(start, end + 1);
+
+  return trimmed;
 }

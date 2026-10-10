@@ -214,7 +214,7 @@ export const enrichments = pgTable(
     primaryKey({
       columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
     }),
-    index("enrichments_by_item").on(table.itemId, table.kind),
+    index("enrichments_by_created_at").on(table.createdAt),
   ],
 );
 
@@ -227,9 +227,14 @@ export const enrichmentFailures = pgTable(
     kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
     failures: integer("failures").notNull().default(1),
     lastError: text("last_error"),
+    /** When the call was spent. See the note on the column in the migration. */
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }).notNull().defaultNow(),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
   },
-  (table) => [primaryKey({ columns: [table.itemId, table.kind] })],
+  (table) => [
+    primaryKey({ columns: [table.itemId, table.kind] }),
+    index("enrichment_failures_by_attempt").on(table.lastAttemptAt),
+  ],
 );
 
 /**

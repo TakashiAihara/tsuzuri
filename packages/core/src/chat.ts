@@ -45,11 +45,6 @@ export type ChatProviderConfig = {
    * timeout of its own.
    */
   requestTimeoutMs?: number | undefined;
-  /**
-   * Value for the `anthropic-version` header. See DEFAULT_ANTHROPIC_VERSION for
-   * why this is the one setting a caller may have to supply.
-   */
-  anthropicVersion?: string | undefined;
 };
 
 /** CHAT_REQUEST_TIMEOUT_MS. Generous, because a local model summarising is slow. */
@@ -57,12 +52,26 @@ export const DEFAULT_CHAT_REQUEST_TIMEOUT_MS = 120_000;
 /**
  * The value sent in the `anthropic-version` header.
  *
- * That wire format requires the header and the design document names it
- * without naming a value, so this constant is a property of the request this
- * module sends rather than a claim about any provider -- nothing here can
- * verify it. It is configurable for an endpoint that expects a different one.
+ * The wire format requires the header and the design document names it without
+ * naming a value, so this constant is a property of the request this module
+ * sends. Nothing here can check that an endpoint accepts it.
  */
-export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
+export const ANTHROPIC_VERSION = "2023-06-01";
+
+/**
+ * Why a request failed, and therefore what may be done about it.
+ *
+ * `retryable` and `configuration` both describe the run rather than the item:
+ * the endpoint was unwell, or this installation asked for something the
+ * endpoint will not do. Neither says anything about the article, so neither is
+ * recorded against one. They stay apart because the operator does different
+ * things about them -- wait, or change the configuration -- and an answer that
+ * only says "try again" is as unhelpful for a bad key as it is for an outage.
+ *
+ * `permanent` is the only one that is evidence about the request, and the only
+ * one an item is charged with.
+ */
+export type ChatErrorKind = "retryable" | "configuration" | "permanent";
 
 /**
  * Same split as EmbeddingError, for the same reason: only a permanent,
@@ -73,7 +82,7 @@ export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export class ChatError extends Error {
   constructor(
     message: string,
-    readonly retryable: boolean,
+    readonly kind: ChatErrorKind,
   ) {
     super(message);
     this.name = "ChatError";
@@ -86,7 +95,6 @@ type ProviderContext = {
   model: string;
   apiKey: string | undefined;
   requestTimeoutMs: number;
-  anthropicVersion: string;
 };
 
 /**
@@ -109,7 +117,6 @@ export function createChatProvider(config: ChatProviderConfig): ChatProvider | n
     model: config.model,
     apiKey: config.apiKey,
     requestTimeoutMs: config.requestTimeoutMs ?? DEFAULT_CHAT_REQUEST_TIMEOUT_MS,
-    anthropicVersion: config.anthropicVersion ?? DEFAULT_ANTHROPIC_VERSION,
   };
 
   switch (config.provider) {
@@ -125,10 +132,9 @@ export function createChatProvider(config: ChatProviderConfig): ChatProvider | n
 /**
  * One request, and the classification every implementation shares.
  *
- * 4xx is a bad request or a bad key and will fail identically forever, except
- * for 429, which is a 4xx asking to be retried. The deadline also covers the
- * response body, so an endpoint that sends headers and then stalls fails here
- * as transport rather than being blamed on the article.
+ * The deadline also covers the response body, so an endpoint that sends headers
+ * and then stalls fails here as transport rather than being blamed on the
+ * article.
  */
 async function postJson(
   url: string,
@@ -153,7 +159,7 @@ async function postJson(
     // runtime often enough that "not running yet" is the common case.
     throw new ChatError(
       `chat request failed: ${error instanceof Error ? error.message : String(error)}`,
-      true,
+      "retryable",
     );
   }
 
@@ -161,7 +167,7 @@ async function postJson(
     const text = (await response.text().catch(() => "")).slice(0, 500);
     throw new ChatError(
       `chat request failed (${response.status}): ${text}`,
-      isRetryable(response.status),
+      classifyStatus(response.status),
     );
   }
 
@@ -178,15 +184,45 @@ async function postJson(
       `chat response body could not be read: ${
         error instanceof Error ? error.message : String(error)
       }`,
-      !permanent,
+      permanent ? "permanent" : "retryable",
     );
   }
 
   return payload;
 }
 
-function isRetryable(status: number): boolean {
-  return status >= 500 || status === 429;
+/**
+ * What a status says about the cause.
+ *
+ * 4xx asks for a different request and 5xx asks for another try, with 429 the
+ * one 4xx that asks for another try. The four statuses that name a setup
+ * mistake -- a key refused, a path that does not exist, a model that does not
+ * exist, a body the endpoint will not accept -- are separated out because every
+ * item would fail them identically, and parking every item behind a backoff for
+ * a typo is how one wrong variable stops enrichment for a day.
+ */
+function classifyStatus(status: number): ChatErrorKind {
+  if (status === 429 || status >= 500) return "retryable";
+  if (status === 400 || status === 401 || status === 403 || status === 404) {
+    return "configuration";
+  }
+  return "permanent";
+}
+
+/**
+ * An answer that stopped because the output bound was reached.
+ *
+ * Not a parse failure: the answer is complete JSON up to the point the bound
+ * bit, and retrying it with the same bound produces the same truncated answer.
+ * The fix is a larger CHAT_MAX_OUTPUT_TOKENS, which is a change to this
+ * installation rather than to any article, so it is classified like every other
+ * configuration error.
+ */
+function outputLimitError(provider: string, limit: number): ChatError {
+  return new ChatError(
+    `${provider} reached the ${limit}-token output bound; raise CHAT_MAX_OUTPUT_TOKENS`,
+    "configuration",
+  );
 }
 
 /**
@@ -195,33 +231,49 @@ function isRetryable(status: number): boolean {
  * A shape this cannot read is a permanent failure rather than an empty string:
  * an empty summary is indistinguishable from a model that had nothing to say,
  * and both would be stored as the same thing.
+ *
+ * `limit` is read from the response's own stop reason rather than guessed from
+ * an empty answer, because a model that spent its whole budget reasoning
+ * answers with no text and no JSON, which retries identically.
  */
 function readReply<T>(
   payload: unknown,
   schema: z.ZodType<T>,
-  extract: (value: T) => string | null,
+  read: (value: T) => Reply,
   shape: string,
+  limit: number,
 ): string {
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
-    throw new ChatError(`chat response was not in the ${shape} shape`, false);
+    throw new ChatError(`chat response was not in the ${shape} shape`, "permanent");
   }
 
-  const text = extract(parsed.data);
+  const reply = read(parsed.data);
+  if (reply.stoppedAtLimit) throw outputLimitError(shape, limit);
+
+  const text = reply.text;
   if (text === null || text.trim().length === 0) {
-    throw new ChatError(`chat response carried no text in the ${shape} shape`, false);
+    throw new ChatError(`chat response carried no text in the ${shape} shape`, "permanent");
   }
   return text;
 }
+
+/** One answer, and whether the endpoint says it stopped at the output bound. */
+type Reply = { text: string | null; stoppedAtLimit: boolean };
 
 const openAiResponse = z.object({
   choices: z
     .array(
       z.object({
+        finish_reason: z.string().nullish(),
         message: z.object({
           // The part array is what an endpoint that answers in segments sends,
           // and reading only the first part would truncate every such answer.
           content: z.union([z.string(), z.array(z.object({ text: z.string() }))]).nullable(),
+          // Read only to recognise an answer that spent its whole budget
+          // reasoning and produced no text; the text of either is never used.
+          reasoning_content: z.string().nullish(),
+          reasoning: z.string().nullish(),
         }),
       }),
     )
@@ -233,6 +285,18 @@ function openAiText(value: z.infer<typeof openAiResponse>): string | null {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map((part) => part.text).join("");
   return null;
+}
+
+function openAiReply(value: z.infer<typeof openAiResponse>): Reply {
+  const choice = value.choices[0];
+  const text = openAiText(value);
+  const reasoned =
+    (choice?.message.reasoning_content?.trim().length ?? 0) > 0 ||
+    (choice?.message.reasoning?.trim().length ?? 0) > 0;
+  return {
+    text,
+    stoppedAtLimit: choice?.finish_reason === "length" || (reasoned && !text?.trim()),
+  };
 }
 
 /**
@@ -261,19 +325,33 @@ function openAiCompatible(context: ProviderContext): ChatProvider {
         },
         { requestTimeoutMs: context.requestTimeoutMs, signal },
       );
-      return readReply(payload, openAiResponse, openAiText, "openai-compatible");
+      return readReply(
+        payload,
+        openAiResponse,
+        openAiReply,
+        "openai-compatible",
+        request.maxOutputTokens,
+      );
     },
   };
 }
 
 const anthropicResponse = z.object({
+  stop_reason: z.string().nullish(),
   // Blocks are typed and not every block carries text, so text is collected
   // from the ones that have it rather than demanded of the first.
-  content: z.array(z.object({ text: z.string().optional() })).min(1),
+  content: z
+    .array(z.object({ text: z.string().optional(), thinking: z.string().optional() }))
+    .min(1),
 });
 
-function anthropicText(value: z.infer<typeof anthropicResponse>): string | null {
-  return value.content.map((block) => block.text ?? "").join("");
+function anthropicReply(value: z.infer<typeof anthropicResponse>): Reply {
+  const text = value.content.map((block) => block.text ?? "").join("");
+  const reasoned = value.content.some((block) => (block.thinking?.trim().length ?? 0) > 0);
+  return {
+    text,
+    stoppedAtLimit: value.stop_reason === "max_tokens" || (reasoned && text.trim().length === 0),
+  };
 }
 
 /** Anthropic's wire format: the system prompt is a top-level field, not a message. */
@@ -285,7 +363,7 @@ function anthropic(context: ProviderContext): ChatProvider {
       const payload = await postJson(
         `${context.baseUrl}/v1/messages`,
         {
-          "anthropic-version": context.anthropicVersion,
+          "anthropic-version": ANTHROPIC_VERSION,
           ...(context.apiKey ? { "x-api-key": context.apiKey } : {}),
         },
         {
@@ -297,19 +375,44 @@ function anthropic(context: ProviderContext): ChatProvider {
         },
         { requestTimeoutMs: context.requestTimeoutMs, signal },
       );
-      return readReply(payload, anthropicResponse, anthropicText, "anthropic");
+      return readReply(
+        payload,
+        anthropicResponse,
+        anthropicReply,
+        "anthropic",
+        request.maxOutputTokens,
+      );
     },
   };
 }
 
 const geminiResponse = z.object({
   candidates: z
-    .array(z.object({ content: z.object({ parts: z.array(z.object({ text: z.string() })) }) }))
+    .array(
+      z.object({
+        finishReason: z.string().nullish(),
+        content: z.object({
+          // `thought` marks a part the model produced while reasoning. It is
+          // read only to recognise an answer that ran out of budget mid-thought.
+          parts: z.array(
+            z.object({ text: z.string().optional(), thought: z.boolean().optional() }),
+          ),
+        }),
+      }),
+    )
     .min(1),
 });
 
-function geminiText(value: z.infer<typeof geminiResponse>): string | null {
-  return (value.candidates[0]?.content.parts ?? []).map((part) => part.text).join("");
+function geminiReply(value: z.infer<typeof geminiResponse>): Reply {
+  const candidate = value.candidates[0];
+  const parts = candidate?.content.parts ?? [];
+  const text = parts.map((part) => part.text ?? "").join("");
+  const reasoned = parts.some((part) => part.thought === true);
+  return {
+    text,
+    stoppedAtLimit:
+      candidate?.finishReason === "MAX_TOKENS" || (reasoned && text.trim().length === 0),
+  };
 }
 
 /**
@@ -324,7 +427,9 @@ function gemini(context: ProviderContext): ChatProvider {
     model: context.model,
     async complete(request, signal) {
       const payload = await postJson(
-        `${context.baseUrl}/v1beta/models/${context.model}:generateContent`,
+        // A model name is a path segment and may carry a slash or a space; an
+        // unencoded one asks for a different resource than the one configured.
+        `${context.baseUrl}/v1beta/models/${encodeURIComponent(context.model)}:generateContent`,
         context.apiKey ? { "x-goog-api-key": context.apiKey } : {},
         {
           systemInstruction: { parts: [{ text: request.system }] },
@@ -333,7 +438,7 @@ function gemini(context: ProviderContext): ChatProvider {
         },
         { requestTimeoutMs: context.requestTimeoutMs, signal },
       );
-      return readReply(payload, geminiResponse, geminiText, "gemini");
+      return readReply(payload, geminiResponse, geminiReply, "gemini", request.maxOutputTokens);
     },
   };
 }

@@ -102,6 +102,28 @@ export const itemSchema = z.strictObject({
 });
 export type Item = z.infer<typeof itemSchema>;
 
+/**
+ * What a chat model has said about one article.
+ *
+ * Carried on GET /items/:id because a summary, a translation and a set of tags
+ * that nothing reads is not enrichment, it is cost. `summarySource` is the same
+ * field the listing carries, and the same reason: a reader cannot tell the
+ * feed's summary from the model's without it.
+ *
+ * Nullable rather than omitted: an article no model has touched is a state a
+ * caller has to handle, and it should not have to tell it apart from a
+ * response that forgot the field.
+ */
+export const itemEnrichmentSchema = z.strictObject({
+  summary: z.string().nullable(),
+  summarySource: z.enum(["feed", "model"]),
+  /** Title and summary translated, with the language they are in. */
+  translation: z.strictObject({ lang: z.string(), title: z.string(), text: z.string() }).nullable(),
+  /** Approved tags attached to this article. */
+  tags: z.array(z.string()),
+});
+export type ItemEnrichment = z.infer<typeof itemEnrichmentSchema>;
+
 export const itemStateSchema = z.strictObject({
   userId: z.string(),
   itemId: z.string(),
@@ -268,7 +290,10 @@ export const rankedItemsResponseSchema = z.strictObject({
   items: z.array(rankedItemSchema),
   scoring: scoringStateSchema,
 });
-export const itemResponseSchema = z.strictObject({ item: itemSchema });
+export const itemResponseSchema = z.strictObject({
+  item: itemSchema,
+  enrichment: itemEnrichmentSchema.nullable(),
+});
 export const itemStateResponseSchema = z.strictObject({ state: itemStateSchema });
 
 export const importOpmlResponseSchema = z.strictObject({
@@ -344,6 +369,11 @@ export type TranslateResponse = z.infer<typeof translateResponseSchema>;
  * `promptVersions` is what a rerun would write under and what `enrich prune
  * --keep-current` keeps; they are the code's, not the operator's, which is why
  * doctor reports them rather than accepting them.
+ *
+ * `lastError` is the last configuration error a pass refused to charge to an
+ * item. Those failures are true of every item equally, so nothing in the store
+ * records them and without this an install whose model has stopped accepting
+ * requests looks exactly like one with nothing to summarise.
  */
 export const llmStatusSchema = z.strictObject({
   enabled: z.boolean(),
@@ -361,6 +391,7 @@ export const llmStatusSchema = z.strictObject({
     translated: z.number(),
     failed: z.number(),
   }),
+  lastError: z.strictObject({ message: z.string(), at: z.string() }).nullable(),
 });
 export type LlmStatus = z.infer<typeof llmStatusSchema>;
 
@@ -368,13 +399,14 @@ export type EnrichRunRequest = {
   /** A duration back from now, or an absolute instant. */
   since: string;
   kind?: "summary" | "translation" | "tags";
-  /** Re-run items that already have a row for the current model and prompt. */
+  /**
+   * Re-run items the store already holds something for, ignoring any retry
+   * backoff.
+   *
+   * A JSON boolean. A `force=true` query string is what stringbool() reads, and
+   * it is what the CLI does not send.
+   */
   force?: boolean;
-};
-
-export type EnrichPruneRequest = {
-  /** Keep the configured model at the prompt versions this build runs. */
-  keepCurrent: boolean;
 };
 
 export type ItemStatePatch = {

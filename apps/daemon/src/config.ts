@@ -219,6 +219,15 @@ function missingFor(
     .map(([key]) => ({ key, message: `required when ${variable} is "${provider}"` }));
 }
 
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * A provider without the settings it needs is a configuration error, not a
  * disabled feature.
@@ -228,6 +237,10 @@ function missingFor(
  * silence: someone sets CHAT_PROVIDER, summaries never appear, and nothing says
  * why. Catching it in the schema makes it a startup error naming the variable
  * that is missing -- the same rule and the same reason as the embedding ones.
+ *
+ * The base URL is checked for being a URL at all rather than only for being
+ * present, because a value that parses nowhere is refused by the provider
+ * builder, which runs where nothing can report it as a configuration problem.
  */
 const configSchemaWithFeatureRules = configSchema.superRefine((config, ctx) => {
   const missing = [
@@ -243,6 +256,14 @@ const configSchemaWithFeatureRules = configSchema.superRefine((config, ctx) => {
 
   for (const issue of missing) {
     ctx.addIssue({ code: "custom", path: [issue.key], message: issue.message });
+  }
+
+  if (config.CHAT_PROVIDER !== "none" && config.CHAT_BASE_URL && !isHttpUrl(config.CHAT_BASE_URL)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["CHAT_BASE_URL"],
+      message: "must be an http or https URL",
+    });
   }
 });
 

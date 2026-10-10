@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { ChatError, createChatProvider, DEFAULT_ANTHROPIC_VERSION } from "./chat.ts";
+import { ANTHROPIC_VERSION, ChatError, createChatProvider } from "./chat.ts";
 
 /**
  * Each wire format is pinned against a fake fetch rather than a live endpoint:
@@ -59,12 +59,7 @@ const REQUEST = { system: "be terse", user: "summarise this", maxOutputTokens: 2
 
 function provider(
   id: "openai-compatible" | "anthropic" | "gemini",
-  overrides: {
-    baseUrl?: string;
-    apiKey?: string;
-    requestTimeoutMs?: number;
-    anthropicVersion?: string;
-  } = {},
+  overrides: { baseUrl?: string; apiKey?: string; requestTimeoutMs?: number } = {},
 ) {
   const created = createChatProvider({
     provider: id,
@@ -174,15 +169,8 @@ describe("anthropic", () => {
     await provider("anthropic", { apiKey: "sk-ant" }).complete(REQUEST);
 
     expect(calls[0]?.headers["x-api-key"]).toBe("sk-ant");
-    expect(calls[0]?.headers["anthropic-version"]).toBe(DEFAULT_ANTHROPIC_VERSION);
+    expect(calls[0]?.headers["anthropic-version"]).toBe(ANTHROPIC_VERSION);
     expect(JSON.stringify(calls[0]?.body)).not.toContain("sk-ant");
-  });
-
-  test("sends a configured version instead of the default", async () => {
-    respondWithJson({ content: [{ type: "text", text: "an answer" }] });
-    await provider("anthropic", { anthropicVersion: "2099-01-01" }).complete(REQUEST);
-
-    expect(calls[0]?.headers["anthropic-version"]).toBe("2099-01-01");
   });
 
   test("omits the key header when no key is configured", async () => {
@@ -239,27 +227,117 @@ describe("gemini", () => {
     expect(await provider("gemini").complete(REQUEST)).toBe("one two");
   });
 
+  test("URL-encodes the model name, which is a path segment of its own", async () => {
+    // A tuned model is named with a slash, and an unencoded one asks for a
+    // different resource than the one configured.
+    respondWithJson({ candidates: [{ content: { parts: [{ text: "an answer" }] } }] });
+    await createChatProvider({
+      provider: "gemini",
+      baseUrl: "https://chat.example/v1",
+      model: "tunedModels/my-model",
+    })?.complete(REQUEST);
+
+    expect(calls[0]?.url).toBe(
+      "https://chat.example/v1/v1beta/models/tunedModels%2Fmy-model:generateContent",
+    );
+  });
+
   test("refuses a response carrying no candidates", async () => {
     respondWithJson({ candidates: [] });
     await expect(provider("gemini").complete(REQUEST)).rejects.toThrow(/gemini shape/);
   });
 });
 
+describe("the output bound", () => {
+  /**
+   * Each provider names this condition in its own field, and each of the three
+   * names is the only one this code checks: an answer that stops here is
+   * complete JSON up to the point the bound bit, and asking again with the same
+   * bound produces the same truncated answer.
+   */
+  test("openai-compatible: finish_reason length", async () => {
+    respondWithJson({
+      choices: [{ finish_reason: "length", message: { content: '{"summary": "half an ans' } }],
+    });
+    await expect(
+      provider("openai-compatible").complete({ ...REQUEST, maxOutputTokens: 256 }),
+    ).rejects.toThrow(/256-token output bound/);
+  });
+
+  test("anthropic: stop_reason max_tokens", async () => {
+    respondWithJson({
+      stop_reason: "max_tokens",
+      content: [{ type: "text", text: '{"text": "hal' }],
+    });
+    await expect(
+      provider("anthropic").complete({ ...REQUEST, maxOutputTokens: 512 }),
+    ).rejects.toThrow(/512-token output bound/);
+  });
+
+  test("gemini: finishReason MAX_TOKENS", async () => {
+    respondWithJson({
+      candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: '{"summary":' }] } }],
+    });
+    await expect(
+      provider("gemini").complete({ ...REQUEST, maxOutputTokens: 1024 }),
+    ).rejects.toThrow(/1024-token output bound/);
+  });
+
+  test("a model that spent its budget reasoning says so, not that it had nothing to say", async () => {
+    // Empty content with a reasoning field is the same event as a stop reason
+    // naming the limit. Reporting "no text" would send the caller looking for a
+    // model problem when the bound is the problem.
+    respondWithJson({
+      choices: [
+        { message: { content: null, reasoning_content: "considering the article at length" } },
+      ],
+    });
+    await expect(
+      provider("openai-compatible").complete({ ...REQUEST, maxOutputTokens: 64 }),
+    ).rejects.toThrow(/64-token output bound/);
+  });
+
+  test("reaching the bound is a configuration error, not a fault of the article", async () => {
+    respondWithJson({ choices: [{ finish_reason: "length", message: { content: '{"summary"' } }] });
+    await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
+      kind: "configuration",
+    });
+  });
+
+  test("an answer that finished on its own is not mistaken for one that did not", async () => {
+    // The stop reason is checked for its value rather than its presence: an
+    // answer that ran out of tokens and one that simply ended look identical
+    // to anything reading only the text.
+    respondWithJson({
+      choices: [{ finish_reason: "stop", message: { content: '{"summary": "complete"}' } }],
+    });
+    expect(await provider("openai-compatible").complete(REQUEST)).toBe('{"summary": "complete"}');
+  });
+});
+
 describe("failure classification", () => {
   test("treats 5xx and 429 as retryable, and other 4xx as permanent", async () => {
     respondWithStatus(503, "upstream is unwell");
-    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ retryable: true });
+    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ kind: "retryable" });
 
     respondWithStatus(429, "slow down");
-    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ retryable: true });
+    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ kind: "retryable" });
 
-    // A bad key fails identically forever; retrying it just holds the item
-    // back from every later attempt.
-    respondWithStatus(401, "bad key");
-    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ retryable: false });
+    respondWithStatus(422, "this article cannot be summarised");
+    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ kind: "permanent" });
+  });
 
-    respondWithStatus(400, "bad request");
-    await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ retryable: false });
+  test("the four statuses that name a setup mistake are separated from the rest", async () => {
+    // Each of these would fail every item identically, and recording one
+    // against an item parks it behind a backoff for a variable somebody can
+    // change in a second. They are neither "try again" nor "this article is
+    // wrong", and the kind is what tells an operator which one it is.
+    for (const status of [400, 401, 403, 404]) {
+      respondWithStatus(status, "no such model");
+      await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
+        kind: "configuration",
+      });
+    }
   });
 
   test("names the status and the body it was refused with", async () => {
@@ -272,21 +350,21 @@ describe("failure classification", () => {
     // attempt would spend another call producing the same prose.
     respondWithStatus(200, "I am afraid I cannot do that");
     await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
-      retryable: false,
+      kind: "permanent",
     });
   });
 
   test("treats a response in an unexpected shape as permanent", async () => {
     respondWithJson({ choices: [{ text: "not a message object" }] });
     await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
-      retryable: false,
+      kind: "permanent",
     });
   });
 
   test("reports an unreachable endpoint as retryable", async () => {
     useFetch(() => Promise.reject(new TypeError("connection refused")));
     await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
-      retryable: true,
+      kind: "retryable",
     });
   });
 
@@ -296,15 +374,23 @@ describe("failure classification", () => {
     useFetch(stall());
     await expect(
       provider("openai-compatible", { requestTimeoutMs: 25 }).complete(REQUEST),
-    ).rejects.toMatchObject({ retryable: true });
+    ).rejects.toMatchObject({ kind: "retryable" });
   });
 
   test("adds the deadline to the caller's signal rather than replacing it", async () => {
     useFetch(stall());
     const slow = provider("openai-compatible", { requestTimeoutMs: 60_000 });
     await expect(slow.complete(REQUEST, AbortSignal.timeout(25))).rejects.toMatchObject({
-      retryable: true,
+      kind: "retryable",
     });
+  });
+
+  test("an aborted call is transport, so it is retryable and not the article's fault", async () => {
+    useFetch(stall());
+    const controller = new AbortController();
+    const pending = provider("openai-compatible").complete(REQUEST, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ kind: "retryable" });
   });
 });
 

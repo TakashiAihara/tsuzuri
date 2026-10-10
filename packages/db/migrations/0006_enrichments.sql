@@ -25,7 +25,10 @@ CREATE TABLE enrichments (
   PRIMARY KEY (item_id, kind, lang, model, prompt_version)
 );
 
-CREATE INDEX enrichments_by_item ON enrichments (item_id, kind);
+-- The hourly spend bound counts rows by when they were written, and nothing
+-- reads enrichments by item any other way: the primary key already leads with
+-- item_id, so an index on (item_id, kind) would only repeat it.
+CREATE INDEX enrichments_by_created_at ON enrichments (created_at);
 
 -- Items an enrichment call failed on, keyed by kind.
 --
@@ -38,9 +41,15 @@ CREATE TABLE enrichment_failures (
   kind            text NOT NULL,
   failures        integer NOT NULL DEFAULT 1 CHECK (failures > 0),
   last_error      text,
+  -- When the call was spent. next_attempt_at is computed from now and always
+  -- lands in the future, so it cannot answer this, and the hourly spend bound
+  -- has to count failures as well as successes.
+  last_attempt_at timestamptz NOT NULL DEFAULT now(),
   next_attempt_at timestamptz NOT NULL,
   PRIMARY KEY (item_id, kind)
 );
+
+CREATE INDEX enrichment_failures_by_attempt ON enrichment_failures (last_attempt_at);
 
 -- The closed set of tags a model may choose from, split into approved and
 -- candidate.

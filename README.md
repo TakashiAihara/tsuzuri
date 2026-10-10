@@ -230,23 +230,27 @@ CHAT_MODEL=qwen3 \
   bun run apps/daemon/src/index.ts
 ```
 
-Three providers ship, one per wire format, and nothing else is added to reach them:
+Three providers ship, one per wire format, and nothing else is added to reach them. What each one posts to is listed here because it is what to point `CHAT_BASE_URL` at, not because the endpoint's behaviour is claimed:
 
-| Provider | Use it for |
+| Provider | Request |
 | --- | --- |
-| `openai-compatible` | Anything speaking the OpenAI chat format: Ollama, LM Studio, vLLM, OpenRouter, OpenAI itself |
-| `anthropic` | The Anthropic Messages API |
-| `gemini` | The Google Generative Language API |
+| `openai-compatible` | `POST {CHAT_BASE_URL}/chat/completions`, the system prompt as a message |
+| `anthropic` | `POST {CHAT_BASE_URL}/v1/messages`, the system prompt as a top-level field |
+| `gemini` | `POST {CHAT_BASE_URL}/v1beta/models/{CHAT_MODEL}:generateContent`, the system prompt as `systemInstruction` |
 
-`CHAT_API_KEY` is optional — local runtimes usually need none. `CHAT_PROVIDER` set without `CHAT_BASE_URL` or `CHAT_MODEL` is a startup error naming the variable, exactly as for embeddings: a typo in a feature that is quietly off is the failure mode that costs the most time.
+`CHAT_API_KEY` is optional — local runtimes usually need none. `CHAT_PROVIDER` set without `CHAT_BASE_URL` or `CHAT_MODEL`, or with a `CHAT_BASE_URL` that is not a URL, is a startup error naming the variable, exactly as for embeddings: a typo in a feature that is quietly off is the failure mode that costs the most time.
 
-A pass runs over the top of the ranked list — a widely syndicated story is summarised once, through its representative, rather than eight times — plus every starred article whatever its rank. Every answer records the model and the prompt version that wrote it, so **changing the chat model costs nothing but the calls**, unlike an embedding model:
+A pass runs over the top of the ranked list — a widely syndicated story is summarised once, through its representative, rather than eight times — plus every starred article whatever its rank and whichever report of it that is. Every answer records the model and the prompt version that wrote it, so **changing the chat model costs nothing but the calls**, unlike an embedding model:
 
 ```bash
 # Change CHAT_MODEL in the environment first, restart, then replay the period
 # you want the new model to answer for. Both answers survive, side by side.
 tsuzuri enrich --since 7d --kind summary --force
 ```
+
+`--force` replays a period without letting what this build has already answered stop it, and it is what gets past the retry backoff an article is waiting out after a refusal. Each call moves on from the articles the one before it wrote, so a run the hourly bound cut short reaches the rest when you run it again.
+
+An article whose current combination the model has not answered is left alone rather than being retried against the same configuration, so a wrong key or an output bound that is too small stops the pass instead of parking every article behind a backoff. When that happens, `tsuzuri doctor` names it under `features.llm.lastError` — nothing in the database records it, because it is equally true of every article.
 
 `tsuzuri enrich` is bounded by `ENRICH_MAX_ITEMS_PER_HOUR`, and says so when the bound is what stopped it — a run that quietly did half of what you asked looks exactly like a run with nothing to do.
 
@@ -256,18 +260,18 @@ tsuzuri enrich --since 7d --kind summary --force
 | `CHAT_BASE_URL` | — | Required once a provider is set |
 | `CHAT_API_KEY` | — | Optional; local runtimes usually need none |
 | `CHAT_MODEL` | — | Required once a provider is set |
-| `CHAT_MAX_OUTPUT_TOKENS` | `1024` | Bound on one answer. A long body needs more |
+| `CHAT_MAX_OUTPUT_TOKENS` | `1024` | Bound on one answer. A body translation asks for eight times this |
 | `CHAT_REQUEST_TIMEOUT_MS` | `120000` | Per-request deadline |
 | `ENRICH_SUMMARY` | `true` | Summarise |
 | `ENRICH_TAGS` | `true` | Suggest tags |
 | `ENRICH_TRANSLATE_TO` | — | Target language. Unset means no translation |
 | `ENRICH_TOP_N` | `20` | Ranked articles considered per pass |
 | `ENRICH_WINDOW_HOURS` | `48` | How far back a pass looks |
-| `ENRICH_MAX_ITEMS_PER_HOUR` | `60` | Spend bound |
+| `ENRICH_MAX_ITEMS_PER_HOUR` | `60` | Spend bound, counting calls that failed as well as calls that answered |
 | `ENRICH_CONCURRENCY` | `2` | Concurrent requests |
-| `TAG_CANDIDATE_PROMOTION_THRESHOLD` | `5` | Times a tag must be suggested before `tsuzuri tags review` lists it |
+| `TAG_CANDIDATE_PROMOTION_THRESHOLD` | `5` | Articles a suggested tag must have come up for before `tsuzuri tags review` lists it |
 
-Listings and search return the model's summary where one exists and the feed's where it does not, and carry `summarySource` beside it — `model` or `feed`. Without that field there is no way to tell from a response whether enrichment is doing anything, which is the same problem `mode` and `reason` solve on a search.
+Listings and search return the model's summary where one exists and the feed's where it does not, and carry `summarySource` beside it — `model` or `feed`. Without that field there is no way to tell from a response whether enrichment is doing anything, which is the same problem `mode` and `reason` solve on a search. `tsuzuri show <id>` prints the same three things for one article: the model's summary, the translated title and summary, and the tags attached to it.
 
 **Tags are suggestions until you approve them.** No vocabulary ships with tsuzuri: seeding one would put somebody's interests into every installation. So tagging starts in suggest-only mode — candidates accumulate, and nothing is attached to anything until you decide:
 
@@ -277,7 +281,11 @@ tsuzuri tags approve rust     # now a real tag, and offered to the model from no
 tsuzuri tags reject crypto-cats
 ```
 
-An empty list in the first days is the documented behaviour, not a broken feature.
+An empty list in the first days is the documented behaviour, not a broken feature. Two things about a decision are worth knowing before you make it. **Rejecting** a tag takes it off every article carrying it — the filter you use today stops matching — because a rejection is an answer about the word, not only about future prompts. **Approving** one does not go back over articles that already named it, since the pass that named them never saw it as approved; to attach it to them, replay the tagging over the period you care about:
+
+```bash
+tsuzuri enrich --since 30d --kind tags --force
+```
 
 Translation covers the title and the summary, not the body: a body is a large call on text you may never open, and the point of a translated summary is deciding whether to read the body at all. When you have decided, ask for it — one article, once, and stored so a second ask is free:
 
@@ -285,13 +293,15 @@ Translation covers the title and the summary, not the body: a body is a large ca
 tsuzuri translate 4f2a91c7
 ```
 
-Enrichments accumulate, because the comparison between two prompt versions is the reason the rows are kept. Deleting them is a deliberate act, never a timer:
+A body longer than 8,000 characters is refused rather than translated up to that point. A translation that stops mid-article reads like a translation, and nobody finds out that half of it is missing until they have read it in the wrong language.
+
+Enrichments accumulate, because the comparison between two prompt versions is the reason the rows are kept. Deleting them is a deliberate act, never a timer, and there is no way to ask for one that keeps nothing:
 
 ```bash
 tsuzuri enrich prune --keep-current   # drops every other model and prompt version
 ```
 
-`tsuzuri doctor` reports whether a model is configured, which one, the prompt versions this build would write under, and how much has been summarised, tagged, translated or failed.
+`tsuzuri doctor` reports whether a model is configured, which one, the prompt versions this build would write under, how much has been summarised, tagged, translated or failed, and the last error a pass refused to charge to an article.
 
 ## MCP server
 

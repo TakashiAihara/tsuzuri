@@ -49,28 +49,6 @@ const REQUEST: ChatRequest = {
   maxOutputTokens: 256,
 };
 
-describe("prompt versions", () => {
-  test("each prompt has its own version, so one can change without the others", () => {
-    expect(SUMMARY_PROMPT_VERSION).toBe("summary.v1");
-    expect(TRANSLATION_PROMPT_VERSION).toBe("translation.v1");
-    expect(TAGS_PROMPT_VERSION).toBe("tags.v1");
-    expect(BODY_TRANSLATION_PROMPT_VERSION).toBe("translation-body.v1");
-
-    const versions = new Set([
-      summaryPrompt.version,
-      translationPrompt("Japanese").version,
-      tagsPrompt([]).version,
-      bodyTranslationPrompt("Japanese").version,
-    ]);
-    expect(versions.size).toBe(4);
-  });
-
-  test("a built prompt carries the version it was built from", () => {
-    expect(summaryPrompt.version).toBe(SUMMARY_PROMPT_VERSION);
-    expect(tagsPrompt(["ai"]).version).toBe(TAGS_PROMPT_VERSION);
-  });
-});
-
 describe("prompt text", () => {
   test("the summary prompt asks for a JSON object and not for prose alone", () => {
     expect(summaryPrompt.system).toContain("JSON");
@@ -112,8 +90,8 @@ describe("prompt text", () => {
     // row per (item, kind, lang, model, prompt version). A shared version would
     // have `tsuzuri translate <id>` overwrite the title and summary the pass
     // wrote, and the other way round.
+    expect(BODY_TRANSLATION_PROMPT_VERSION).not.toBe(TRANSLATION_PROMPT_VERSION);
     expect(BODY_TRANSLATION_PROMPT_VERSION).toBe("translation-body.v1");
-    expect(bodyTranslationPrompt("English").version).not.toBe(translationPrompt("English").version);
   });
 });
 
@@ -171,6 +149,51 @@ describe("completeJson", () => {
     expect(asked).toHaveLength(1);
   });
 
+  test("reads the object out of an answer that wrapped it in prose", async () => {
+    // A model that introduces the answer and signs off after it has answered
+    // the question correctly, and spending the retry on it buys nothing.
+    const { provider, asked } = stubProvider([
+      'Here is the summary you asked for:\n```json\n{"summary": "a short summary"}\n```\nLet me know if you need more detail.',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("takes the fenced block over a brace somewhere in the prose around it", async () => {
+    // Falling back to the outermost braces here would span from the model's
+    // running commentary to the end of the answer, and spend the retry on JSON
+    // that was never going to parse.
+    const { provider, asked } = stubProvider([
+      'I looked at {"unclear": true} and then:\n```json\n{"summary": "a short summary"}\n```',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("takes the outermost object when there is no fence at all", async () => {
+    const { provider, asked } = stubProvider([
+      'Sure. {"summary": "a short summary"} Hope that helps.',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("a brace inside a string value does not end the object early", async () => {
+    // The outermost span is what makes this parse: stopping at the first "}"
+    // would hand JSON.parse half an object and spend the retry on it.
+    const { provider, asked } = stubProvider(['{"summary": "the {brace} inside a quote"}']);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "the {brace} inside a quote" });
+    expect(asked).toHaveLength(1);
+  });
+
   test("retries once with the reason, and takes the second answer", async () => {
     const { provider, asked } = stubProvider([
       "I am afraid I cannot summarise that.",
@@ -215,11 +238,41 @@ describe("completeJson", () => {
     // ChatError says the endpoint or the request failed. Retrying it inside
     // this function would turn a transport failure into a parse failure and
     // charge the article for the endpoint's outage.
-    const failure = new ChatError("chat request failed (503)", true);
+    const failure = new ChatError("chat request failed (503)", "retryable");
     const { provider, asked } = stubProvider([failure, '{"summary": "unused"}']);
 
     await expect(completeJson(provider, REQUEST, summaryReplySchema)).rejects.toThrow(ChatError);
     expect(asked).toHaveLength(1);
+  });
+
+  test("an aborted signal reaches the provider rather than racing it", async () => {
+    const { provider, asked } = stubProvider(['{"summary": "unused"}']);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      completeJson(provider, REQUEST, summaryReplySchema, controller.signal),
+    ).rejects.toBeDefined();
+    expect(asked).toHaveLength(0);
+  });
+
+  test("the caller's signal is handed to every attempt", async () => {
+    const seen: (AbortSignal | undefined)[] = [];
+    const answers = ["not json", '{"summary": "a short summary"}'];
+    const provider: ChatProvider = {
+      id: "openai-compatible",
+      model: "stub-model",
+      async complete(_request, signal) {
+        seen.push(signal);
+        return answers.shift() ?? '{"summary": "unused"}';
+      },
+    };
+    const controller = new AbortController();
+
+    await completeJson(provider, REQUEST, summaryReplySchema, controller.signal);
+
+    // Both attempts, so a shutdown between them still reaches the second.
+    expect(seen).toEqual([controller.signal, controller.signal]);
   });
 
   test("answers a tag prompt with the tags chosen and the candidates named", async () => {
@@ -239,5 +292,20 @@ describe("completeJson", () => {
     const { provider } = stubProvider([JSON.stringify({ text: "本文" })]);
     const result = await completeJson(provider, REQUEST, bodyTranslationReplySchema);
     expect(result).toEqual({ text: "本文" });
+  });
+});
+
+describe("prompt versions", () => {
+  test("each prompt has a version of its own, so one can change alone", () => {
+    // The version is what goes in the primary key, so two prompts sharing one
+    // would overwrite each other's answers for the same article.
+    const versions = [
+      SUMMARY_PROMPT_VERSION,
+      TRANSLATION_PROMPT_VERSION,
+      TAGS_PROMPT_VERSION,
+      BODY_TRANSLATION_PROMPT_VERSION,
+    ];
+    expect(versions).toEqual(["summary.v1", "translation.v1", "tags.v1", "translation-body.v1"]);
+    expect(new Set(versions).size).toBe(4);
   });
 });

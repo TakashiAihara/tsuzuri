@@ -8,15 +8,17 @@ import {
   attachTags,
   clearEnrichmentFailure,
   currentEnrichments,
-  enrichedItemsSince,
+  enrichmentAttemptsSince,
   enrichmentCandidates,
   enrichmentCounts,
   enrichmentInputs,
+  kindsInBackoff,
   pruneEnrichments,
   recordEnrichmentFailure,
   setTagStatus,
   suggestTag,
   tagsForReview,
+  tagsOfItems,
   writeEnrichment,
 } from "./enrichments.ts";
 import { migrate } from "./migrate.ts";
@@ -464,17 +466,48 @@ describeIfDb("enrichments", () => {
   });
 
   describe("the tag vocabulary", () => {
+    /**
+     * One stored `tags` enrichment, which is what an observation is counted
+     * from. Written through writeEnrichment so the count and the row the
+     * daemon would have written are the same thing.
+     */
+    async function suggestedBy(...itemIds: string[]) {
+      for (const itemId of itemIds) {
+        await writeEnrichment(handle.sql, {
+          itemId,
+          kind: "tags",
+          model: MODEL,
+          promptVersion: "tags.v1",
+          content: { tags: [], candidates: ["query-planners"] },
+        });
+      }
+    }
+
+    /** Store the enrichment a given set of articles would have produced. */
+    async function namedBy(itemId: string, slugs: string[]) {
+      await writeEnrichment(handle.sql, {
+        itemId,
+        kind: "tags",
+        model: MODEL,
+        promptVersion: "tags.v1",
+        content: { tags: [], candidates: slugs },
+      });
+      for (const slug of slugs) await suggestTag(handle.sql, slug, slug);
+    }
+
     beforeEach(async () => {
       await handle.sql`
         INSERT INTO items (id, url, canonical_url, published_at, search_text)
         VALUES ('a', 'https://example.com/a', 'https://example.com/a', '2026-10-01', 'body a'),
-               ('b', 'https://example.com/b', 'https://example.com/b', '2026-10-01', 'body b')
+               ('b', 'https://example.com/b', 'https://example.com/b', '2026-10-01', 'body b'),
+               ('c', 'https://example.com/c', 'https://example.com/c', '2026-10-01', 'body c')
       `;
     });
 
     test("a suggested tag starts as a candidate with one observation", async () => {
       type Candidate = { slug: string; label: string; status: string; observations: number };
 
+      await suggestedBy("a");
       await suggestTag(handle.sql, "query-planners", "Query planners");
 
       const [row] = await rows<Candidate>(handle.sql`
@@ -488,22 +521,61 @@ describeIfDb("enrichments", () => {
       });
     });
 
-    test("the same suggestion again is counted rather than duplicated", async () => {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+    test("one article re-run five times is one observation, not five", async () => {
+      // The number answers "how many articles is this about". Counting
+      // proposals would let a single article reach the promotion threshold on
+      // its own, which is the question a threshold exists to ask.
+      await suggestedBy("a");
+      for (let attempt = 0; attempt < 5; attempt += 1) {
         await suggestTag(handle.sql, "query-planners", "Query planners");
       }
 
-      const [row] = await rows<{ slug: string; label: string; observations: number }>(handle.sql`
-        SELECT slug, label, observations FROM tag_vocabulary
+      const [row] = await rows<{ observations: number }>(handle.sql`
+        SELECT observations FROM tag_vocabulary WHERE slug = 'query-planners'
       `);
-      expect(row).toEqual({ slug: "query-planners", label: "Query planners", observations: 3 });
+      expect(row).toEqual({ observations: 1 });
+    });
+
+    test("three articles that named it is three observations", async () => {
+      await suggestedBy("a", "b", "c");
+      await suggestTag(handle.sql, "query-planners", "Query planners");
+
+      const [row] = await rows<{ observations: number }>(handle.sql`
+        SELECT observations FROM tag_vocabulary WHERE slug = 'query-planners'
+      `);
+      expect(row).toEqual({ observations: 3 });
+    });
+
+    test("an article that named two tags counts once for each", async () => {
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "tags",
+        model: MODEL,
+        promptVersion: "tags.v1",
+        content: { tags: ["vulkan"], candidates: ["query-planners"] },
+      });
+      await suggestTag(handle.sql, "query-planners", "Query planners");
+      await suggestTag(handle.sql, "vulkan", "Vulkan");
+
+      const found = await rows<{ slug: string; observations: number }>(handle.sql`
+        SELECT slug, observations FROM tag_vocabulary ORDER BY slug
+      `);
+      // The suggestion under `candidates` counts as much as one under `tags`:
+      // both are one article naming this concept.
+      expect(found).toEqual([
+        { slug: "query-planners", observations: 1 },
+        { slug: "vulkan", observations: 1 },
+      ]);
     });
 
     test("an approved tag is not dragged back into candidacy by a later suggestion", async () => {
+      await suggestedBy("a");
       await suggestTag(handle.sql, "query-planners", "Query planners");
+      await suggestedBy("b");
       await suggestTag(handle.sql, "query-planners", "Query planners");
       expect(await setTagStatus(handle.sql, "query-planners", "approved")).toBe(true);
 
+      await suggestedBy("b");
       await suggestTag(handle.sql, "query-planners", "Query planners");
 
       const [row] = await rows<{ status: string; observations: number }>(handle.sql`
@@ -513,9 +585,11 @@ describeIfDb("enrichments", () => {
     });
 
     test("a rejected tag is not revived by a later suggestion either", async () => {
+      await suggestedBy("a");
       await suggestTag(handle.sql, "query-planners", "Query planners");
       expect(await setTagStatus(handle.sql, "query-planners", "rejected")).toBe(true);
 
+      await suggestedBy("b");
       await suggestTag(handle.sql, "query-planners", "Query planners");
 
       const [row] = await rows<{ status: string; observations: number }>(handle.sql`
@@ -555,25 +629,26 @@ describeIfDb("enrichments", () => {
       expect(await approvedTags(handle.sql)).toEqual(["apparmor", "zanzibar"]);
     });
 
-    test("review lists the candidates at or above the threshold, most proposed first", async () => {
-      for (const slug of ["vulkan", "zanzibar", "apparmor"]) {
-        await suggestTag(handle.sql, slug, slug);
-      }
-      await suggestTag(handle.sql, "zanzibar", "zanzibar");
-      await suggestTag(handle.sql, "apparmor", "apparmor");
-      await setTagStatus(handle.sql, "vulkan", "approved");
+    test("review lists the candidates at or above the threshold, most seen first", async () => {
+      // Three articles naming different sets, so the counts differ by how many
+      // articles named them rather than by how often.
+      await namedBy("a", ["vulkan", "zanzibar", "apparmor"]);
+      await namedBy("b", ["vulkan", "zanzibar"]);
+      await namedBy("c", ["vulkan"]);
+      await setTagStatus(handle.sql, "apparmor", "approved");
 
       expect((await tagsForReview(handle.sql, 2)).map((row) => row.slug)).toEqual([
-        "apparmor",
+        "vulkan",
         "zanzibar",
       ]);
-      expect(await tagsForReview(handle.sql, 3)).toEqual([]);
+      // Only vulkan was named by three articles.
+      expect((await tagsForReview(handle.sql, 3)).map((row) => row.slug)).toEqual(["vulkan"]);
     });
 
-    test("an approved tag is not waiting for review, however often it was proposed", async () => {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        await suggestTag(handle.sql, "vulkan", "Vulkan");
-      }
+    test("an approved tag is not waiting for review, however many articles named it", async () => {
+      await namedBy("a", ["vulkan"]);
+      await namedBy("b", ["vulkan"]);
+      await suggestTag(handle.sql, "vulkan", "vulkan");
       await setTagStatus(handle.sql, "vulkan", "approved");
 
       expect(await tagsForReview(handle.sql, 1)).toEqual([]);
@@ -628,19 +703,39 @@ describeIfDb("enrichments", () => {
       expect(attached).toEqual([{ item: "a" }]);
     });
 
-    test("a withdrawn approval attaches the tag nowhere new", async () => {
+    test("a withdrawn approval detaches the tag from the articles it was on", async () => {
       await suggestTag(handle.sql, "vulkan", "Vulkan");
       await setTagStatus(handle.sql, "vulkan", "approved");
       const ids = await tagIds(handle);
       await attachTags(handle.sql, "a", [ids.get("vulkan") as string], "model");
 
       await setTagStatus(handle.sql, "vulkan", "rejected");
-      expect(await attachTags(handle.sql, "b", [ids.get("vulkan") as string], "model")).toBe(0);
 
+      // The filter somebody uses today must not keep the tag on the articles
+      // it was on: a rejection is an answer about the word, not about the past.
       const attached = await rows<{ item: string }>(handle.sql`
         SELECT item_id AS item FROM item_tags
       `);
-      expect(attached).toEqual([{ item: "a" }]);
+      expect(attached).toEqual([]);
+      // And it attaches nowhere new either.
+      expect(await attachTags(handle.sql, "b", [ids.get("vulkan") as string], "model")).toBe(0);
+    });
+
+    test("approving leaves the articles it was not on alone", async () => {
+      await suggestTag(handle.sql, "vulkan", "Vulkan");
+      await setTagStatus(handle.sql, "vulkan", "approved");
+      const ids = await tagIds(handle);
+      await attachTags(handle.sql, "a", [ids.get("vulkan") as string], "model");
+      await handle.sql`
+        INSERT INTO enrichments (item_id, kind, model, prompt_version, content)
+        VALUES ('b', 'tags', ${MODEL}, 'tags.v1', '{"tags":["vulkan"],"candidates":[]}'::jsonb)
+      `;
+
+      // Approving makes it a tag from now on. It does not go and attach it to
+      // the article that already named it and never got it: that is
+      // `tsuzuri enrich --kind tags --force`, and doing it here would attach a
+      // tag on the strength of a row no pass wrote with an approved tag in it.
+      expect(await tagsOfItems(handle.sql, ["a", "b"])).toEqual(new Map([["a", ["vulkan"]]]));
     });
 
     test("attaching the same tag twice is not a second row", async () => {
@@ -692,6 +787,32 @@ describeIfDb("enrichments", () => {
         SELECT count(*)::int AS count FROM item_tags
       `);
       expect(attached).toEqual([{ count: 0 }]);
+    });
+
+    test("reads the tags of several articles at once, by slug", async () => {
+      await suggestTag(handle.sql, "vulkan", "Vulkan");
+      await suggestTag(handle.sql, "zanzibar", "Zanzibar");
+      await setTagStatus(handle.sql, "vulkan", "approved");
+      await setTagStatus(handle.sql, "zanzibar", "approved");
+      const ids = await tagIds(handle);
+
+      await attachTags(handle.sql, "a", [ids.get("vulkan") as string], "model");
+      await attachTags(
+        handle.sql,
+        "b",
+        [ids.get("vulkan") as string, ids.get("zanzibar") as string],
+        "model",
+      );
+
+      // One map rather than one query per article: a listing would otherwise
+      // make fifty round trips to render fifty rows.
+      expect(await tagsOfItems(handle.sql, ["a", "b", "untagged"])).toEqual(
+        new Map([
+          ["a", ["vulkan"]],
+          ["b", ["vulkan", "zanzibar"]],
+        ]),
+      );
+      expect(await tagsOfItems(handle.sql, [])).toEqual(new Map());
     });
   });
 
@@ -761,7 +882,7 @@ describeIfDb("enrichments", () => {
       });
 
       const { candidates, matched } = await select();
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["middle", "old"]);
+      expect(candidates).toEqual(["middle", "old"]);
       expect(matched).toBe(2);
     });
 
@@ -785,7 +906,7 @@ describeIfDb("enrichments", () => {
       });
 
       const { candidates } = await select();
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(candidates).toEqual(["a"]);
     });
 
     test("a previous prompt version does not make an item enriched", async () => {
@@ -799,7 +920,7 @@ describeIfDb("enrichments", () => {
       });
 
       const { candidates } = await select();
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(candidates).toEqual(["a"]);
     });
 
     test("an item missing one wanted kind is still a candidate for the others", async () => {
@@ -815,7 +936,7 @@ describeIfDb("enrichments", () => {
       const withTags = await select({
         wanted: [...wantSummary, { kind: "tags", promptVersion: "tags.v1" }],
       });
-      expect(withTags.candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(withTags.candidates).toEqual(["a"]);
       expect((await select()).candidates).toEqual([]);
     });
 
@@ -828,7 +949,7 @@ describeIfDb("enrichments", () => {
       const { candidates } = await select({
         wanted: [...wantSummary, { kind: "tags", promptVersion: "tags.v1" }],
       });
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(candidates).toEqual(["a"]);
 
       // The summary alone is inside its backoff, so the item waits.
       expect((await select()).candidates).toEqual([]);
@@ -845,10 +966,13 @@ describeIfDb("enrichments", () => {
       );
 
       const { candidates } = await select();
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(candidates).toEqual(["a"]);
     });
 
-    test("--force re-runs an item that already has a row", async () => {
+    test("--force treats a row written before this request as answering the item", async () => {
+      // The cutoff is the instant the request began. A row older than that is
+      // an answer somebody already has, and re-running over it on every call is
+      // what stops a bounded rerun from ever reaching past the newest items.
       await seed([{ id: "a", hoursAgo: 1 }]);
       await writeEnrichment(handle.sql, {
         itemId: "a",
@@ -858,8 +982,24 @@ describeIfDb("enrichments", () => {
         content: { summary: "already summarised" },
       });
 
+      const { candidates } = await select({ force: true, now: new Date(Date.now() + 1000) });
+      expect(candidates).toEqual([]);
+    });
+
+    test("--force re-runs an item whose row is from another prompt version", async () => {
+      // The point of the flag: a prompt change writes a new row beside the old
+      // one, and evaluating it needs the items that already have one.
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await writeEnrichment(handle.sql, {
+        itemId: "a",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: "summary.v0",
+        content: { summary: "written by the old prompt" },
+      });
+
       const { candidates } = await select({ force: true });
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["a"]);
+      expect(candidates).toEqual(["a"]);
     });
 
     test("since reaches back past the window a pass looks at", async () => {
@@ -869,7 +1009,7 @@ describeIfDb("enrichments", () => {
 
       expect((await select()).candidates).toEqual([]);
       const { candidates } = await select({ since: new Date(Date.now() - 30 * 24 * 3600_000) });
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["ancient"]);
+      expect(candidates).toEqual(["ancient"]);
     });
 
     test("the starred arm returns starred items however old they are", async () => {
@@ -881,7 +1021,7 @@ describeIfDb("enrichments", () => {
       ]);
 
       const { candidates } = await select({ starredOnly: true });
-      expect(candidates).toEqual([{ id: "stale-star", starred: true }]);
+      expect(candidates).toEqual(["stale-star"]);
     });
 
     test("only the cluster representative is a candidate while clustering is on", async () => {
@@ -901,9 +1041,84 @@ describeIfDb("enrichments", () => {
       `;
 
       const collapsed = await select({ collapse: true });
-      expect(collapsed.candidates.map((candidate) => candidate.id)).toEqual(["wire"]);
+      expect(collapsed.candidates).toEqual(["wire"]);
       const expanded = await select({ collapse: false });
-      expect(expanded.candidates.map((candidate) => candidate.id)).toEqual(["copy", "wire"]);
+      expect(expanded.candidates).toEqual(["copy", "wire"]);
+    });
+
+    test("a starred copy is a candidate however its cluster is represented", async () => {
+      // The representative filter answers "one story is one call", which is
+      // about the ranked arm choosing articles to spend on. A star names one
+      // article, and the article somebody starred is not made less interesting
+      // by another outlet having published it first.
+      await seed([
+        { id: "wire", hoursAgo: 2 },
+        { id: "copy", hoursAgo: 1, starred: true },
+      ]);
+      await handle.sql`
+        INSERT INTO clusters (representative_item_id, size, first_published_at, last_published_at)
+        VALUES ('wire', 2, now() - make_interval(hours => 2), now())
+      `;
+      await handle.sql`
+        INSERT INTO item_clusters (item_id, cluster_id)
+        SELECT item.id, c.id FROM items item, clusters c WHERE c.representative_item_id = 'wire'
+      `;
+
+      const collapsed = await select({ collapse: true });
+      expect(collapsed.candidates).toEqual(["wire"]);
+
+      const starred = await select({ collapse: true, starredOnly: true });
+      expect(starred.candidates).toEqual(["copy"]);
+    });
+
+    test("--force ignores the retry backoff, which is what it is for", async () => {
+      // An explicit rerun asked for by a person is the decision the backoff was
+      // waiting for. Without this the flag would be indistinguishable from not
+      // passing it, since every item it wants has no row for the version being
+      // replayed.
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await recordEnrichmentFailure(handle.sql, "a", "summary", "the model refused");
+
+      expect((await select()).candidates).toEqual([]);
+      expect((await select({ force: true })).candidates).toEqual(["a"]);
+    });
+
+    test("--force moves on after the items the previous call wrote", async () => {
+      // Without the cutoff, a rerun limited by the hourly bound re-picks the
+      // same newest items every time and never reaches the rest.
+      await seed([
+        { id: "newest", hoursAgo: 1 },
+        { id: "older", hoursAgo: 2 },
+      ]);
+
+      const first = await select({ force: true, limit: 1, now: new Date(Date.now() - 1000) });
+      expect(first.candidates).toEqual(["newest"]);
+
+      await writeEnrichment(handle.sql, {
+        itemId: "newest",
+        kind: "summary",
+        model: MODEL,
+        promptVersion: PROMPT_VERSION,
+        content: { summary: "written by that request" },
+      });
+
+      // The next request begins after that row was written, so it reads as the
+      // answer it is and the item behind it is chosen instead.
+      const second = await select({ force: true, limit: 1 });
+      expect(second.candidates).toEqual(["older"]);
+    });
+
+    test("without --force the backoff filter still holds, and with it the kinds are listed", async () => {
+      // The selection query filters on backoff; enrichOne asks per kind so an
+      // item chosen for one kind does not pay for another that is waiting.
+      await seed([{ id: "a", hoursAgo: 1 }]);
+      await recordEnrichmentFailure(handle.sql, "a", "summary", "refused");
+
+      expect(await kindsInBackoff(handle.sql, "a")).toEqual(new Set(["summary"]));
+      // A backoff from an hour ago is not holding anything.
+      expect(await kindsInBackoff(handle.sql, "a", new Date(Date.now() + 2 * 60 * 60_000))).toEqual(
+        new Set(),
+      );
     });
 
     test("the limit bounds the list, and matched still counts the rest", async () => {
@@ -914,7 +1129,7 @@ describeIfDb("enrichments", () => {
       ]);
 
       const { candidates, matched } = await select({ limit: 2 });
-      expect(candidates.map((candidate) => candidate.id)).toEqual(["c", "b"]);
+      expect(candidates).toEqual(["c", "b"]);
       // So a pass that stops at the hourly bound can report a backlog rather
       // than a truncated list it believes is all of it.
       expect(matched).toBe(3);
@@ -1017,7 +1232,10 @@ describeIfDb("enrichments", () => {
       ).toEqual({ summarised: 0, tagged: 0, translated: 0, failed: 1 });
     });
 
-    test("the hourly bound counts items answered since an instant, once each", async () => {
+    test("the hourly bound counts attempts, so a model that answers nothing spends nothing", async () => {
+      // Successes and failures alike: a bound counted over successes is not a
+      // bound, because an endpoint refusing every article writes no rows and
+      // would be called again every pass, forever.
       for (const kind of ["summary", "tags"] as const) {
         await writeEnrichment(handle.sql, {
           itemId: "a",
@@ -1034,9 +1252,30 @@ describeIfDb("enrichments", () => {
         promptVersion: "summary.v1",
         content: { summary: "s" },
       });
+      await recordEnrichmentFailure(handle.sql, "b", "tags", "refused");
 
-      expect(await enrichedItemsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(2);
-      expect(await enrichedItemsSince(handle.sql, new Date(Date.now() + 3600_000))).toBe(0);
+      // Two items answered and one that failed: three items of spend, not five.
+      expect(await enrichmentAttemptsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(3);
+      expect(await enrichmentAttemptsSince(handle.sql, new Date(Date.now() + 3600_000))).toBe(0);
+    });
+
+    test("an item failing twice is one item of spend, not two calls of budget", async () => {
+      await recordEnrichmentFailure(handle.sql, "a", "summary", "refused");
+      await recordEnrichmentFailure(handle.sql, "a", "tags", "refused");
+
+      expect(await enrichmentAttemptsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(1);
+    });
+
+    test("a failure from yesterday does not count against today's hour", async () => {
+      await recordEnrichmentFailure(
+        handle.sql,
+        "a",
+        "summary",
+        "refused",
+        new Date(Date.now() - 3 * 60 * 60_000),
+      );
+
+      expect(await enrichmentAttemptsSince(handle.sql, new Date(Date.now() - 3600_000))).toBe(0);
     });
   });
 

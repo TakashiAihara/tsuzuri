@@ -109,9 +109,10 @@ try {
  * The chat model, resolved once.
  *
  * A half-configured provider is a startup error rather than silence, and the
- * configuration schema has already refused it, so this cannot throw here: the
- * point of building it here is that /doctor can report the model it will use
- * from the first request.
+ * configuration schema has already refused a missing base URL or model and a
+ * base URL that is not a URL, so what remains here is a model this daemon can
+ * name. The point of building it here is that /doctor can report the model it
+ * will use from the first request.
  */
 const chat = createChatProvider({
   provider: config.CHAT_PROVIDER,

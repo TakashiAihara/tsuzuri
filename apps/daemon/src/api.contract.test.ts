@@ -209,6 +209,50 @@ describeIfDb("api contract", () => {
     expect(body.bounded).toBe(false);
   });
 
+  test("POST /enrich takes force as the boolean a client sends", async () => {
+    // z.stringbool() reads "true" from a query string and rejects the boolean
+    // every JSON client sends, so `--force` was a 400 for the CLI. Both forms
+    // have to reach the handler; the string form is refused, in the table below.
+    await handle.sql`
+      INSERT INTO item_sources (item_id, source_id)
+      VALUES (${TWIN_A}, '11111111-1111-1111-1111-111111111111')
+    `;
+    const withoutForce = await parsed(enrichRunSchema, "/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ since: "7d", force: false }),
+    });
+    // The pass above already answered the article under test, so the twin is
+    // the only thing left in the period.
+    expect(withoutForce.summarised).toBe(1);
+
+    await handle.sql`
+      INSERT INTO item_sources (item_id, source_id)
+      VALUES (${TWIN_B}, '11111111-1111-1111-1111-111111111111')
+    `;
+    const withForce = await parsed(enrichRunSchema, "/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ since: "7d", force: true }),
+    });
+    expect(withForce.summarised).toBe(1);
+  });
+
+  test("GET /items/:id carries what the model said about the article", async () => {
+    // A summary, a translation and tags that nothing reads is not enrichment,
+    // it is cost, so they come back with the article.
+    const body = await parsed(itemResponseSchema, `/items/${ITEM_ID}`);
+
+    expect(body.item.id).toBe(ITEM_ID);
+    expect(body.enrichment?.summary).toBe("The model said this.");
+    expect(body.enrichment?.summarySource).toBe("model");
+    expect(body.enrichment?.translation).toEqual({
+      lang: "Japanese",
+      title: "題",
+      text: "要約",
+    });
+  });
+
   test("a listing carries the model's summary, and says where it came from", async () => {
     // The reason summarySource exists: without it a response cannot answer
     // whether enrichment is doing anything (D35).
@@ -270,12 +314,21 @@ describeIfDb("api contract", () => {
       VALUES (${ITEM_ID}, 'summary', 'contract-stub', 'summary.v0', '{"summary":"old prompt"}'::jsonb)
     `;
 
-    const body = await parsed(enrichPruneResponseSchema, "/enrich/prune", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ keepCurrent: true }),
-    });
+    // No body, and no way to send one: the endpoint always keeps the current
+    // combinations, because the alternative is a request that deletes every
+    // answer this installation has.
+    const body = await parsed(enrichPruneResponseSchema, "/enrich/prune", { method: "POST" });
     expect(body.pruned).toBe(1);
+  });
+
+  test("GET /doctor reports the last error a pass refused to charge to an item", async () => {
+    // A configuration error is true of every item equally, so nothing in the
+    // store records it and the field is the only thing that says why an
+    // install with a working model has stopped summarising.
+    const response = await app.fetch(new Request("http://test/doctor"));
+    const body = (await response.json()) as { features: { llm: unknown } };
+    const llm = llmStatusSchema.parse(body.features.llm);
+    expect(llm.lastError).toBeNull();
   });
 
   test("GET /doctor reports what enrichment is configured with", async () => {
@@ -287,7 +340,9 @@ describeIfDb("api contract", () => {
     expect(llm.provider).toBe("openai-compatible");
     expect(llm.model).toBe("contract-stub");
     expect(llm.promptVersions.summary).toBe("summary.v1");
-    expect(llm.counts.summarised).toBe(1);
+    // Three articles have been through the pass by now: the one under test and
+    // the two twins the force test attached to a subscription.
+    expect(llm.counts.summarised).toBe(3);
   });
 
   test("GET /interest/status", async () => {
@@ -326,13 +381,18 @@ describeIfDb("api contract", () => {
       { name: "unreadable since", path: "/search?q=x&since=whenever", status: 400 },
       // A rerun with no period would be the whole corpus in one request.
       { name: "enrich without a period", path: "/enrich", status: 400, init: { method: "POST" } },
-      // Naming nothing keeps nothing, so an unstated keepCurrent must not be
-      // read as "delete every enrichment this installation has".
+      // --force is a boolean in the body, because that is what every client
+      // sends. Read as a string it would be a 400 on `{"force": true}`, which
+      // is what the CLI sends.
       {
-        name: "prune without keepCurrent",
-        path: "/enrich/prune",
+        name: "force as the string a query would carry",
+        path: "/enrich",
         status: 400,
-        init: { method: "POST" },
+        init: {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ since: "7d", force: "true" }),
+        },
       },
       {
         name: "approve a tag nobody suggested",
