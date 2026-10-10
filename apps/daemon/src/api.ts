@@ -380,8 +380,7 @@ export function createApi(deps: ApiDeps) {
     if (!row) return c.json({ error: "not found" }, 404);
     // What a model said about it, beside the article. Writing a translation and
     // a set of tags nobody can read is not enrichment, it is cost.
-    const said = await enrichment.currentForItems([resolved.id]);
-    return c.json({ item: row, enrichment: said.get(resolved.id) ?? null });
+    return c.json({ item: row, enrichment: await enrichment.currentFor(resolved.id) });
   });
 
   /** Mark read / unread / starred. All of these feed interest scoring later. */
@@ -589,25 +588,42 @@ export function createApi(deps: ApiDeps) {
          * every other client sends.
          */
         force: z.boolean().default(false),
+        /**
+         * The instant a forced rerun measures against, as an ISO 8601 instant
+         * or a duration such as 1h.
+         *
+         * The value the last response returned, which is what makes a rerun
+         * continue past the articles the previous one wrote rather than
+         * re-picking them. Accepted as a string rather than as a Date so the
+         * error for an unreadable one is the same 400 an unreadable `since`
+         * gets.
+         */
+        forceBefore: z.string().trim().min(1).optional(),
       })
       .safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
 
     let since: Date;
+    let forceBefore: Date | null;
     try {
       // Trimmed and non-empty above, so parseSince answers with a Date or
       // throws; it returns null only for an absent value.
       since = parseSince(parsed.data.since) as Date;
+      forceBefore = parseSince(parsed.data.forceBefore) as Date | null;
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
 
     try {
+      // 200 with the counts even when the run was cut short: a configuration
+      // error after some items were written is not a request that failed, and
+      // answering 500 would tell the caller nothing was enriched.
       return c.json(
         await enrichment.runOver({
           since,
           kind: parsed.data.kind ?? null,
           force: parsed.data.force,
+          forceBefore,
         }),
       );
     } catch (error) {

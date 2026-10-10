@@ -25,10 +25,16 @@ CREATE TABLE enrichments (
   PRIMARY KEY (item_id, kind, lang, model, prompt_version)
 );
 
--- The hourly spend bound counts rows by when they were written, and nothing
--- reads enrichments by item any other way: the primary key already leads with
--- item_id, so an index on (item_id, kind) would only repeat it.
+-- The hourly spend bound seeds itself from rows by when they were written, and
+-- nothing reads enrichments by item any other way: the primary key already
+-- leads with item_id, so an index on (item_id, kind) would only repeat it.
 CREATE INDEX enrichments_by_created_at ON enrichments (created_at);
+
+-- The tag observation count reads the current model's current tags rows for one
+-- slug, and it is asked once per suggested slug, so without this the
+-- vocabulary scans the table every time a model names something new.
+CREATE INDEX enrichments_by_tags ON enrichments (model, prompt_version)
+  WHERE kind = 'tags';
 
 -- Items an enrichment call failed on, keyed by kind.
 --
@@ -36,9 +42,15 @@ CREATE INDEX enrichments_by_created_at ON enrichments (created_at);
 -- version, so without this one article the model refuses -- one that trips a
 -- content filter, one whose text is pathological -- is selected on every pass
 -- and blocks everything behind it forever.
+-- Keyed like enrichments, so a failure belongs to the model and prompt version
+-- that produced it: switching models must not inherit the old model's backoff,
+-- and two translation languages must not share one row.
 CREATE TABLE enrichment_failures (
   item_id         text NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-  kind            text NOT NULL,
+  kind            text NOT NULL CHECK (kind IN ('summary', 'translation', 'tags')),
+  lang            text NOT NULL DEFAULT '',
+  model           text NOT NULL,
+  prompt_version  text NOT NULL,
   failures        integer NOT NULL DEFAULT 1 CHECK (failures > 0),
   last_error      text,
   -- When the call was spent. next_attempt_at is computed from now and always
@@ -46,7 +58,7 @@ CREATE TABLE enrichment_failures (
   -- has to count failures as well as successes.
   last_attempt_at timestamptz NOT NULL DEFAULT now(),
   next_attempt_at timestamptz NOT NULL,
-  PRIMARY KEY (item_id, kind)
+  PRIMARY KEY (item_id, kind, lang, model, prompt_version)
 );
 
 CREATE INDEX enrichment_failures_by_attempt ON enrichment_failures (last_attempt_at);
@@ -63,7 +75,9 @@ CREATE TABLE tag_vocabulary (
   label        text NOT NULL,
   status       text NOT NULL DEFAULT 'candidate'
                CHECK (status IN ('approved', 'candidate', 'rejected')),
-  -- How many times a candidate has been suggested. The promotion threshold.
+  -- How many distinct articles this build has named this candidate, counted
+  -- from the tags enrichments rather than incremented. The promotion
+  -- threshold.
   observations integer NOT NULL DEFAULT 0,
   created_at   timestamptz NOT NULL DEFAULT now(),
   approved_at  timestamptz

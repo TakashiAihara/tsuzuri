@@ -195,17 +195,20 @@ async function postJson(
  * What a status says about the cause.
  *
  * 4xx asks for a different request and 5xx asks for another try, with 429 the
- * one 4xx that asks for another try. The four statuses that name a setup
- * mistake -- a key refused, a path that does not exist, a model that does not
- * exist, a body the endpoint will not accept -- are separated out because every
- * item would fail them identically, and parking every item behind a backoff for
- * a typo is how one wrong variable stops enrichment for a day.
+ * one 4xx that asks for another try. 401, 403 and 404 are separated out because
+ * every item would fail them identically: a key refused, a route that does not
+ * exist, a model that does not exist, and parking the whole corpus behind a
+ * backoff for a typo is how one wrong variable stops enrichment for a day.
+ *
+ * 400 is not one of them. It is the one 4xx that can be about the request: an
+ * article too long for the model's context is refused the same way a malformed
+ * body is, and the second is evidence about the article. Treating it as
+ * configuration would re-pick that article on every pass and blame the setup
+ * for something only a shorter article could fix.
  */
 function classifyStatus(status: number): ChatErrorKind {
   if (status === 429 || status >= 500) return "retryable";
-  if (status === 400 || status === 401 || status === 403 || status === 404) {
-    return "configuration";
-  }
+  if (status === 401 || status === 403 || status === 404) return "configuration";
   return "permanent";
 }
 

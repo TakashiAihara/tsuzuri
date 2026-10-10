@@ -327,9 +327,16 @@ CREATE TABLE enrichments (
 -- that count needs.
 CREATE INDEX enrichments_by_created_at ON enrichments (created_at);
 
+-- Corrected while implementing (2026-10-10, review of PR #41, decided by the
+-- author): keyed like enrichments. Keyed on (item_id, kind), a model switch
+-- inherited the old model's backoff, two translation languages shared a row,
+-- and doctor's failed count summed every model.
 CREATE TABLE enrichment_failures (
   item_id         text NOT NULL REFERENCES items (id) ON DELETE CASCADE,
-  kind            text NOT NULL,
+  kind            text NOT NULL CHECK (kind IN ('summary', 'translation', 'tags')),
+  lang            text NOT NULL DEFAULT '',
+  model           text NOT NULL,
+  prompt_version  text NOT NULL,
   failures        integer NOT NULL DEFAULT 1 CHECK (failures > 0),
   last_error      text,
   -- Added while implementing (2026-10-10, review of PR #41): the hourly bound
@@ -337,7 +344,7 @@ CREATE TABLE enrichment_failures (
   -- always in the future, so it cannot say when a call was spent.
   last_attempt_at timestamptz NOT NULL DEFAULT now(),
   next_attempt_at timestamptz NOT NULL,
-  PRIMARY KEY (item_id, kind)
+  PRIMARY KEY (item_id, kind, lang, model, prompt_version)
 );
 CREATE INDEX enrichment_failures_by_attempt ON enrichment_failures (last_attempt_at);
 

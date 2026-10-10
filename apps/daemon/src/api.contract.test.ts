@@ -18,7 +18,7 @@ import {
   tagsResponseSchema,
   translateResponseSchema,
 } from "@tsuzuri/api";
-import type { ChatProvider, ChatRequest } from "@tsuzuri/core";
+import { ChatError, type ChatProvider, type ChatRequest } from "@tsuzuri/core";
 import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
 import type { z } from "zod";
 
@@ -74,6 +74,14 @@ const chat: ChatProvider = {
 describeIfDb("api contract", () => {
   let handle: ReturnType<typeof createDatabase>;
   let app: ReturnType<typeof createApi>;
+  /**
+   * The rest of the daemon, kept for a second API instance.
+   *
+   * A refusal is not reachable through the chat provider the suite runs on --
+   * it answers everything -- so the handler that reports one is built here over
+   * a service whose model says no.
+   */
+  let deps: Omit<Parameters<typeof createApi>[0], "enrichment">;
 
   const ITEM_ID = `c0ffee11${"2".repeat(56)}`;
   // Two ids sharing a prefix, so the ambiguity path is actually reachable.
@@ -121,7 +129,7 @@ describeIfDb("api contract", () => {
       interest,
       provider: chat,
     });
-    app = createApi({
+    deps = {
       db: handle.db,
       sql: handle.sql,
       fetcher: fetch,
@@ -129,9 +137,27 @@ describeIfDb("api contract", () => {
       embeddings,
       interest,
       clustering,
-      enrichment,
-    });
+    };
+    app = createApi({ ...deps, enrichment });
   });
+
+  /** An API over a model that refuses everything with the given status. */
+  function refusingApp(): ReturnType<typeof createApi> {
+    return createApi({
+      ...deps,
+      enrichment: createEnrichmentService({
+        sql: handle.sql,
+        config: deps.config,
+        interest: deps.interest,
+        provider: {
+          id: "openai-compatible",
+          model: "contract-stub",
+          complete: () =>
+            Promise.reject(new ChatError("chat request failed (401)", "configuration")),
+        },
+      }),
+    });
+  }
 
   afterAll(async () => {
     await handle?.close();
@@ -213,29 +239,74 @@ describeIfDb("api contract", () => {
     // z.stringbool() reads "true" from a query string and rejects the boolean
     // every JSON client sends, so `--force` was a 400 for the CLI. Both forms
     // have to reach the handler; the string form is refused, in the table below.
-    await handle.sql`
-      INSERT INTO item_sources (item_id, source_id)
-      VALUES (${TWIN_A}, '11111111-1111-1111-1111-111111111111')
-    `;
+    for (const id of [TWIN_A, TWIN_B]) {
+      await handle.sql`
+        INSERT INTO item_sources (item_id, source_id)
+        VALUES (${id}, '11111111-1111-1111-1111-111111111111')
+      `;
+    }
+    const answered = await parsed(enrichRunSchema, "/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ since: "7d", force: false }),
+    });
+    expect(answered.summarised).toBe(2);
+
+    // The article under test was answered by the pass above, so these two calls
+    // differ in nothing but the flag.
     const withoutForce = await parsed(enrichRunSchema, "/enrich", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ since: "7d", force: false }),
     });
-    // The pass above already answered the article under test, so the twin is
-    // the only thing left in the period.
-    expect(withoutForce.summarised).toBe(1);
+    expect(withoutForce.items).toBe(0);
+    expect(withoutForce.forceBefore).toBeNull();
 
-    await handle.sql`
-      INSERT INTO item_sources (item_id, source_id)
-      VALUES (${TWIN_B}, '11111111-1111-1111-1111-111111111111')
-    `;
     const withForce = await parsed(enrichRunSchema, "/enrich", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ since: "7d", force: true }),
     });
-    expect(withForce.summarised).toBe(1);
+    // All three were answered above, and a forced rerun asks about every one of
+    // them again -- which is the only thing the flag is for. It also answers
+    // with the cutoff to continue from.
+    expect(withForce.items).toBe(3);
+    expect(withForce.summarised).toBe(3);
+    expect(withForce.error).toBeNull();
+    expect(withForce.forceBefore).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test("POST /enrich continues a forced rerun from the cutoff it was given", async () => {
+    const cutoff = new Date(Date.now() + 1000).toISOString();
+
+    const body = await parsed(enrichRunSchema, "/enrich", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ since: "7d", force: true, forceBefore: cutoff }),
+    });
+
+    // Nothing here was written before a cutoff in the future, so every article
+    // in the period is waiting again.
+    expect(body.summarised).toBe(3);
+    expect(body.forceBefore).toBe(cutoff);
+  });
+
+  test("POST /enrich answers 200 with the counts when a refusal ends a rerun", async () => {
+    // The articles before the refusal were written. Answering 500 would say
+    // nothing was enriched and that the whole period has to be run again.
+    const response = await refusingApp().fetch(
+      new Request("http://test/enrich", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ since: "7d", force: true }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const body = enrichRunSchema.parse(await response.json());
+    expect(body.error).toMatch(/401/);
+    expect(body.summarised).toBe(0);
+    expect(body.forceBefore).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   test("GET /items/:id carries what the model said about the article", async () => {
@@ -323,12 +394,31 @@ describeIfDb("api contract", () => {
 
   test("GET /doctor reports the last error a pass refused to charge to an item", async () => {
     // A configuration error is true of every item equally, so nothing in the
-    // store records it and the field is the only thing that says why an
-    // install with a working model has stopped summarising.
-    const response = await app.fetch(new Request("http://test/doctor"));
+    // store records it and this field is the only thing that says why an
+    // install with a working model has stopped summarising. Asserted non-null:
+    // a field hard-coded to null would pass a test that only ever saw null.
+    const refusing = refusingApp();
+    await refusing.fetch(
+      new Request("http://test/enrich", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ since: "7d", force: true }),
+      }),
+    );
+
+    const response = await refusing.fetch(new Request("http://test/doctor"));
     const body = (await response.json()) as { features: { llm: unknown } };
     const llm = llmStatusSchema.parse(body.features.llm);
-    expect(llm.lastError).toBeNull();
+
+    expect(llm.lastError?.message).toMatch(/401/);
+    expect(llm.lastError?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    // And the daemon this suite runs on has refused nothing, so its field is
+    // the other shape: a message that only ever appears is a message nobody
+    // believes is absent.
+    const healthy = await app.fetch(new Request("http://test/doctor"));
+    const healthyBody = (await healthy.json()) as { features: { llm: unknown } };
+    expect(llmStatusSchema.parse(healthyBody.features.llm).lastError).toBeNull();
   });
 
   test("GET /doctor reports what enrichment is configured with", async () => {

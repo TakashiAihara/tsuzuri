@@ -327,17 +327,27 @@ describe("failure classification", () => {
     await expect(provider("gemini").complete(REQUEST)).rejects.toMatchObject({ kind: "permanent" });
   });
 
-  test("the four statuses that name a setup mistake are separated from the rest", async () => {
+  test("the three statuses that name a setup mistake are separated from the rest", async () => {
     // Each of these would fail every item identically, and recording one
     // against an item parks it behind a backoff for a variable somebody can
     // change in a second. They are neither "try again" nor "this article is
     // wrong", and the kind is what tells an operator which one it is.
-    for (const status of [400, 401, 403, 404]) {
+    for (const status of [401, 403, 404]) {
       respondWithStatus(status, "no such model");
       await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
         kind: "configuration",
       });
     }
+  });
+
+  test("a 400 is evidence about the article, not about the installation", async () => {
+    // An article too long for the model's context is refused exactly this way.
+    // Charging the installation for it re-picks that article on every pass and
+    // points the operator at a setup that is working.
+    respondWithStatus(400, "this article is too long for the context window");
+    await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
+      kind: "permanent",
+    });
   });
 
   test("names the status and the body it was refused with", async () => {

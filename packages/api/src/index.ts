@@ -103,16 +103,17 @@ export const itemSchema = z.strictObject({
 export type Item = z.infer<typeof itemSchema>;
 
 /**
- * What a chat model has said about one article.
+ * What a chat model has said about an article.
  *
  * Carried on GET /items/:id because a summary, a translation and a set of tags
  * that nothing reads is not enrichment, it is cost. `summarySource` is the same
  * field the listing carries, and the same reason: a reader cannot tell the
  * feed's summary from the model's without it.
  *
- * Nullable rather than omitted: an article no model has touched is a state a
- * caller has to handle, and it should not have to tell it apart from a
- * response that forgot the field.
+ * Always present, and never null: an article no model has touched has a summary
+ * of its own to show, and `summarySource: "feed"` is what says where that came
+ * from. A nullable field beside it would be a second way to say the same thing,
+ * and a caller would have to handle both.
  */
 export const itemEnrichmentSchema = z.strictObject({
   summary: z.string().nullable(),
@@ -292,7 +293,7 @@ export const rankedItemsResponseSchema = z.strictObject({
 });
 export const itemResponseSchema = z.strictObject({
   item: itemSchema,
-  enrichment: itemEnrichmentSchema.nullable(),
+  enrichment: itemEnrichmentSchema,
 });
 export const itemStateResponseSchema = z.strictObject({ state: itemStateSchema });
 
@@ -340,6 +341,14 @@ export type TagStatusResponse = z.infer<typeof tagStatusResponseSchema>;
  *
  * `bounded` says the hourly spend limit stopped it with candidates waiting,
  * which is otherwise indistinguishable from there being nothing left to do.
+ *
+ * `forceBefore` is the cutoff a forced rerun measured against, and passing it
+ * on the next call is what makes a rerun continue rather than repeat: a row
+ * written from that instant on is an answer, one written before it is not.
+ *
+ * `error` is the configuration error that cut the run short, if one did. The
+ * counts beside it are what was written before it, so this is an answer rather
+ * than a failure the caller has to make sense of.
  */
 export const enrichRunSchema = z.strictObject({
   items: z.number(),
@@ -348,6 +357,8 @@ export const enrichRunSchema = z.strictObject({
   translated: z.number(),
   failed: z.number(),
   bounded: z.boolean(),
+  error: z.string().nullable(),
+  forceBefore: z.string().nullable(),
 });
 export type EnrichRunResponse = z.infer<typeof enrichRunSchema>;
 
@@ -407,6 +418,11 @@ export type EnrichRunRequest = {
    * it is what the CLI does not send.
    */
   force?: boolean;
+  /**
+   * The instant a forced rerun measures against, as the last response returned
+   * it. Absent on the first call, which measures against the request time.
+   */
+  forceBefore?: string;
 };
 
 export type ItemStatePatch = {

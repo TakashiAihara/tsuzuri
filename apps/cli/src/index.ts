@@ -29,7 +29,7 @@ import { Command } from "commander";
  */
 
 type RankedItemsResponse = { items: RankedItem[]; scoring: ScoringState };
-type ItemWithEnrichment = { item: Item; enrichment: ItemEnrichment | null };
+type ItemWithEnrichment = { item: Item; enrichment: ItemEnrichment };
 
 const DEFAULT_ENDPOINT = process.env.TSUZURI_ENDPOINT ?? "http://127.0.0.1:8787";
 
@@ -302,13 +302,13 @@ program
     // The model's summary in place of the feed's, and the feed's when there is
     // no model one: without the field the two are indistinguishable, and
     // `summarySource` says which this is (D35).
-    const summary = enrichment?.summary ?? item.summary;
+    const summary = enrichment.summary ?? item.summary;
     if (summary) out(`\n${summary}`);
-    if (enrichment?.translation) {
+    if (enrichment.translation) {
       out(`\n${enrichment.translation.title} (${enrichment.translation.lang})`);
       out(enrichment.translation.text);
     }
-    if (enrichment && enrichment.tags.length > 0) out(`\ntags: ${enrichment.tags.join(" ")}`);
+    if (enrichment.tags.length > 0) out(`\ntags: ${enrichment.tags.join(" ")}`);
     out(`\n${item.searchText || "(no body)"}`);
   });
 
@@ -427,31 +427,55 @@ const enrich = program
   .option("--since <when>", "how far back to go, e.g. 7d or an ISO date")
   .option("--kind <kind>", "summary, tags or translation; all of them by default")
   .option("--force", "re-run articles already answered for this prompt, ignoring any retry backoff")
-  .action(async (opts: { since?: string; kind?: string; force?: boolean }) => {
-    if (!opts.since) {
-      log("enrich needs --since, e.g. --since 7d: it spends model calls, and no period is a guess");
-      process.exit(2);
-    }
-    const body = JSON.stringify({
-      since: opts.since,
-      ...(opts.kind ? { kind: opts.kind } : {}),
-      force: Boolean(opts.force),
-    });
-    const result = await call<EnrichRunResponse>(globals(), "/enrich", {
-      method: "POST",
-      raw: body,
-    });
-    if (globals().json) return printJson(result);
-    log(
-      `enriched ${result.items} articles: ${result.summarised} summarised, ` +
-        `${result.tagged} tagged, ${result.translated} translated, ${result.failed} failed`,
-    );
-    // Said rather than inferred from a smaller-than-expected count: a run
-    // stopped by the hourly limit looks exactly like one with nothing to do.
-    if (result.bounded) {
-      log("stopped at ENRICH_MAX_ITEMS_PER_HOUR; run it again for the rest");
-    }
-  });
+  .option(
+    "--force-before <when>",
+    "with --force: re-run only what was written before this instant, e.g. the cutoff the last run returned",
+  )
+  .action(
+    async (opts: { since?: string; kind?: string; force?: boolean; forceBefore?: string }) => {
+      if (!opts.since) {
+        log(
+          "enrich needs --since, e.g. --since 7d: it spends model calls, and no period is a guess",
+        );
+        process.exit(2);
+      }
+      if (opts.forceBefore && !opts.force) {
+        log(
+          "--force-before only means something with --force; without it nothing is re-run anyway",
+        );
+        process.exit(2);
+      }
+      const body = JSON.stringify({
+        since: opts.since,
+        ...(opts.kind ? { kind: opts.kind } : {}),
+        force: Boolean(opts.force),
+        // Absent rather than null on the first call, so the daemon measures
+        // against the instant the request began.
+        ...(opts.forceBefore ? { forceBefore: opts.forceBefore } : {}),
+      });
+      const result = await call<EnrichRunResponse>(globals(), "/enrich", {
+        method: "POST",
+        raw: body,
+      });
+      if (globals().json) return printJson(result);
+      log(
+        `enriched ${result.items} articles: ${result.summarised} summarised, ` +
+          `${result.tagged} tagged, ${result.translated} translated, ${result.failed} failed`,
+      );
+      if (result.error) log(`stopped: ${result.error}`);
+      // Said rather than inferred from a smaller-than-expected count: a run
+      // stopped by the hourly limit looks exactly like one with nothing to do,
+      // and repeating the command as typed would spend the hour again on the
+      // articles it has already written.
+      if (result.bounded && result.forceBefore) {
+        log(
+          `continue the rest with: tsuzuri enrich --since ${opts.since} --force --force-before ${result.forceBefore}`,
+        );
+      } else if (result.bounded) {
+        log("stopped at ENRICH_MAX_ITEMS_PER_HOUR; run it again for the rest");
+      }
+    },
+  );
 
 enrich
   .command("prune")

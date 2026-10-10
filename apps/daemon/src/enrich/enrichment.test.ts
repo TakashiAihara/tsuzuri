@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { ChatError, type ChatProvider, type ChatRequest } from "@tsuzuri/core";
+import { ChatError, type ChatProvider, type ChatRequest, createChatProvider } from "@tsuzuri/core";
 import {
   createDatabase,
   DEFAULT_USER_ID,
@@ -10,6 +10,7 @@ import {
   writeEnrichment,
   writeInterestProfile,
 } from "@tsuzuri/db";
+import type postgres from "postgres";
 
 import { loadConfig } from "../config.ts";
 import { createEmbeddingService } from "./embeddings.ts";
@@ -34,6 +35,9 @@ const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
 
 const MODEL = "stub-chat";
+
+/** What the stub answers with when a test is not about the answer itself. */
+const SUMMARY = '{"summary": "The model said this."}';
 
 type Answer = string | Error;
 
@@ -178,6 +182,41 @@ describeIfDb("createEnrichmentService", () => {
     return [...rows];
   };
 
+  /**
+   * An item holding the current summary row, written `minutesAgo` minutes back.
+   *
+   * The age is what --force measures against, and writeEnrichment cannot say
+   * it: a row written "now" is indistinguishable from one this request wrote,
+   * which is exactly the confusion the cutoff exists to settle.
+   */
+  const summarised = async (sql: postgres.Sql, itemId: string, minutesAgo: number) => {
+    await writeEnrichment(sql, {
+      itemId,
+      kind: "summary",
+      model: MODEL,
+      promptVersion: "summary.v1",
+      content: { summary: `summarised ${minutesAgo} minutes ago` },
+    });
+    await sql`
+      UPDATE enrichments SET created_at = now() - make_interval(mins => ${minutesAgo}::int)
+      WHERE item_id = ${itemId}
+    `;
+  };
+
+  /**
+   * Wait for the background loop to reach a number of calls.
+   *
+   * The loop runs on its own schedule, so a test that started it has to let it
+   * get there rather than assert on the return of a call it has not made.
+   */
+  async function untilCalled(asked: ChatRequest[], count: number): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (asked.length >= count) return;
+      await Bun.sleep(20);
+    }
+    throw new Error(`the pass made ${asked.length} calls, not ${count}`);
+  }
+
   const failures = async () => {
     const rows = await handle.sql<Array<{ itemId: string; kind: string }>>`
       SELECT item_id AS "itemId", kind FROM enrichment_failures ORDER BY item_id, kind
@@ -244,6 +283,8 @@ describeIfDb("createEnrichmentService", () => {
       translated: 0,
       failed: 0,
       bounded: false,
+      error: null,
+      forceBefore: null,
       idle: false,
     });
     expect(await storedSummaries()).toEqual([
@@ -463,14 +504,36 @@ describeIfDb("createEnrichmentService", () => {
     const { chat } = stubChat(() => new ChatError("chat request failed (401)", "configuration"));
     const enrichment = service(chat);
 
-    await expect(enrichment.runPass()).rejects.toThrow(/401/);
+    const result = await enrichment.runPass();
 
+    // Answered rather than thrown: the caller is told why in the result, and
+    // everything written before it is written.
+    expect(result.error).toMatch(/401/);
+    expect(result.summarised).toBe(0);
     expect(await failures()).toEqual([]);
     const status = await enrichment.status();
     expect(status.lastError?.message).toMatch(/401/);
     // And an ISO instant, so "when" is answerable without reading the daemon's
     // log to work out how long this has been happening.
     expect(status.lastError?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test("a configuration error empties the queue rather than being paid for item by item", async () => {
+    // Every item queued behind the refusal would meet the same one. Left to run,
+    // a bad key costs ENRICH_CONCURRENCY requests for as many articles as are
+    // waiting, and the refusal says nothing about any of them.
+    for (const id of ["a", "b", "c", "d", "e"]) await seedItem(id);
+    const { chat, asked } = stubChat(
+      () => new ChatError("chat request failed (401)", "configuration"),
+    );
+
+    const result = await service(chat).runPass();
+
+    // The two in flight when the first refusal came back, and no more.
+    expect(asked).toHaveLength(2);
+    expect(result.error).toMatch(/401/);
+    expect(result.summarised).toBe(0);
+    expect(await storedSummaries()).toEqual([]);
   });
 
   test("an answer that hit the output bound is a configuration error too", async () => {
@@ -482,11 +545,91 @@ describeIfDb("createEnrichmentService", () => {
     );
     const enrichment = service(chat);
 
-    await expect(enrichment.runPass()).rejects.toThrow(/output bound/);
+    expect((await enrichment.runPass()).error).toMatch(/output bound/);
 
     expect(await failures()).toEqual([]);
     expect(asked).toHaveLength(1);
     expect((await enrichment.status()).lastError?.message).toMatch(/output bound/);
+  });
+
+  test("a refused call stops being the reason once one succeeds", async () => {
+    // doctor reports why enrichment is not running. Reporting the last refusal
+    // for ever would make a key fixed an hour ago look like an install that
+    // still cannot call anything, which is the question the field is asked for.
+    await seedItem("a");
+    let calls = 0;
+    // One refusal and then answers, which is what a key somebody has just
+    // fixed looks like from here.
+    const { chat } = stubChat(() =>
+      calls++ === 0 ? new ChatError("chat request failed (401)", "configuration") : SUMMARY,
+    );
+    const enrichment = service(chat);
+
+    expect((await enrichment.runPass()).error).toMatch(/401/);
+    expect((await enrichment.status()).lastError?.message).toMatch(/401/);
+
+    const next = await enrichment.runPass();
+
+    expect(next.summarised).toBe(1);
+    expect(next.error).toBeNull();
+    expect((await enrichment.status()).lastError).toBeNull();
+  });
+
+  test("an article the endpoint refuses outright is charged to the article", async () => {
+    // A 400 is the one 4xx that can be about the request: an article too long
+    // for the model's context. Charging the installation for it re-picks that
+    // article on every pass and points the operator at a setup that works.
+    const endpoint = Bun.serve({
+      port: 0,
+      fetch: () => new Response("context length exceeded", { status: 400 }),
+    });
+    try {
+      await seedItem("a");
+      const chat = createChatProvider({
+        provider: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${endpoint.port}/v1`,
+        model: MODEL,
+      }) as ChatProvider;
+      const enrichment = service(chat);
+
+      const result = await enrichment.runPass();
+
+      // The refusal is about this article, so it is recorded against it and the
+      // pass carries on -- and nothing is said about the configuration.
+      expect(result.failed).toBe(1);
+      expect(result.error).toBeNull();
+      expect(await failures()).toEqual([{ itemId: "a", kind: "summary" }]);
+      expect((await enrichment.status()).lastError).toBeNull();
+    } finally {
+      endpoint.stop(true);
+    }
+  });
+
+  test("a 401 from the endpoint is the installation's, not the article's", async () => {
+    // The other half of the split the 400 test above draws: these three fail
+    // every article identically, so they stop the pass and are reported rather
+    // than recorded, and nothing is written about any of them.
+    const endpoint = Bun.serve({
+      port: 0,
+      fetch: () => new Response("invalid api key", { status: 401 }),
+    });
+    try {
+      await seedItem("a");
+      const chat = createChatProvider({
+        provider: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${endpoint.port}/v1`,
+        model: MODEL,
+      }) as ChatProvider;
+      const enrichment = service(chat);
+
+      const result = await enrichment.runPass();
+
+      expect(result.error).toMatch(/401/);
+      expect(await failures()).toEqual([]);
+      expect((await enrichment.status()).lastError?.message).toMatch(/401/);
+    } finally {
+      endpoint.stop(true);
+    }
   });
 
   test("two unusable answers are recorded as a failure too", async () => {
@@ -581,22 +724,167 @@ describeIfDb("createEnrichmentService", () => {
     expect(asked).toHaveLength(0);
   });
 
-  test("--force over a bounded budget reaches every item, once each", async () => {
-    // Re-picking the newest items on every call would make --since a way to
-    // re-run the same two articles until the hour turned over.
-    for (const id of ["a", "b", "c", "d", "e"]) {
-      await seedItem(id, { hoursAgo: 6 * 24 });
-    }
-    const { chat } = stubChat(answerEachPrompt());
+  test("an answer that cannot be read twice is two calls against the hour", async () => {
+    // The retry is a second request to the endpoint, so the bound has to see
+    // it: counting articles instead would let one article that never answers
+    // well spend the hour many times over, which is the case the bound is for.
+    await seedItem("a");
+    const { chat, asked } = stubChat(() => "I am afraid I cannot do that.");
+    const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "2" });
+
+    await enrichment.runPass();
+    expect(asked).toHaveLength(2);
+
+    // Both calls are spent, so an article that arrives now waits for the next
+    // hour rather than being asked about on this one. Counting articles
+    // instead would have left one call here and asked it anyway.
+    await seedItem("b");
+    asked.length = 0;
+    await enrichment.runPass();
+    expect(asked).toHaveLength(0);
+  });
+
+  test("a rate-limited call is one call against the hour", async () => {
+    // 429 is not retried here, so it is one call -- but it is still one, and a
+    // model asking to be slowed down is exactly when spending the hour again
+    // immediately is worst.
+    await seedItem("a", { hoursAgo: 1 });
+    await seedItem("b", { hoursAgo: 2 });
+    const { chat, asked } = stubChat(() => new ChatError("chat request failed (429)", "retryable"));
+    const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "1" });
+
+    await expect(enrichment.runPass()).rejects.toThrow(/429/);
+    expect(asked).toHaveLength(1);
+
+    asked.length = 0;
+    await enrichment.runPass();
+    expect(asked).toHaveLength(0);
+  });
+
+  test("a rerun draws from the hour the pass spends, so it is the same budget", async () => {
+    // Two of the hour's three calls went to the pass. A rerun drawing its own
+    // budget would make asking twice the way to get twice the work.
+    await seedItem("newest", { hoursAgo: 1 });
+    await seedItem("older", { hoursAgo: 2 });
+    await seedItem("oldest", { hoursAgo: 6 * 24 });
+    const { chat, asked } = stubChat(answerEachPrompt());
     const enrichment = service(chat, { ENRICH_MAX_ITEMS_PER_HOUR: "2" });
     const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
-    const run = () => enrichment.runOver({ since, kind: "summary", force: true });
 
-    const results = [await run(), await run(), await run()];
+    await enrichment.runPass();
+    expect(asked).toHaveLength(2);
 
-    expect(results.map((result) => result.summarised)).toEqual([2, 2, 1]);
-    expect(results.map((result) => result.bounded)).toEqual([true, true, false]);
-    expect((await storedSummaries()).map((row) => row.itemId)).toEqual(["a", "b", "c", "d", "e"]);
+    asked.length = 0;
+    const rerun = await enrichment.runOver({ since, kind: "summary", force: true });
+
+    expect(asked).toHaveLength(0);
+    expect(rerun.items).toBe(0);
+  });
+
+  test("stopping at ENRICH_TOP_N is not the hour running out", async () => {
+    // Twelve articles are waiting and the hour could pay for ten of them, so
+    // what stopped the pass was the top N. Saying the hour stopped it sends
+    // somebody to raise a limit that was never reached.
+    for (let index = 0; index < 12; index += 1) {
+      await seedItem(`t${index}`, { hoursAgo: index + 1 });
+    }
+    const { chat } = stubChat(answerEachPrompt());
+
+    const result = await service(chat, {
+      ENRICH_TOP_N: "2",
+      ENRICH_MAX_ITEMS_PER_HOUR: "10",
+    }).runPass();
+
+    expect(result.items).toBe(2);
+    expect(result.bounded).toBe(false);
+  });
+
+  test("--force re-runs what the store already has, and the cutoff it returns is what continues it", async () => {
+    // Three articles, each already holding the current summary row, which is the
+    // case the flag exists for: replaying a prompt over articles that already
+    // have an answer. Reading any stored row as answering the item made the
+    // flag do nothing at all.
+    for (const id of ["a", "b", "c"]) await seedItem(id, { hoursAgo: 6 * 24 });
+    await summarised(handle.sql, "a", 3 * 60);
+    await summarised(handle.sql, "b", 2 * 60);
+    await summarised(handle.sql, "c", 30);
+    const { chat, asked } = stubChat(answerEachPrompt());
+    const enrichment = service(chat);
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
+    const before = Date.now();
+
+    const first = await enrichment.runOver({ since, kind: "summary", force: true });
+
+    expect(first.summarised).toBe(3);
+    expect(first.items).toBe(3);
+    // The cutoff it measured against comes back, so the call that continues it
+    // can send exactly what it was given.
+    const cutoff = new Date(first.forceBefore as string).getTime();
+    expect(cutoff).toBeGreaterThanOrEqual(before);
+
+    // What this call wrote is answered as of that cutoff, so repeating the
+    // command with it reaches the articles behind rather than re-running these
+    // three for another hour.
+    const second = await enrichment.runOver({
+      since,
+      kind: "summary",
+      force: true,
+      forceBefore: new Date(first.forceBefore as string),
+    });
+
+    expect(second.items).toBe(0);
+    expect(second.summarised).toBe(0);
+    expect(asked).toHaveLength(3);
+  });
+
+  test("a forced rerun with an explicit cutoff measures against that, not the request", async () => {
+    // "Re-run everything older than this" and "re-run everything" are different
+    // questions, and only the caller knows which one it is asking.
+    await seedItem("old", { hoursAgo: 6 * 24 });
+    await seedItem("recent", { hoursAgo: 6 * 24 });
+    await summarised(handle.sql, "old", 3 * 60);
+    await summarised(handle.sql, "recent", 30);
+    const { chat } = stubChat(answerEachPrompt());
+    const enrichment = service(chat);
+    const cutoff = new Date(Date.now() - 60 * 60_000);
+
+    const result = await enrichment.runOver({
+      since: new Date(Date.now() - 7 * 24 * 60 * 60_000),
+      kind: "summary",
+      force: true,
+      forceBefore: cutoff,
+    });
+
+    // Only the article answered before the cutoff, and the cutoff it used is
+    // the one it was given rather than the instant it happened to run at.
+    expect(result.summarised).toBe(1);
+    expect(result.forceBefore).toBe(cutoff.toISOString());
+  });
+
+  test("a rerun stopped by a configuration error still answers with what it wrote", async () => {
+    // The newest article is answered and the one behind it is refused, so with
+    // one at a time the refusal comes after something was written. Answering
+    // 500 for that would tell the caller nothing was enriched and that the
+    // whole period has to be run again.
+    await seedItem("answered", { hoursAgo: 1 });
+    await seedItem("refused", { hoursAgo: 2 });
+    const { chat } = stubChat((request) =>
+      request.user.includes("body of answered")
+        ? '{"summary": "The model said this."}'
+        : new ChatError("chat request failed (401)", "configuration"),
+    );
+    const enrichment = service(chat, { ENRICH_CONCURRENCY: "1" });
+
+    const result = await enrichment.runOver({
+      since: new Date(Date.now() - 7 * 24 * 60 * 60_000),
+      kind: "summary",
+      force: true,
+    });
+
+    expect(result.summarised).toBe(1);
+    expect(result.items).toBe(1);
+    expect(result.error).toMatch(/401/);
+    expect((await storedSummaries()).map((row) => row.itemId)).toEqual(["answered"]);
   });
 
   test("a rerun reports bounded from what matched, not from what it fetched", async () => {
@@ -668,14 +956,25 @@ describeIfDb("createEnrichmentService", () => {
   });
 
   test("a rerun without --force leaves an item that already has a row", async () => {
+    // The row is there before either rerun, so what separates the two calls is
+    // the flag rather than whether anything had been written yet.
     await seedItem("a", { hoursAgo: 24 * 6 });
+    await summarised(handle.sql, "a", 3 * 60);
     const { chat, asked } = stubChat(answerEachPrompt());
     const enrichment = service(chat);
     const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
 
-    expect((await enrichment.runOver({ since, kind: "summary", force: true })).summarised).toBe(1);
-    expect((await enrichment.runOver({ since, kind: "summary", force: false })).items).toBe(0);
+    const withoutForce = await enrichment.runOver({ since, kind: "summary", force: false });
+
+    expect(withoutForce.items).toBe(0);
+    expect(withoutForce.forceBefore).toBeNull();
+    expect(asked).toHaveLength(0);
+
+    const withForce = await enrichment.runOver({ since, kind: "summary", force: true });
+
+    expect(withForce.summarised).toBe(1);
     expect(asked).toHaveLength(1);
+    expect((await storedSummaries()).map((row) => row.summary)).toEqual(["The model said this."]);
   });
 
   test("a rerun and the background pass do not spend the hour at the same time", async () => {
@@ -704,8 +1003,10 @@ describeIfDb("createEnrichmentService", () => {
     ]);
 
     // One run's calls, then the other's. Interleaved would be two runs
-    // spending one allowance at the same time.
-    expect(asked).toEqual(["pass", "pass", "rerun", "rerun"]);
+    // spending one allowance at the same time. The rerun asks about the
+    // in-window articles as well -- that is what --force means -- and about
+    // the two the pass never reached, which is the point of --since.
+    expect(asked).toEqual(["pass", "pass", "pass", "pass", "rerun", "rerun"]);
   });
 
   test("a rerun answers 400 rather than running with no chat model", async () => {
@@ -846,12 +1147,40 @@ describeIfDb("createEnrichmentService", () => {
     expect(await storedSummaries()).toEqual([]);
   });
 
+  test("a stopped service can be started again", async () => {
+    // The controller stop() aborts refuses every request handed to it and the
+    // stopping flag is left set, so a restart built on either would do nothing
+    // at all -- and a daemon that is stopped and started is the normal case
+    // for a reload.
+    await seedItem("a");
+    const { chat, asked } = stubChat(answerEachPrompt());
+    const enrichment = service(chat);
+
+    await enrichment.start();
+    await untilCalled(asked, 1);
+    await enrichment.stop();
+
+    // A second article arrives while the daemon is down, which is what the
+    // second start is for: nothing about the first one is left to do.
+    await seedItem("b");
+    await enrichment.start();
+    await untilCalled(asked, 2);
+    await enrichment.stop();
+
+    expect((await storedSummaries()).map((row) => row.itemId)).toEqual(["a", "b"]);
+  });
+
   test("a kind in backoff is not paid for again on an item chosen for another", async () => {
     // Selection only promises the item lacks one of the wanted combinations, so
     // it is picked for its tags while its summary is still waiting out a
     // backoff. Without this the tags pass re-runs the summary that failed.
     await seedItem("a");
-    await recordEnrichmentFailure(handle.sql, "a", "summary", "the model would not answer");
+    await recordEnrichmentFailure(
+      handle.sql,
+      "a",
+      { kind: "summary", model: MODEL, promptVersion: "summary.v1" },
+      "the model would not answer",
+    );
     const { chat, asked } = stubChat(answerEachPrompt());
 
     const result = await service(chat, { ENRICH_TAGS: "true" }).runPass();

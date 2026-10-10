@@ -22,10 +22,15 @@ let enrichResponse: unknown = {
   translated: 0,
   failed: 0,
   bounded: false,
+  error: null,
+  forceBefore: null,
 };
 let tagsResponse: unknown = { tags: [] };
 let translateResponse: unknown = { itemId: "aa11", lang: "Japanese", text: "", cached: false };
-let showResponse: unknown = { item: null, enrichment: null };
+let showResponse: unknown = {
+  item: null,
+  enrichment: { summary: null, summarySource: "feed", translation: null, tags: [] },
+};
 /** Every path the stub was asked for, with the body it was given. */
 const requests: { path: string; method: string; body: unknown }[] = [];
 
@@ -217,15 +222,47 @@ describe("enrichment commands", () => {
     expect(lastRequest("/enrich")?.body).toEqual({ since: "7d", force: false });
   });
 
-  test("enrich passes --kind and --force through", async () => {
+  test("enrich passes --kind and --force through, and no cutoff on the first call", async () => {
     // --force is what re-runs articles that already have an answer for the
     // current prompt version, which is how a new prompt is compared with the old.
+    // No --force-before on the first call: the daemon measures against the
+    // request time and answers with the cutoff it used.
     await run(["enrich", "--since", "30d", "--kind", "summary", "--force"]);
     expect(lastRequest("/enrich")?.body).toEqual({
       since: "30d",
       kind: "summary",
       force: true,
     });
+  });
+
+  test("enrich sends the cutoff the last run returned when it is given one", async () => {
+    await run([
+      "enrich",
+      "--since",
+      "30d",
+      "--force",
+      "--force-before",
+      "2026-10-10T12:00:00.000Z",
+    ]);
+    expect(lastRequest("/enrich")?.body).toEqual({
+      since: "30d",
+      force: true,
+      forceBefore: "2026-10-10T12:00:00.000Z",
+    });
+  });
+
+  test("enrich refuses a cutoff with nothing to continue, rather than ignoring it", async () => {
+    const before = requests.length;
+    const { code, stderr } = await run([
+      "enrich",
+      "--since",
+      "30d",
+      "--force-before",
+      "2026-10-10T12:00:00.000Z",
+    ]);
+    expect(code).not.toBe(0);
+    expect(stderr).toMatch(/--force-before/);
+    expect(requests.length).toBe(before);
   });
 
   test("enrich refuses to run without a period rather than guessing one", async () => {
@@ -236,7 +273,7 @@ describe("enrichment commands", () => {
     expect(requests.length).toBe(before);
   });
 
-  test("enrich says when the hourly bound stopped it", async () => {
+  test("enrich says when the hourly bound stopped it, and prints the command that continues it", async () => {
     enrichResponse = {
       items: 60,
       summarised: 60,
@@ -244,11 +281,31 @@ describe("enrichment commands", () => {
       translated: 0,
       failed: 0,
       bounded: true,
+      error: null,
+      forceBefore: "2026-10-10T12:00:00.000Z",
+    };
+    const { stderr } = await run(["enrich", "--since", "30d", "--force"]);
+    // Otherwise a run that did half of what was asked looks like one with
+    // nothing left to do -- and running the command as typed would spend the
+    // hour again on the sixty articles it has just written.
+    expect(stderr).toMatch(
+      /tsuzuri enrich --since 30d --force --force-before 2026-10-10T12:00:00\.000Z/,
+    );
+  });
+
+  test("enrich says what stopped a rerun that the model refused", async () => {
+    enrichResponse = {
+      items: 4,
+      summarised: 4,
+      tagged: 0,
+      translated: 0,
+      failed: 0,
+      bounded: false,
+      error: "chat request failed (401)",
+      forceBefore: null,
     };
     const { stderr } = await run(["enrich", "--since", "30d"]);
-    // Otherwise a run that did half of what was asked looks like one with
-    // nothing left to do.
-    expect(stderr).toMatch(/ENRICH_MAX_ITEMS_PER_HOUR/);
+    expect(stderr).toMatch(/chat request failed \(401\)/);
   });
 
   test("enrich prune keeps the current combination and says what went", async () => {
@@ -355,7 +412,12 @@ describe("show", () => {
   });
 
   test("falls back to the article alone when no model has touched it", async () => {
-    showResponse = { item: article(), enrichment: null };
+    // An article no model has answered still carries the feed's summary and
+    // says where it came from, rather than an absent block.
+    showResponse = {
+      item: article(),
+      enrichment: { summary: null, summarySource: "feed", translation: null, tags: [] },
+    };
     const { stdout, code } = await run(["show", "aa11bb22"]);
     expect(code).toBe(0);
     expect(stdout).toContain("The feed's own summary.");

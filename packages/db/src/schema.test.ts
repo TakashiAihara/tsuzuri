@@ -71,6 +71,17 @@ describeIfDb("schema", () => {
     expect(names).not.toContain("enrichments_by_item");
   });
 
+  test("the tag observation count has the index it scans", async () => {
+    // observations is counted out of the tags enrichments for one slug, and it
+    // is asked once per slug the model suggests. Without the index the
+    // vocabulary is a table scan per suggestion.
+    const rows = await handle.sql<{ indexdef: string }[]>`
+      SELECT indexdef FROM pg_indexes WHERE indexname = 'enrichments_by_tags'
+    `;
+    expect(rows[0]?.indexdef).toContain("model, prompt_version");
+    expect(rows[0]?.indexdef).toContain("kind = 'tags'::text");
+  });
+
   test("round-trips a source, an item and its state through Drizzle", async () => {
     const [source] = await db
       .insert(sources)

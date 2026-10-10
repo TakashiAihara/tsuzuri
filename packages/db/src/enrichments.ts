@@ -82,6 +82,15 @@ export async function writeEnrichment(
   `;
 }
 
+/** One combination an enrichment or a failure belongs to. */
+export type EnrichmentTarget = {
+  kind: EnrichmentKind;
+  /** Target language for a translation; empty for the other two kinds. */
+  lang?: string | undefined;
+  model: string;
+  promptVersion: string;
+};
+
 export type CurrentEnrichmentFilter = {
   kind?: EnrichmentKind;
   model: string;
@@ -138,18 +147,19 @@ export async function currentEnrichments(
 export async function recordEnrichmentFailure(
   sql: postgres.Sql,
   itemId: string,
-  kind: EnrichmentKind,
+  target: EnrichmentTarget,
   error: string,
   now = new Date(),
 ): Promise<void> {
   const first = new Date(now.getTime() + retryBackoffSeconds(1) * 1000);
   await sql`
-    INSERT INTO enrichment_failures (item_id, kind, failures, last_error, last_attempt_at, next_attempt_at)
+    INSERT INTO enrichment_failures (item_id, kind, lang, model, prompt_version,
+                                     failures, last_error, last_attempt_at, next_attempt_at)
     VALUES (
-      ${itemId}, ${kind}, 1, ${error.slice(0, 1000)},
-      ${instant(now)}::timestamptz, ${instant(first)}::timestamptz
+      ${itemId}, ${target.kind}, ${target.lang ?? ""}, ${target.model}, ${target.promptVersion},
+      1, ${error.slice(0, 1000)}, ${instant(now)}::timestamptz, ${instant(first)}::timestamptz
     )
-    ON CONFLICT (item_id, kind) DO UPDATE
+    ON CONFLICT (item_id, kind, lang, model, prompt_version) DO UPDATE
       SET failures = enrichment_failures.failures + 1,
           last_error = EXCLUDED.last_error,
           last_attempt_at = ${instant(now)}::timestamptz,
@@ -163,35 +173,44 @@ export async function recordEnrichmentFailure(
 }
 
 /**
- * Which of these kinds are waiting out a backoff for this item.
+ * Whether this item is waiting out a backoff for this combination.
  *
  * Asked of the store rather than assumed from the selection, because selection
  * only promises the item lacks a wanted combination: an item chosen for
  * tagging may still be inside a summary backoff, and running the summary anyway
  * spends a call the backoff was holding.
  */
-export async function kindsInBackoff(
+export async function inBackoff(
   sql: postgres.Sql,
   itemId: string,
+  target: EnrichmentTarget,
   now = new Date(),
-): Promise<Set<EnrichmentKind>> {
-  const rows = await sql<{ kind: EnrichmentKind }[]>`
-    SELECT kind FROM enrichment_failures
-    WHERE item_id = ${itemId} AND next_attempt_at > ${instant(now)}::timestamptz
+): Promise<boolean> {
+  const rows = await sql<{ waiting: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM enrichment_failures
+      WHERE item_id = ${itemId} AND kind = ${target.kind} AND lang = ${target.lang ?? ""}
+        AND model = ${target.model} AND prompt_version = ${target.promptVersion}
+        AND next_attempt_at > ${instant(now)}::timestamptz
+    ) AS waiting
   `;
-  return new Set(rows.map((row) => row.kind));
+  return rows[0]?.waiting ?? false;
 }
 
 export async function clearEnrichmentFailure(
   sql: postgres.Sql,
   itemId: string,
-  kind: EnrichmentKind,
+  target: EnrichmentTarget,
 ): Promise<void> {
-  await sql`DELETE FROM enrichment_failures WHERE item_id = ${itemId} AND kind = ${kind}`;
+  await sql`
+    DELETE FROM enrichment_failures
+    WHERE item_id = ${itemId} AND kind = ${target.kind} AND lang = ${target.lang ?? ""}
+      AND model = ${target.model} AND prompt_version = ${target.promptVersion}
+  `;
 }
 
 /**
- * How many distinct articles have proposed this tag.
+ * How many distinct articles of this build have proposed this tag.
  *
  * Counted from the stored `tags` enrichments rather than incremented per
  * proposal, because the question the number answers is "how many articles is
@@ -202,16 +221,32 @@ export async function clearEnrichmentFailure(
  * The suggestions are already written down: every `tags` enrichment row holds
  * what the model named for that article, so counting distinct items that named
  * this slug reads the store rather than keeping a second tally beside it.
+ * Scoped to one model and one prompt version because a row written by another
+ * model, or by yesterday's prompt, is an answer about a question this build is
+ * not asking -- counting it would make a model switch look like evidence.
  *
  * An approved or rejected row is left exactly as it is, observations included:
  * its status is a decision somebody made, and a later suggestion is not an
  * argument that overturns it.
+ *
+ * NOTE ponytail: this still scans every current `tags` row once per suggested
+ * slug to find the one being counted. That is the ceiling until the proposals
+ * are a table of their own rather than a JSON field read back out; the index
+ * below only narrows which rows are scanned, not how often.
  */
-export async function suggestTag(sql: postgres.Sql, slug: string, label: string): Promise<void> {
+export async function suggestTag(
+  sql: postgres.Sql,
+  slug: string,
+  label: string,
+  model: string,
+  promptVersion: string,
+): Promise<void> {
   const seen = sql`
     SELECT count(DISTINCT e.item_id)::int
     FROM enrichments e
     WHERE e.kind = 'tags'
+      AND e.model = ${model}
+      AND e.prompt_version = ${promptVersion}
       AND (
         (e.content->'tags') ?| ${[slug]}::text[]
         OR (e.content->'candidates') ?| ${[slug]}::text[]
@@ -446,14 +481,16 @@ export type CandidateOptions = {
    * An explicit rerun asked for by a person is treated as the decision the
    * backoff was waiting for; a scheduled pass never sets this.
    *
-   * A row written at or after `now` does not count towards the item already
-   * having one. Without that, a rerun limited by the hourly bound re-picks the
-   * same newest items on every call and never reaches the rest, because each
-   * call sees the rows the previous one wrote and re-runs them anyway. A row
-   * written before this request began does count, which is what leaves each
-   * call with the articles the one before it did not reach.
+   * A row written at or after `forceBefore` is the answer the caller already
+   * has; one written before it is not, and the item is a candidate again. The
+   * cutoff defaults to the instant the request began, so a rerun reaches every
+   * item rather than none of them, and the response returns the cutoff it used
+   * so that a second call continues past what the first wrote instead of
+   * re-picking the same items.
    */
   force?: boolean | undefined;
+  /** The instant a forced rerun measures against; defaults to the request time. */
+  forceBefore?: Date | null | undefined;
   /** One row per story, as in scoreItems. */
   collapse: boolean;
   /** Every starred item rather than the newest ones, regardless of rank. */
@@ -480,8 +517,8 @@ export type CandidateOptions = {
  *   - What is missing. An item qualifies when it lacks at least one wanted
  *     combination, so an article with a summary and no tags is still selected
  *     for tagging. `force` keeps the same test and moves its cutoff: the item
- *     qualifies whenever it lacked a combination as of `now`, which is what
- *     leaves the next call something the last one did not write.
+ *     qualifies whenever it lacked a combination as of `forceBefore`, which is
+ *     what leaves a later call the articles the earlier ones did not write.
  *   - Retry backoff. A kind is skipped while its failure row says to wait, and
  *     only that kind: one kind failing must not park the others behind it.
  *   - The representative. With clustering on, a story is one call through one
@@ -514,9 +551,9 @@ export async function enrichmentCandidates(
       : sql`i.published_at > ${instant(now)}::timestamptz
                 - make_interval(hours => ${options.windowHours ?? 0}::int)`;
 
-  // Under `force`, "already answered" means as of the instant this request
-  // began: a row written since then is this request's own, not an answer the
-  // person asking already had.
+  // Under `force`, "already answered" means as of the cutoff the caller named:
+  // a row written from it on is an answer somebody has, and a row written
+  // before it is not, so the item is asked about again.
   const answered = options.force
     ? sql`
         SELECT 1 FROM enrichments e
@@ -525,7 +562,7 @@ export async function enrichmentCandidates(
           AND e.kind = want.kind
           AND e.prompt_version = want.prompt_version
           AND e.lang = want.lang
-          AND e.created_at < ${instant(now)}::timestamptz`
+          AND e.created_at >= ${instant(options.forceBefore ?? now)}::timestamptz`
     : sql`
         SELECT 1 FROM enrichments e
         WHERE e.item_id = i.id
@@ -542,6 +579,9 @@ export async function enrichmentCandidates(
           SELECT 1 FROM enrichment_failures f
           WHERE f.item_id = i.id
             AND f.kind = want.kind
+            AND f.lang = want.lang
+            AND f.model = ${options.model}
+            AND f.prompt_version = want.prompt_version
             AND f.next_attempt_at > ${instant(now)}::timestamptz
         )`;
 
@@ -640,7 +680,8 @@ export async function enrichmentCounts(
     SELECT count(DISTINCT item_id) FILTER (WHERE kind = 'summary')::int AS summarised,
            count(DISTINCT item_id) FILTER (WHERE kind = 'tags')::int AS tagged,
            count(DISTINCT item_id) FILTER (WHERE kind = 'translation')::int AS translated,
-           (SELECT count(*)::int FROM enrichment_failures) AS failed
+           (SELECT count(*)::int FROM enrichment_failures
+            WHERE model = ${filter.model} AND prompt_version = ANY(${versions}::text[])) AS failed
     FROM enrichments
     WHERE model = ${filter.model} AND prompt_version = ANY(${versions}::text[])
   `;
@@ -648,29 +689,32 @@ export async function enrichmentCounts(
 }
 
 /**
- * How many calls this store has spent on since an instant.
+ * How many calls this store already spent since an instant.
  *
- * Counted from the rows rather than from memory: a counter that starts empty on
- * every restart would let a daemon that is restarted hourly spend
- * ENRICH_MAX_ITEMS_PER_HOUR on each restart.
+ * The seed for the hourly spend bound rather than the bound itself: the service
+ * counts the calls it makes itself, and asks this once at startup so that a
+ * restart does not hand it a fresh allowance. A counter that starts empty on
+ * every restart lets a daemon restarted inside the hour spend
+ * ENRICH_MAX_ITEMS_PER_HOUR again on each restart.
  *
- * Attempts and not only successes, because a bound counted over successes is
- * not a bound at all: a model that refuses every article writes nothing and
- * keeps being called, which is the opposite of what the setting is for.
+ * Rows and attempts rather than items, because the bound is about calls: one
+ * item can be two calls when the first answer does not parse, and an item
+ * counted once no matter how many times it failed is not a bound at all. What
+ * this cannot see is the calls a failure row has absorbed -- one row records
+ * every attempt at one item and kind -- so a restart after repeated refusals
+ * starts the hour slightly optimistic. That is the safe direction to be wrong
+ * in: the alternative is an hour that never refills.
  *
- * Both sides are counted as distinct items rather than rows, so an article
- * summarised and translated is one item of spend and an article whose two kinds
- * both failed is one too. next_attempt_at is what the backoff reads and is
- * always in the future for a fresh failure, so the attempt itself is stamped
- * on its own column.
+ * next_attempt_at is what the backoff reads and is always in the future for a
+ * fresh failure, so the attempt itself is stamped on its own column.
  */
-export async function enrichmentAttemptsSince(sql: postgres.Sql, since: Date): Promise<number> {
+export async function enrichmentCallsBefore(sql: postgres.Sql, since: Date): Promise<number> {
   const rows = await sql<{ count: number }[]>`
     SELECT (
-      (SELECT count(DISTINCT item_id) FROM enrichments
+      (SELECT count(*)::int FROM enrichments
        WHERE created_at >= ${instant(since)}::timestamptz)
       +
-      (SELECT count(DISTINCT item_id) FROM enrichment_failures
+      (SELECT count(*)::int FROM enrichment_failures
        WHERE last_attempt_at >= ${instant(since)}::timestamptz)
     )::int AS count
   `;

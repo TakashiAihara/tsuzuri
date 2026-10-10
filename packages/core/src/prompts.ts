@@ -195,21 +195,74 @@ function readReply<T>(
 /**
  * Take the JSON out of an answer that wrapped it in prose.
  *
- * A fenced block is taken wherever it appears, and failing that the outermost
- * object. Both are anchored to what actually contains the JSON rather than to
- * the whole reply, because a model that adds a sentence before or after the
- * object would otherwise spend the retry on an answer that was correct.
+ * In order: the whole reply, then a fenced block wherever it appears, then the
+ * first balanced object in it that parses. The order is what stops each step
+ * from costing a correct answer: a reply that is one JSON object whose string
+ * values contain backticks has no fence to find and must not be cut down to
+ * one, a fence is language-tagged by some models and bare by others, and prose
+ * around the object can contain braces of its own.
+ *
+ * Returning the first span that parses rather than the outermost one is what
+ * makes a preamble with a stray `{` usable: the span from that brace to the end
+ * of the answer is not JSON, and refusing to look further would spend the
+ * retry on an answer the model had already got right.
  */
 function unwrapJson(answer: string): string {
   const trimmed = answer.trim();
+  if (parses(trimmed)) return trimmed;
 
-  const fenced = /```(?:json)?\s*\n?([\s\S]*?)\n?```/.exec(trimmed);
-  if (fenced?.[1]?.trim()) return fenced[1].trim();
+  const fenced = /```(?:json)?\s*\n?([\s\S]*?)\n?```/i.exec(trimmed);
+  if (fenced?.[1]?.trim() && parses(fenced[1].trim())) return fenced[1].trim();
 
-  // Outermost, so a brace inside a string value does not end the object early.
-  const start = trimmed.indexOf("{");
-  const end = trimmed.lastIndexOf("}");
-  if (start >= 0 && end > start) return trimmed.slice(start, end + 1);
+  for (const span of objectSpans(trimmed)) {
+    if (parses(span)) return span;
+  }
 
+  // Nothing in the reply is JSON on its own, so the retry is told what it was
+  // rather than what to cut out of it.
   return trimmed;
+}
+
+/** Every balanced `{ ... }` span in the text, outermost first and left to right. */
+function objectSpans(text: string): string[] {
+  const spans: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+
+    // A brace inside a string value is text, so the scan has to know about the
+    // quotes and the backslashes that escape them.
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) spans.push(text.slice(start, index + 1));
+    }
+  }
+  return spans;
+}
+
+function parses(candidate: string): boolean {
+  try {
+    JSON.parse(candidate);
+    return true;
+  } catch {
+    return false;
+  }
 }

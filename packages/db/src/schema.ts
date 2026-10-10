@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -215,6 +216,9 @@ export const enrichments = pgTable(
       columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
     }),
     index("enrichments_by_created_at").on(table.createdAt),
+    index("enrichments_by_tags")
+      .on(table.model, table.promptVersion)
+      .where(sql`${table.kind} = 'tags'`),
   ],
 );
 
@@ -225,6 +229,9 @@ export const enrichmentFailures = pgTable(
       .notNull()
       .references(() => items.id, { onDelete: "cascade" }),
     kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
+    lang: text("lang").notNull().default(""),
+    model: text("model").notNull(),
+    promptVersion: text("prompt_version").notNull(),
     failures: integer("failures").notNull().default(1),
     lastError: text("last_error"),
     /** When the call was spent. See the note on the column in the migration. */
@@ -232,7 +239,9 @@ export const enrichmentFailures = pgTable(
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
   },
   (table) => [
-    primaryKey({ columns: [table.itemId, table.kind] }),
+    primaryKey({
+      columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
+    }),
     index("enrichment_failures_by_attempt").on(table.lastAttemptAt),
   ],
 );

@@ -185,12 +185,59 @@ describe("completeJson", () => {
   });
 
   test("a brace inside a string value does not end the object early", async () => {
-    // The outermost span is what makes this parse: stopping at the first "}"
+    // The balanced span is what makes this parse: stopping at the first "}"
     // would hand JSON.parse half an object and spend the retry on it.
     const { provider, asked } = stubProvider(['{"summary": "the {brace} inside a quote"}']);
     const result = await completeJson(provider, REQUEST, summaryReplySchema);
 
     expect(result).toEqual({ summary: "the {brace} inside a quote" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("takes the whole reply when it is one object, backticks in its values and all", async () => {
+    // The order that broke this: a fence is looked for first, so three
+    // backticks inside a string value cut the answer down to what was between
+    // them, which is not JSON, and the retry was spent on a correct reply.
+    const { provider, asked } = stubProvider([
+      '{"summary": "```js\\nconst x = 1;\\n``` was in the article"}',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "```js\nconst x = 1;\n``` was in the article" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("reads a fence whose language is written in capitals", async () => {
+    // The tag is decoration: a model that writes ```JSON wrote the same object
+    // as one that wrote ```json, and the reply was usable.
+    const { provider, asked } = stubProvider(['```JSON\n{"summary": "a short summary"}\n```']);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("skips a stray brace in the prose before the object", async () => {
+    // Spanning from that brace to the end of the answer is not JSON, and
+    // refusing to look past it would spend the retry on a correct reply.
+    const { provider, asked } = stubProvider([
+      'The article opens with {and closes with} that. {"summary": "a short summary"}',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: "a short summary" });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("takes the first object that parses when the answer holds two", async () => {
+    // A model that worked an example through before giving its answer names
+    // the shape twice; the one that fits is the one it settled on.
+    const { provider, asked } = stubProvider([
+      '{"summary": "how I read it: \\"{}\\""}\n{"summary": "a short summary"}',
+    ]);
+    const result = await completeJson(provider, REQUEST, summaryReplySchema);
+
+    expect(result).toEqual({ summary: 'how I read it: "{}"' });
     expect(asked).toHaveLength(1);
   });
 
