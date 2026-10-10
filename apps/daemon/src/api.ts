@@ -123,6 +123,7 @@ export function createApi(deps: ApiDeps) {
 
   app.delete("/sources/:id", async (c) => {
     const sourceId = c.req.param("id");
+    if (!z.uuid().safeParse(sourceId).success) return c.json({ error: "not found" }, 404);
     // The clusters this subscription's items belong to are refreshed in the
     // same transaction as the deletion. A representative carried only by this
     // subscription can no longer be listed, and the collapsed timeline shows a
@@ -272,7 +273,12 @@ export function createApi(deps: ApiDeps) {
         summary: items.summary,
         readAt: itemState.readAt,
         starredAt: itemState.starredAt,
-        clusterSize: sql<number>`COALESCE(${clusters.size}, 1)::int`,
+        // Same count as LISTED_CLUSTER_SIZE in @tsuzuri/db's interest.ts.
+        clusterSize: sql<number>`(CASE WHEN ${itemClusters.clusterId} IS NULL THEN 1 ELSE (
+          SELECT count(*) FROM item_clusters m
+          WHERE m.cluster_id = ${itemClusters.clusterId}
+            AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = m.item_id)
+        ) END)::int`,
       })
       .from(items)
       .innerJoin(itemSources, eq(itemSources.itemId, items.id))
@@ -400,8 +406,9 @@ export function createApi(deps: ApiDeps) {
           .onConflictDoUpdate({
             target: [itemState.userId, itemState.itemId],
             set: {
-              // A report already read keeps its own read time. Resetting it to
-              // now would make an old read look fresh to the interest profile.
+              // A report already read keeps its own read time, so unfolding
+              // the story later still shows when each report was read. The
+              // interest profile folds the story and takes its latest read.
               readAt: body.data.read ? sql`COALESCE(${itemState.readAt}, excluded.read_at)` : null,
               updatedAt: now,
             },

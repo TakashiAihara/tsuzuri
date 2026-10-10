@@ -229,8 +229,10 @@ describeIfDb("duplicate clustering", () => {
     await seed("unfollowed", "2026-10-01T00:00:00Z");
     await seed("followed", "2026-10-01T05:00:00Z");
     await handle.sql`INSERT INTO item_sources (item_id, source_id) VALUES ('followed', ${source?.id as string})`;
-    const clusterId = await foundCluster(handle.sql, "followed");
-    await joinCluster(handle.sql, { itemId: "unfollowed", clusterId, matchedBy: "embedding" });
+    // "unfollowed" founds the cluster, so the assertion only holds if the join
+    // recomputes the representative.
+    const clusterId = await foundCluster(handle.sql, "unfollowed");
+    await joinCluster(handle.sql, { itemId: "followed", clusterId, matchedBy: "embedding" });
 
     const [row] =
       await handle.sql`SELECT representative_item_id AS rep FROM clusters WHERE id = ${clusterId}::uuid`;

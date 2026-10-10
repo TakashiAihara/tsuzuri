@@ -204,8 +204,8 @@ describeIfDb("clustering", () => {
       ON CONFLICT (user_id, item_id) DO UPDATE SET read_at = excluded.read_at
     `;
     await setState(WIRE, { read: true, scope: "cluster" });
-    // COPY was read in January; reading the story now must not make that read
-    // look fresh to the interest profile.
+    // COPY was read in January; reading the story now must not rewrite when
+    // COPY itself was read.
     // Raw queries return timestamptz as text here (drizzle swaps the parser).
     expect(new Date((await readAt(COPY)) as unknown as string).toISOString()).toBe(
       "2026-01-01T00:00:00.000Z",
@@ -225,6 +225,13 @@ describeIfDb("clustering", () => {
     });
   });
 
+  test("deleting a source by a malformed id is a 404, not a database error", async () => {
+    const response = await app.fetch(
+      new Request("http://test/sources/not-a-uuid", { method: "DELETE" }),
+    );
+    expect(response.status).toBe(404);
+  });
+
   test("unsubscribing from the representative's feed leaves the story visible", async () => {
     // Last, because it removes a subscription from the shared fixture. WIRE
     // represents the story and came only through the wire feed; once that is
@@ -234,6 +241,7 @@ describeIfDb("clustering", () => {
         .status,
     ).toBe(200);
     const { items } = await listing("unread=false");
-    expect(items.map((item) => item.id)).toContain(COPY);
+    // WIRE can no longer be listed, so COPY stands for no other report.
+    expect(items.find((item) => item.id === COPY)?.clusterSize).toBe(1);
   });
 });

@@ -279,7 +279,7 @@ export type ItemStatePatch = {
   skipped?: boolean;
   /**
    * `cluster` carries a read to every report of the same story; stars and
-   * skips stay on the item named. Defaults to `item`.
+   * skips stay on the item named. Defaults to `cluster`.
    */
   scope?: "item" | "cluster";
 };

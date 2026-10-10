@@ -477,8 +477,8 @@ describeIfDb("interest profile and scoring", () => {
       try {
         await handle.sql`
           INSERT INTO item_state (user_id, item_id, read_at, starred_at) VALUES
-            (${DEFAULT_USER_ID}, 'x-fresh', '2026-08-11T01:00:00Z', NULL),
-            (${DEFAULT_USER_ID}, 'x-week-old', '2026-08-11T02:00:00Z', '2026-08-11T03:00:00Z')
+            (${DEFAULT_USER_ID}, 'x-fresh', '2026-08-11T01:00:00Z', '2026-08-11T01:30:00Z'),
+            (${DEFAULT_USER_ID}, 'x-week-old', '2026-08-11T02:00:00Z', NULL)
         `;
         // Unfolded this is three: two reads and a star.
         expect(await signalCount(handle.sql, DEFAULT_USER_ID)).toBe(2);
@@ -487,8 +487,25 @@ describeIfDb("interest profile and scoring", () => {
         expect(rows).toHaveLength(1);
         expect(rows[0]?.itemId).toBe("x-week-old");
         expect(rows[0]?.readAt?.toISOString()).toBe("2026-08-11T02:00:00.000Z");
-        expect(rows[0]?.starredAt?.toISOString()).toBe("2026-08-11T03:00:00.000Z");
+        // The star is on the member reacted to earlier; the folded row keeps it.
+        expect(rows[0]?.starredAt?.toISOString()).toBe("2026-08-11T01:30:00.000Z");
       } finally {
+        await dropClusters();
+      }
+    });
+
+    test("a report no subscription carries is not counted in the row's +N", async () => {
+      await resetState();
+      await seedProfile();
+      await seedCluster();
+      await handle.sql`DELETE FROM item_sources WHERE item_id = 'x-fresh'`;
+      try {
+        const collapsed = await scoreItems(handle.sql, { ...scoreDefaults, collapse: true }, NOW);
+        expect(collapsed.find((item) => item.id === "x-week-old")?.clusterSize).toBe(1);
+      } finally {
+        await handle.sql`
+          INSERT INTO item_sources (item_id, source_id) VALUES ('x-fresh', ${sourceRead})
+        `;
         await dropClusters();
       }
     });

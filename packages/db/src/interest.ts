@@ -154,7 +154,7 @@ export async function signalledItems(
            skipped_at AS "skippedAt",
            embedding::text AS embedding
     FROM stories
-    ORDER BY story_latest DESC
+    ORDER BY story_latest DESC, item_id
     LIMIT ${options.limit}
   `;
 
@@ -304,6 +304,17 @@ export type ScoredItem = {
  */
 const STORY_ROW = `(ic.cluster_id IS NULL OR cl.representative_item_id = i.id)`;
 
+/**
+ * The reports a row stands for, counting only members a subscription still
+ * carries: `clusters.size` keeps every member, and a report from a feed you
+ * left cannot be shown by `--no-collapse`, so it must not be in the "+N".
+ */
+export const LISTED_CLUSTER_SIZE = `(CASE WHEN ic.cluster_id IS NULL THEN 1 ELSE (
+  SELECT count(*) FROM item_clusters m
+  WHERE m.cluster_id = ic.cluster_id
+    AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = m.item_id)
+) END)`;
+
 export type ScoreOptions = {
   userId: string;
   limit: number;
@@ -378,7 +389,7 @@ export async function scoreItems(
            st.read_at AS "readAt",
            st.starred_at AS "starredAt",
            m.affinity_similarity AS "affinitySimilarity",
-           COALESCE(cl.size, 1)::int AS "clusterSize",
+           ${sql.unsafe(LISTED_CLUSTER_SIZE)}::int AS "clusterSize",
            m.affinity_similarity
              -- GREATEST(0, ...) on the age: a feed may publish up to a day
              -- into the future and ingest stores it, which makes the exponent
@@ -466,7 +477,7 @@ export async function explorationCandidates(
              i.summary,
              st.read_at AS "readAt",
              st.starred_at AS "starredAt",
-             COALESCE(cl.size, 1)::int AS "clusterSize",
+             ${sql.unsafe(LISTED_CLUSTER_SIZE)}::int AS "clusterSize",
              sr.reads
       FROM items i
       JOIN item_sources src ON src.item_id = i.id
