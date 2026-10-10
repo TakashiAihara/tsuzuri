@@ -3,6 +3,7 @@ import PQueue from "p-queue";
 
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
+import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createInterestService } from "./enrich/interest.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
@@ -91,7 +92,18 @@ try {
   console.error("interest scoring could not be started:", error);
 }
 
-const app = createApi({ db, sql, fetcher, config, embeddings, interest });
+/**
+ * Clustering consults embeddings when they are ready and works without them,
+ * so it starts after them and tolerates failing the same way.
+ */
+const clustering = createClusteringService({ sql, config, embeddings });
+try {
+  await clustering.start();
+} catch (error) {
+  console.error("clustering could not be started:", error);
+}
+
+const app = createApi({ db, sql, fetcher, config, embeddings, interest, clustering });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
@@ -102,6 +114,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     stopping = true;
     await server.stop();
     await interest.stop();
+    await clustering.stop();
     await embeddings.stop();
     await close();
     process.exit(0);

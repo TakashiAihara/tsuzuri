@@ -40,6 +40,7 @@ export {
 } from "./kmeans.ts";
 export { type NormalizeOptions, normalizeItem } from "./normalize.ts";
 export { RRF_K, reciprocalRankFusion, searchTerms } from "./search-query.ts";
+export { hammingDistance, simhash } from "./simhash.ts";
 export { snippetToText } from "./snippet.ts";
 export {
   defineSource,

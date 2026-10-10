@@ -104,6 +104,10 @@ export type SignalledItem = {
  *
  * Items with no vector are excluded rather than defaulted. There is no sensible
  * position in the space for an article that has not been embedded.
+ *
+ * One row per story (D24): a read carried to eight reports of the same story
+ * is one opinion, so the members of a cluster fold into the member reacted to
+ * last, with each kind of signal taken from whichever member has it.
  */
 export async function signalledItems(
   sql: postgres.Sql,
@@ -118,20 +122,39 @@ export async function signalledItems(
       embedding: string;
     }>
   >`
-    SELECT s.item_id AS "itemId",
-           s.starred_at AS "starredAt",
-           s.read_at AS "readAt",
-           s.skipped_at AS "skippedAt",
-           e.embedding::text AS embedding
-    FROM item_state s
-    JOIN item_embeddings e ON e.item_id = s.item_id
-    WHERE s.user_id = ${options.userId}
-      AND (s.starred_at IS NOT NULL OR s.read_at IS NOT NULL OR s.skipped_at IS NOT NULL)
-    ORDER BY GREATEST(
-      COALESCE(s.starred_at, 'epoch'::timestamptz),
-      COALESCE(s.read_at, 'epoch'::timestamptz),
-      COALESCE(s.skipped_at, 'epoch'::timestamptz)
-    ) DESC
+    WITH reacted AS (
+      SELECT s.item_id, s.starred_at, s.read_at, s.skipped_at, e.embedding,
+             COALESCE(ic.cluster_id::text, s.item_id::text) AS story,
+             GREATEST(
+               COALESCE(s.starred_at, 'epoch'::timestamptz),
+               COALESCE(s.read_at, 'epoch'::timestamptz),
+               COALESCE(s.skipped_at, 'epoch'::timestamptz)
+             ) AS latest
+      FROM item_state s
+      JOIN item_embeddings e ON e.item_id = s.item_id
+      LEFT JOIN item_clusters ic ON ic.item_id = s.item_id
+      WHERE s.user_id = ${options.userId}
+        AND (s.starred_at IS NOT NULL OR s.read_at IS NOT NULL OR s.skipped_at IS NOT NULL)
+    ),
+    stories AS (
+      SELECT DISTINCT ON (story)
+             item_id,
+             max(starred_at) OVER w AS starred_at,
+             max(read_at) OVER w AS read_at,
+             max(skipped_at) OVER w AS skipped_at,
+             max(latest) OVER w AS story_latest,
+             embedding
+      FROM reacted
+      WINDOW w AS (PARTITION BY story)
+      ORDER BY story, latest DESC, item_id
+    )
+    SELECT item_id AS "itemId",
+           starred_at AS "starredAt",
+           read_at AS "readAt",
+           skipped_at AS "skippedAt",
+           embedding::text AS embedding
+    FROM stories
+    ORDER BY story_latest DESC, item_id
     LIMIT ${options.limit}
   `;
 
@@ -232,19 +255,24 @@ export async function readProfileSummary(
  * How many signals exist, for deciding whether scoring may activate.
  *
  * Counts individual signals rather than rows: an article you read and then
- * starred is two, because it told us two things. Undecayed, because this
+ * starred is two, because it told us two things. Per story, as in
+ * signalledItems, so a read carried across a cluster counts once. Undecayed, because this
  * answers "is there enough history to cluster" and an old signal still counts
  * as history even once it barely counts as evidence.
  */
 export async function signalCount(sql: postgres.Sql, userId: string): Promise<number> {
   const rows = await sql<Array<{ count: number }>>`
     SELECT (
-      count(*) FILTER (WHERE starred_at IS NOT NULL)
-      + count(*) FILTER (WHERE read_at IS NOT NULL)
-      + count(*) FILTER (WHERE skipped_at IS NOT NULL)
+      count(DISTINCT story) FILTER (WHERE starred_at IS NOT NULL)
+      + count(DISTINCT story) FILTER (WHERE read_at IS NOT NULL)
+      + count(DISTINCT story) FILTER (WHERE skipped_at IS NOT NULL)
     )::int AS count
-    FROM item_state
-    WHERE user_id = ${userId}
+    FROM (
+      SELECT s.*, COALESCE(ic.cluster_id::text, s.item_id::text) AS story
+      FROM item_state s
+      LEFT JOIN item_clusters ic ON ic.item_id = s.item_id
+      WHERE s.user_id = ${userId}
+    ) per_story
   `;
   return rows[0]?.count ?? 0;
 }
@@ -261,7 +289,31 @@ export type ScoredItem = {
   starredAt: string | null;
   interest: number;
   affinitySimilarity: number;
+  /** Items reporting the same story, including this one. 1 when it is alone. */
+  clusterSize: number;
 };
+
+/**
+ * Keep only rows that stand for a story: an item no cluster has claimed, or
+ * the stored representative of its cluster.
+ *
+ * Not DISTINCT ON over the filtered list. That would pick, per cluster, the
+ * first row surviving the unread filter -- so reading the representative would
+ * promote the next unread member into its place, and the story would come
+ * back. A fixed representative cannot be replaced by a filter.
+ */
+const STORY_ROW = `(ic.cluster_id IS NULL OR cl.representative_item_id = i.id)`;
+
+/**
+ * The reports a row stands for, counting only members a subscription still
+ * carries: `clusters.size` keeps every member, and a report from a feed you
+ * left cannot be shown by `--no-collapse`, so it must not be in the "+N".
+ */
+export const LISTED_CLUSTER_SIZE = `(CASE WHEN ic.cluster_id IS NULL THEN 1 ELSE (
+  SELECT count(*) FROM item_clusters m
+  WHERE m.cluster_id = ic.cluster_id
+    AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = m.item_id)
+) END)`;
 
 export type ScoreOptions = {
   userId: string;
@@ -274,6 +326,8 @@ export type ScoreOptions = {
   estimatedFactor: number;
   /** How far back to consider candidates, in days. */
   windowDays: number;
+  /** One row per story rather than one per report of it. */
+  collapse: boolean;
 };
 
 /**
@@ -335,6 +389,7 @@ export async function scoreItems(
            st.read_at AS "readAt",
            st.starred_at AS "starredAt",
            m.affinity_similarity AS "affinitySimilarity",
+           ${sql.unsafe(LISTED_CLUSTER_SIZE)}::int AS "clusterSize",
            m.affinity_similarity
              -- GREATEST(0, ...) on the age: a feed may publish up to a day
              -- into the future and ingest stores it, which makes the exponent
@@ -354,7 +409,10 @@ export async function scoreItems(
     FROM matched m
     JOIN items i ON i.id = m.id
     LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ${options.userId}
+    LEFT JOIN item_clusters ic ON ic.item_id = i.id
+    LEFT JOIN clusters cl ON cl.id = ic.cluster_id
     WHERE (${!options.unreadOnly} OR st.read_at IS NULL)
+      AND (${!options.collapse} OR ${sql.unsafe(STORY_ROW)})
       AND (
         ${options.sourceId}::uuid IS NULL
         OR EXISTS (
@@ -375,6 +433,8 @@ export type ExplorationOptions = {
   windowDays: number;
   /** Ids already chosen by scoring, which must not be offered again. */
   exclude: readonly string[];
+  /** One row per story, as in scoreItems. */
+  collapse: boolean;
 };
 
 /**
@@ -417,13 +477,17 @@ export async function explorationCandidates(
              i.summary,
              st.read_at AS "readAt",
              st.starred_at AS "starredAt",
+             ${sql.unsafe(LISTED_CLUSTER_SIZE)}::int AS "clusterSize",
              sr.reads
       FROM items i
       JOIN item_sources src ON src.item_id = i.id
       JOIN source_reads sr ON sr.source_id = src.source_id
       LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ${options.userId}
+      LEFT JOIN item_clusters ic ON ic.item_id = i.id
+      LEFT JOIN clusters cl ON cl.id = ic.cluster_id
       WHERE i.published_at > ${instant(now)}::timestamptz
                              - make_interval(days => ${options.windowDays}::int)
+        AND (${!options.collapse} OR ${sql.unsafe(STORY_ROW)})
         AND NOT (i.id = ANY(${[...options.exclude]}::text[]))
         AND (${!options.unreadOnly} OR st.read_at IS NULL)
         AND (
@@ -444,6 +508,7 @@ export async function explorationCandidates(
            summary,
            "readAt",
            "starredAt",
+           "clusterSize",
            0::double precision AS "affinitySimilarity",
            0::double precision AS interest
     FROM candidates

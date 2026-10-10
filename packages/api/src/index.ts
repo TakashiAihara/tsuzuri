@@ -64,6 +64,12 @@ export const itemSummarySchema = z.strictObject({
   summary: z.string().nullable(),
   readAt: z.string().nullable(),
   starredAt: z.string().nullable(),
+  /**
+   * How many items report the same story, this one included. 1 means it is
+   * alone, or clustering is off. Above 1, a collapsed listing is showing this
+   * row in place of the others.
+   */
+  clusterSize: z.number(),
 });
 export type ItemSummary = z.infer<typeof itemSummarySchema>;
 
@@ -195,6 +201,8 @@ export const rankedItemSchema = z.strictObject({
   interest: z.number(),
   affinitySimilarity: z.number(),
   exploration: z.boolean(),
+  /** As on itemSummarySchema. */
+  clusterSize: z.number(),
 });
 export type RankedItem = z.infer<typeof rankedItemSchema>;
 
@@ -269,4 +277,9 @@ export type ItemStatePatch = {
   read?: boolean;
   starred?: boolean;
   skipped?: boolean;
+  /**
+   * `cluster` carries a read to every report of the same story; stars and
+   * skips stay on the item named. Defaults to `cluster`.
+   */
+  scope?: "item" | "cluster";
 };

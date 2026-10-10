@@ -217,7 +217,10 @@ CREATE TABLE item_clusters (
   item_id    text PRIMARY KEY REFERENCES items (id) ON DELETE CASCADE,
   cluster_id uuid NOT NULL REFERENCES clusters (id) ON DELETE CASCADE,
   -- How it matched, for debugging a cluster that looks wrong.
-  matched_by text NOT NULL CHECK (matched_by IN ('embedding', 'simhash', 'both')),
+  -- NULL for the member that founded the cluster. Corrected while
+  -- implementing: the draft had NOT NULL, but the founder matched nothing and
+  -- still needs a row, or the worker would pick it up as pending forever.
+  matched_by text CHECK (matched_by IN ('embedding', 'simhash', 'both')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX item_clusters_by_cluster ON item_clusters (cluster_id);
@@ -246,19 +249,27 @@ For each item with no cluster, look at items published within `CLUSTER_WINDOW_HO
 - cosine distance below `CLUSTER_MAX_DISTANCE`, default 0.15 — much tighter than search's 0.6, because search wants related and this wants same;
 - or Hamming distance at most `CLUSTER_SIMHASH_MAX_BITS`, default 6 of 64.
 
-Either signal alone is enough; `matched_by` records which fired. An item joins the cluster of its best match, or opens a new cluster of one. This is single-link agglomeration over a window, which can chain — A near B, B near C, A not near C — and at these thresholds a chain means the pair really is one story told twice. Tightening further would split real duplicates apart, which is the failure the issue is about.
+Either signal alone is enough; `matched_by` records which fired. An item joins the cluster of its best match, or opens a new cluster of one. This is single-link agglomeration over a window, which can chain — A near B, B near C, A not near C — and at these thresholds a chain means the pair really is one story told twice. Tightening further would split real duplicates apart, which is the failure the issue is about. Chaining also means the window bounds each join, not the cluster: a story that keeps drawing follow-ups can span longer than 72 hours.
+
+Corrected while implementing: a cluster never holds two items that share a subscription. A feed does not report the same news twice; what looks alike inside one feed is a series or a follow-up. On a real corpus of 145 articles, parts 1-3 of one series matched each other at cosine distances 0.122-0.132, between the true cross-outlet matches at 0.119-0.149, so no distance threshold separates them; whether the two items share a subscription separates them exactly. The check runs against every member of the candidate's cluster rather than the candidate alone — otherwise part 2 joins part 1 through another outlet's copy of part 1. This is also what the issue's title, "across sources", says.
 
 The worker runs on the same shape as the embedding backfill: poll for items with no `item_clusters` row, no queue table, resumable, and safe to run repeatedly. `CLUSTERING_ENABLED` defaults to false.
 
+Corrected while implementing: with an embedding model in use, an item is not clustered until the backfill has given it a vector or recorded a failure for it. Membership is decided once and never revisited, so clustering an item before its vector exists would decide it with one signal missing, and two reports of a rewritten story would stay split for good depending only on which worker reached them first.
+
 ### Collapsing
 
-Collapsing is a query-time decision, expressed as `DISTINCT ON (COALESCE(cluster_id::text, item_id))` over the ranked or ordered list — an unclustered item is its own group, so one query serves both cases. Verified against the planner.
+Collapsing is a query-time decision: a listing keeps an item that no cluster has claimed, or the stored representative of its cluster.
+
+Corrected while implementing: the draft expressed this as `DISTINCT ON (COALESCE(cluster_id::text, item_id))` over the ranked or ordered list. Applied after the unread filter, that picks the first surviving member of each cluster, so reading the representative promotes the next unread member into its place and the story comes back — the failure D24 exists to prevent, reachable even with read propagation, through any read that does not propagate. Filtering to the stored representative cannot be undone by another filter.
 
 The representative is the cluster member with the earliest non-estimated `published_at`, ties broken by longest `search_text`: the outlet that published first, and among simultaneous ones the version with the most content. Deterministic, and computable without reference to anything user-specific. An attractive alternative — the version from the subscription you read most — is recorded and not taken. See D23.
 
-When a listing is collapsed, marking the visible row read marks every member of its cluster read. Anything else resurfaces the same story under the next representative, which is exactly what the issue asks to stop. `POST /items/:id/state` gains `scope: item|cluster`, defaulting to `item`; the CLI and MCP pass `cluster` when they collapsed. Note that a propagated read is not noise for interest scoring: a cluster is one story by construction, so "you read this story" is true of every member. See D24.
+Corrected while implementing: members still carried by a subscription come first. A collapsed listing shows a story through its representative alone, so a representative no subscription carries — its feed was unsubscribed — would hide the whole story, reports from feeds still followed included. Deleting a subscription recomputes the representatives of the clusters its items belong to, in the same transaction.
 
-`--no-collapse` and `collapse=false` expand.
+When a listing is collapsed, marking the visible row read marks every member of its cluster read. Anything else resurfaces the same story under the next representative, which is exactly what the issue asks to stop. `POST /items/:id/state` gains `scope: item|cluster`, defaulting to `cluster`, so every client propagates: the CLI's `mark`, and the MCP server's `mark_read`, whose ids may come from `search_articles` (which never collapses) — a story read there would otherwise stay unread in the collapsed list. `mark --no-collapse` sends `item`. Only the read is carried: a star or a skip is about the article in front of you. Correction (2026-10-10, review of PR #38): this paragraph first kept MCP at `item` and argued a propagated read is not noise for scoring. Both were wrong: a member read through search left the story unread in the list, and the profile counted one carried read once per member. The interest profile and the activation count now fold a cluster into one signal. See D24.
+
+`--no-collapse` and `collapse=false` expand. A listing filtered to one subscription never collapses: no cluster holds two items from one feed, so collapsing there could only hide that feed's own reports behind another outlet's representative.
 
 ## Part 3: LLM enrichment (#5)
 
@@ -527,7 +538,7 @@ Settled 2026-08-12, including D14, D20 and D33, which were the three left open i
 | D21 | How the two clustering signals combine | Either alone is sufficient, within a 72-hour window: cosine distance below 0.15, or Hamming distance at most 6 of 64. `matched_by` records which. Requiring both would miss the wire copy the embedding arm scores as merely related, and the SimHash arm is what makes clustering partly work with no model configured |
 | D22 | SimHash tokenisation | Character 3-grams uniformly. Word tokenisation does not segment Japanese, which is why PGroonga is a dependency; two tokenisers would be two behaviours to tune where one works |
 | D23 | Which member represents a cluster | Earliest non-estimated `published_at`, ties broken by longest `search_text`. Rejected for now: the member from the subscription you read most, which is the version you would rather read but couples clustering to reading history and makes the representative user-specific |
-| D24 | Read state across a cluster | Marking a collapsed row read marks every member. Anything else resurfaces the story under the next representative. The propagated read is not noise for scoring, because a cluster is one story by construction |
+| D24 | Read state across a cluster | Marking a collapsed row read marks every member. Anything else resurfaces the story under the next representative. Every client propagates (the API default), and the interest profile counts a cluster as one signal |
 | D25 | Chat provider implementations | Three thin `fetch` clients, one per wire format, no vendor SDKs. The three request shapes differ genuinely — top-level `system` and an `anthropic-version` header, a system message, `systemInstruction` and `contents` — and a dependency per provider would buy nothing the abstraction does not already give |
 | D26 | How structured output is obtained | JSON asked for in the prompt, validated with zod, one retry with the parse error, then a recorded failure. Rejected: the providers' structured-output modes, which are three different mechanisms and are unimplemented or partial across most of what `openai-compatible` targets, so the fallback would exist anyway |
 | D27 | What makes a prompt change replayable | `model` and `prompt_version` in the primary key of `enrichments`, so a change writes beside rather than over. The issue's completion criterion is a property of the key. Growth is bounded by an explicit `enrich prune`, never automatically |

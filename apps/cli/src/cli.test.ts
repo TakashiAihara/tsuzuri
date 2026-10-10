@@ -11,12 +11,24 @@ import { afterAll, describe, expect, test } from "bun:test";
  */
 
 let searchResponse: unknown = { mode: "text-only", results: [] };
+let itemsResponse: unknown = { items: [] };
+/** What the CLI last sent, so a test can assert on the request as well as the output. */
+let lastItemsQuery: URLSearchParams | null = null;
+let lastStateBody: unknown = null;
 
 const daemon = Bun.serve({
   port: 0,
-  fetch(request) {
-    const { pathname } = new URL(request.url);
-    if (pathname === "/search") return Response.json(searchResponse);
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/search") return Response.json(searchResponse);
+    if (url.pathname === "/items") {
+      lastItemsQuery = url.searchParams;
+      return Response.json(itemsResponse);
+    }
+    if (url.pathname.endsWith("/state")) {
+      lastStateBody = await request.json();
+      return Response.json({ state: {} });
+    }
     return Response.json({ error: "no stub" }, { status: 404 });
   },
 });
@@ -101,5 +113,49 @@ describe("tsuzuri search", () => {
     const { stdout, code } = await run(["search", "Rust"]);
     expect(code).toBe(0);
     expect(stdout).toContain("Rust 1.90 released & shipped");
+  });
+});
+
+describe("read and mark with duplicate clustering", () => {
+  const row = (id: string, title: string, clusterSize: number) => ({
+    id: `${id}${"0".repeat(64 - id.length)}`,
+    url: `https://e.com/${id}`,
+    title,
+    author: null,
+    publishedAt: new Date().toISOString(),
+    publishedAtEstimated: false,
+    summary: null,
+    readAt: null,
+    starredAt: null,
+    clusterSize,
+  });
+
+  test("a collapsed row says how many other reports it stands for", async () => {
+    itemsResponse = {
+      items: [row("aaaa1111", "Syndicated story", 3), row("bbbb2222", "Only one", 1)],
+    };
+    const { stdout, code } = await run(["read"]);
+    expect(code).toBe(0);
+    expect(lastItemsQuery?.has("collapse")).toBe(false);
+    expect(stdout).toContain("Syndicated story  +2");
+    // A story only one outlet ran carries no count.
+    expect(stdout).not.toMatch(/Only one\s+\+/);
+  });
+
+  test("--no-collapse asks for every report and shows no count", async () => {
+    // Every report is already on screen, so "+2" would read as two more hidden.
+    itemsResponse = { items: [row("aaaa1111", "Syndicated story", 3)] };
+    const { stdout } = await run(["read", "--no-collapse"]);
+    expect(lastItemsQuery?.get("collapse")).toBe("false");
+    expect(stdout).toContain("Syndicated story");
+    expect(stdout).not.toContain("+2");
+  });
+
+  test("mark reads the whole story, and --no-collapse only the report named", async () => {
+    await run(["mark", "aaaa1111"]);
+    expect(lastStateBody).toEqual({ read: true, scope: "cluster" });
+
+    await run(["mark", "--no-collapse", "aaaa1111"]);
+    expect(lastStateBody).toEqual({ read: true, scope: "item" });
   });
 });

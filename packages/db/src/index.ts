@@ -1,5 +1,22 @@
 export { type CreateDatabaseOptions, createDatabase, type Database } from "./client.ts";
 export {
+  bestClusterMatch,
+  type ClusteringCounts,
+  type ClusterMatch,
+  clusteringCounts,
+  clusterMemberIds,
+  clustersOfSource,
+  foundCluster,
+  joinCluster,
+  type MatchedBy,
+  type MatchOptions,
+  matchedBy,
+  type PendingClusterItem,
+  pendingClusterItems,
+  refreshCluster,
+  writeSimhash,
+} from "./clustering.ts";
+export {
   createEmbeddingIndex,
   createEmbeddingTable,
   type EmbeddingCounts,
@@ -38,11 +55,13 @@ export {
 } from "./interest.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
+  clusters,
   DEFAULT_USER_ID,
   embeddingFailures,
   embeddingModel,
   type ItemRow,
   type ItemStateRow,
+  itemClusters,
   itemSources,
   itemState,
   items,

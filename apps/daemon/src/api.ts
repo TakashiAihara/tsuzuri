@@ -1,20 +1,26 @@
 import { searchTerms } from "@tsuzuri/core";
 import {
+  clusterMemberIds,
+  clusters,
+  clustersOfSource,
   type Database,
   DEFAULT_USER_ID,
   hybridSearch,
+  itemClusters,
   itemSources,
   itemState,
   items,
+  refreshCluster,
   sources,
 } from "@tsuzuri/db";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import PQueue from "p-queue";
 import type postgres from "postgres";
 import { z } from "zod";
 
 import type { Config } from "./config.ts";
+import type { ClusteringService } from "./enrich/clustering.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
 import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
@@ -39,6 +45,7 @@ export type ApiDeps = {
   config: Config;
   embeddings: EmbeddingService;
   interest: InterestService;
+  clustering: ClusteringService;
 };
 
 const addSourceSchema = z.object({
@@ -65,11 +72,18 @@ const listItemsSchema = z.object({
    * `recent` unless someone changed it.
    */
   sort: z.enum(["recent", "score"]).optional(),
+  /**
+   * One row per story rather than one per report of it. On by default: a
+   * story syndicated to eight outlets occupying eight rows is the thing
+   * clustering exists to stop. Has no effect while clustering is off, since
+   * then nothing belongs to a cluster.
+   */
+  collapse: z.stringbool().default(true),
 });
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
-  const { db, sql: rawSql, fetcher, config, embeddings, interest } = deps;
+  const { db, sql: rawSql, fetcher, config, embeddings, interest, clustering } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -108,12 +122,21 @@ export function createApi(deps: ApiDeps) {
   });
 
   app.delete("/sources/:id", async (c) => {
-    const deleted = await db
-      .delete(sources)
-      .where(eq(sources.id, c.req.param("id")))
-      .returning({ id: sources.id });
-    if (deleted.length === 0) return c.json({ error: "not found" }, 404);
-    return c.json({ deleted: deleted.length });
+    const sourceId = c.req.param("id");
+    if (!z.uuid().safeParse(sourceId).success) return c.json({ error: "not found" }, 404);
+    // The clusters this subscription's items belong to are refreshed in the
+    // same transaction as the deletion. A representative carried only by this
+    // subscription can no longer be listed, and the collapsed timeline shows a
+    // story through its representative alone -- so without the refresh the
+    // whole story, reports from feeds still followed included, would vanish.
+    const deleted = await rawSql.begin(async (tx) => {
+      const affected = await clustersOfSource(tx, sourceId);
+      const rows = await tx`DELETE FROM sources WHERE id = ${sourceId}::uuid RETURNING id`;
+      for (const clusterId of affected) await refreshCluster(tx, clusterId);
+      return rows.length;
+    });
+    if (deleted === 0) return c.json({ error: "not found" }, 404);
+    return c.json({ deleted });
   });
 
   app.post("/sources/import-opml", async (c) => {
@@ -180,6 +203,10 @@ export function createApi(deps: ApiDeps) {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
     const { unread, limit, sourceId } = parsed.data;
+    // Within one subscription there is nothing to collapse: a story never holds
+    // two items from the same feed, so collapsing could only hide this feed's
+    // own reports behind another outlet's representative.
+    const collapse = parsed.data.collapse && !sourceId;
     const sort = parsed.data.sort ?? config.TIMELINE_DEFAULT_SORT;
 
     /**
@@ -196,9 +223,10 @@ export function createApi(deps: ApiDeps) {
         limit,
         unreadOnly: unread,
         sourceId: sourceId ?? null,
+        collapse,
       });
       if (page.scoring.active) return c.json({ items: page.items, scoring: page.scoring });
-      const fallback = await listRecent({ unread, limit, sourceId });
+      const fallback = await listRecent({ unread, limit, sourceId, collapse });
       return c.json({
         items: fallback.map((item) => ({
           ...item,
@@ -210,7 +238,7 @@ export function createApi(deps: ApiDeps) {
       });
     }
 
-    return c.json({ items: await listRecent({ unread, limit, sourceId }) });
+    return c.json({ items: await listRecent({ unread, limit, sourceId, collapse }) });
   });
 
   /** The reverse-chronological listing, shared by the plain and degraded paths. */
@@ -218,12 +246,21 @@ export function createApi(deps: ApiDeps) {
     unread: boolean;
     limit: number;
     sourceId?: string | undefined;
+    collapse: boolean;
   }) {
-    const { unread, limit, sourceId } = options;
+    const { unread, limit, sourceId, collapse } = options;
 
     const conditions = [];
     if (unread) conditions.push(isNull(itemState.readAt));
     if (sourceId) conditions.push(eq(itemSources.sourceId, sourceId));
+    // A story row is an item no cluster has claimed, or its cluster's stored
+    // representative. Why a fixed representative rather than DISTINCT ON is
+    // written beside STORY_ROW in packages/db/src/interest.ts.
+    if (collapse) {
+      conditions.push(
+        or(isNull(itemClusters.clusterId), eq(clusters.representativeItemId, items.id)),
+      );
+    }
 
     const rows = await db
       .selectDistinctOn([items.publishedAt, items.id], {
@@ -236,6 +273,12 @@ export function createApi(deps: ApiDeps) {
         summary: items.summary,
         readAt: itemState.readAt,
         starredAt: itemState.starredAt,
+        // Same count as LISTED_CLUSTER_SIZE in @tsuzuri/db's interest.ts.
+        clusterSize: sql<number>`(CASE WHEN ${itemClusters.clusterId} IS NULL THEN 1 ELSE (
+          SELECT count(*) FROM item_clusters m
+          WHERE m.cluster_id = ${itemClusters.clusterId}
+            AND EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = m.item_id)
+        ) END)::int`,
       })
       .from(items)
       .innerJoin(itemSources, eq(itemSources.itemId, items.id))
@@ -243,6 +286,8 @@ export function createApi(deps: ApiDeps) {
         itemState,
         and(eq(itemState.itemId, items.id), eq(itemState.userId, DEFAULT_USER_ID)),
       )
+      .leftJoin(itemClusters, eq(itemClusters.itemId, items.id))
+      .leftJoin(clusters, eq(clusters.id, itemClusters.clusterId))
       .where(conditions.length > 0 ? and(...conditions) : undefined)
       .orderBy(desc(items.publishedAt), items.id)
       .limit(limit);
@@ -309,6 +354,15 @@ export function createApi(deps: ApiDeps) {
         read: z.boolean().optional(),
         starred: z.boolean().optional(),
         skipped: z.boolean().optional(),
+        /**
+         * `cluster` (the default) carries a read to every report of the same
+         * story (D24), so a story read through search or MCP does not stay
+         * unread in the collapsed list. `item` is for a client showing every
+         * report. Only the read is carried: a star or a skip is about the
+         * article in front of you. Carried reads do not inflate the interest
+         * profile, which folds a cluster into one signal.
+         */
+        scope: z.enum(["item", "cluster"]).default("cluster"),
       })
       .safeParse(await c.req.json());
     if (!body.success) return c.json({ error: z.treeifyError(body.error) }, 400);
@@ -322,14 +376,46 @@ export function createApi(deps: ApiDeps) {
     if (body.data.starred !== undefined) patch.starredAt = body.data.starred ? now : null;
     if (body.data.skipped !== undefined) patch.skippedAt = body.data.skipped ? now : null;
 
-    const [row] = await db
-      .insert(itemState)
-      .values({ userId: DEFAULT_USER_ID, itemId: resolved.id, ...patch })
-      .onConflictDoUpdate({
-        target: [itemState.userId, itemState.itemId],
-        set: { ...patch, updatedAt: now },
-      })
-      .returning();
+    const others =
+      body.data.scope === "cluster" && body.data.read !== undefined
+        ? (await clusterMemberIds(rawSql, resolved.id)).filter((id) => id !== resolved.id)
+        : [];
+
+    // One transaction, so a propagation that fails does not leave the named
+    // item read and the rest of its story unread behind a 500.
+    const row = await db.transaction(async (tx) => {
+      const [written] = await tx
+        .insert(itemState)
+        .values({ userId: DEFAULT_USER_ID, itemId: resolved.id, ...patch })
+        .onConflictDoUpdate({
+          target: [itemState.userId, itemState.itemId],
+          set: { ...patch, updatedAt: now },
+        })
+        .returning();
+
+      if (others.length > 0) {
+        await tx
+          .insert(itemState)
+          .values(
+            others.map((itemId) => ({
+              userId: DEFAULT_USER_ID,
+              itemId,
+              readAt: body.data.read ? now : null,
+            })),
+          )
+          .onConflictDoUpdate({
+            target: [itemState.userId, itemState.itemId],
+            set: {
+              // A report already read keeps its own read time, so unfolding
+              // the story later still shows when each report was read. The
+              // interest profile folds the story and takes its latest read.
+              readAt: body.data.read ? sql`COALESCE(${itemState.readAt}, excluded.read_at)` : null,
+              updatedAt: now,
+            },
+          });
+      }
+      return written;
+    });
 
     return c.json({ state: row });
   });
@@ -463,6 +549,7 @@ export function createApi(deps: ApiDeps) {
           ...embeddingStatus,
         },
         scoring: await interest.status(),
+        clustering: await clustering.status(),
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.
         llm: { enabled: false, reason: "not implemented until P3" },
