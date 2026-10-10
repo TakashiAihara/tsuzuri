@@ -2,7 +2,7 @@
 
 A self-hosted feed reader built for a CLI and for AI agents, with first-class support for sites that do not publish a feed at all.
 
-> Status: early. Ingest, the CLI, hybrid search, the MCP server and interest scoring work end to end. Summarisation, tagging, clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
+> Status: early. Ingest, the CLI, hybrid search, the MCP server and interest scoring work end to end. Summarisation, tagging, article duplicate clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
 
 ## Why another reader
 
@@ -266,7 +266,7 @@ This narrows the exposure rather than eliminating it. The address is checked by 
 | --- | --- | --- |
 | P1 | Ingest (RSS/Atom/JSON Feed), storage, CLI, OPML import | done |
 | P2 | Embeddings, hybrid search (pgvector + PGroonga), MCP server | done |
-| P3 | Interest scoring, summarisation, translation, tagging, clustering, digests | in progress |
+| P3 | Interest scoring, summarisation, translation, tagging, article duplicate clustering, digests | in progress |
 | P4 | Web UI (React + TanStack + shadcn/ui), packaging | |
 | P5 | Source plugins: declarative YAML rules (CSS/XPath), TypeScript plugins, external generators | |
 | P6 | Headless rendering, LLM-based extraction and rule repair | |
