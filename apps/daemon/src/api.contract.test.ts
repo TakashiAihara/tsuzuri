@@ -17,6 +17,7 @@ import type { z } from "zod";
 
 import { createApi } from "./api.ts";
 import { loadConfig } from "./config.ts";
+import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createInterestService } from "./enrich/interest.ts";
 
@@ -78,6 +79,7 @@ describeIfDb("api contract", () => {
     await embeddings.start();
     const interest = createInterestService({ sql: handle.sql, config, embeddings });
     await interest.start();
+    const clustering = createClusteringService({ sql: handle.sql, config, embeddings });
     app = createApi({
       db: handle.db,
       sql: handle.sql,
@@ -85,6 +87,7 @@ describeIfDb("api contract", () => {
       config,
       embeddings,
       interest,
+      clustering,
     });
   });
 

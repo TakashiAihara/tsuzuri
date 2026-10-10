@@ -143,7 +143,12 @@ describeIfDb("createInterestService", () => {
     for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "starred");
     await interest.rebuild();
 
-    const page = await interest.rank({ limit: 10, unreadOnly: false, sourceId: null });
+    const page = await interest.rank({
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     expect(page.scoring.active).toBe(true);
     const ids = page.items.map((item) => item.id);
     // Everything on the Rust axis outranks everything off it.
@@ -172,7 +177,12 @@ describeIfDb("createInterestService", () => {
     const { interest } = await ready();
     for (const id of ["rust-a", "rust-b", "cooking-a", "cooking-b"]) await signal(id, "read");
     await interest.rebuild();
-    const before = await interest.rank({ limit: 10, unreadOnly: false, sourceId: null });
+    const before = await interest.rank({
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     const rustBefore = before.items.find((item) => item.id === "rust-c")?.interest as number;
 
     // Skipping on the Rust axis must cost the Rust cluster, not the cooking one.
@@ -188,7 +198,12 @@ describeIfDb("createInterestService", () => {
     // makes affinity exactly 1 for an interest nothing has been skipped near.
     expect(rows.slice(1).every((row) => row.skipped === 0)).toBe(true);
 
-    const after = await interest.rank({ limit: 10, unreadOnly: false, sourceId: null });
+    const after = await interest.rank({
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     const rustAfter = after.items.find((item) => item.id === "rust-c")?.interest as number;
     expect(rustAfter).toBeLessThan(rustBefore);
   });
@@ -236,7 +251,12 @@ describeIfDb("createInterestService", () => {
     for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "read");
     await interest.rebuild();
 
-    const page = await interest.rank({ limit: 5, unreadOnly: false, sourceId: null });
+    const page = await interest.rank({
+      limit: 5,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     const explored = page.items.filter((item) => item.exploration);
     expect(explored.length).toBeGreaterThan(0);
     // An unlabelled item that ranking did not choose is indistinguishable from
@@ -257,7 +277,12 @@ describeIfDb("createInterestService", () => {
     for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "starred");
     await interest.rebuild();
 
-    const page = await interest.rank({ limit: 7, unreadOnly: false, sourceId: null });
+    const page = await interest.rank({
+      limit: 7,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     expect(page.items).toHaveLength(Object.keys(VECTORS).length);
     expect(new Set(page.items.map((item) => item.id)).size).toBe(page.items.length);
   });
@@ -276,7 +301,12 @@ describeIfDb("createInterestService", () => {
   test("stays inactive, with a reason, below the signal threshold", async () => {
     const { interest } = await ready({ INTEREST_MIN_SIGNALS: "50" });
     await signal("rust-a", "read");
-    const page = await interest.rank({ limit: 10, unreadOnly: false, sourceId: null });
+    const page = await interest.rank({
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     expect(page.scoring.active).toBe(false);
     expect(page.items).toHaveLength(0);
     if (!page.scoring.active) {
@@ -288,7 +318,12 @@ describeIfDb("createInterestService", () => {
   test("says the profile is missing rather than ranking against nothing", async () => {
     const { interest } = await ready();
     for (const id of ["rust-a", "rust-b", "rust-c"]) await signal(id, "read");
-    const page = await interest.rank({ limit: 10, unreadOnly: false, sourceId: null });
+    const page = await interest.rank({
+      limit: 10,
+      unreadOnly: false,
+      sourceId: null,
+      collapse: false,
+    });
     expect(page.scoring.active).toBe(false);
     if (!page.scoring.active) {
       expect(page.scoring.reason).toBe("the interest profile has not been built yet");

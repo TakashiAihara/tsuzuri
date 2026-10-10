@@ -151,6 +151,41 @@ export const embeddingFailures = pgTable(
   (table) => [index("embedding_failures_next_attempt").on(table.nextAttemptAt)],
 );
 
+/**
+ * Duplicate clusters, from 0005_clustering.sql.
+ *
+ * item_simhash is deliberately not mirrored: its column is bit(64), which
+ * Drizzle has no type for, and only packages/db/src/clustering.ts touches it,
+ * in raw SQL, the same way item_embeddings is handled.
+ */
+export const clusters = pgTable("clusters", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  representativeItemId: text("representative_item_id")
+    .notNull()
+    .references(() => items.id, { onDelete: "cascade" }),
+  size: integer("size").notNull().default(1),
+  firstPublishedAt: timestamp("first_published_at", { withTimezone: true }).notNull(),
+  lastPublishedAt: timestamp("last_published_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const itemClusters = pgTable(
+  "item_clusters",
+  {
+    itemId: text("item_id")
+      .primaryKey()
+      .references(() => items.id, { onDelete: "cascade" }),
+    clusterId: uuid("cluster_id")
+      .notNull()
+      .references(() => clusters.id, { onDelete: "cascade" }),
+    /** Null for the member that founded the cluster. */
+    matchedBy: text("matched_by", { enum: ["embedding", "simhash", "both"] }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("item_clusters_by_cluster").on(table.clusterId)],
+);
+
 export type SourceRow = typeof sources.$inferSelect;
 export type NewSourceRow = typeof sources.$inferInsert;
 export type ItemRow = typeof items.$inferSelect;

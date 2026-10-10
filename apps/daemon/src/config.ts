@@ -125,6 +125,22 @@ const configSchema = z.object({
   TIMELINE_DEFAULT_SORT: z.enum(["recent", "score"]).default("recent"),
 
   /**
+   * Duplicate clustering. Off by default like the rest of enrichment, though
+   * unlike scoring it needs no model: SimHash clusters near-verbatim copies on
+   * its own, and the embedding signal widens that to rewrites when one exists.
+   */
+  CLUSTERING_ENABLED: z.stringbool().default(false),
+  /** How far apart two reports of one story may be published. */
+  CLUSTER_WINDOW_HOURS: z.coerce.number().int().positive().default(72),
+  /**
+   * Cosine distance below which two items are one story. Much tighter than
+   * SEARCH_MAX_DISTANCE: search wants related, this wants the same.
+   */
+  CLUSTER_MAX_DISTANCE: z.coerce.number().positive().max(2).default(0.15),
+  /** Hamming distance, out of 64, within which two items are one story. */
+  CLUSTER_SIMHASH_MAX_BITS: z.coerce.number().int().min(0).max(64).default(6),
+
+  /**
    * Cosine distance beyond which a vector candidate is not a result.
    *
    * The vector arm returns its nearest N however far away they are, so without

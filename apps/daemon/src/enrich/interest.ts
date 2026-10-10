@@ -72,6 +72,7 @@ export type InterestService = {
     limit: number;
     unreadOnly: boolean;
     sourceId: string | null;
+    collapse: boolean;
   }) => Promise<RankedPage>;
 };
 
@@ -364,6 +365,7 @@ export function createInterestService(deps: {
         recencyHalfLifeHours: config.INTEREST_RECENCY_HALFLIFE_HOURS,
         estimatedFactor: config.INTEREST_ESTIMATED_DATE_FACTOR,
         windowDays: config.INTEREST_WINDOW_DAYS,
+        collapse: options.collapse,
       });
 
       // Whatever scoring did not fill, exploration may. The reserved share is a
@@ -377,6 +379,7 @@ export function createInterestService(deps: {
         sourceId: options.sourceId,
         windowDays: config.INTEREST_WINDOW_DAYS,
         exclude: scored.map((item) => item.id),
+        collapse: options.collapse,
       });
 
       const items = interleaveExploration(

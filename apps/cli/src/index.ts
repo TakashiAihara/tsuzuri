@@ -168,56 +168,78 @@ program
   // daemon's TIMELINE_DEFAULT_SORT. Defaulting to "recent" here would send it
   // explicitly and make that setting unreachable from the CLI.
   .option("--by <order>", "recent or score (default: the daemon's setting)")
-  .action(async (opts: { limit: string; source?: string; all?: boolean; by?: string }) => {
-    const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
-    if (opts.source) params.set("sourceId", opts.source);
-    if (opts.by) params.set("sort", opts.by);
+  .option("--no-collapse", "show every report of a story, not one row per story")
+  .action(
+    async (opts: {
+      limit: string;
+      source?: string;
+      all?: boolean;
+      by?: string;
+      collapse: boolean;
+    }) => {
+      const params = new URLSearchParams({ limit: opts.limit, unread: String(!opts.all) });
+      if (opts.source) params.set("sourceId", opts.source);
+      if (opts.by) params.set("sort", opts.by);
+      if (!opts.collapse) params.set("collapse", "false");
 
-    // Which shape came back is a property of the response, not of the flag,
-    // precisely because the daemon may have chosen the ordering.
-    const body = await call<{ items: ItemSummary[] } | RankedItemsResponse>(
-      globals(),
-      `/items?${params}`,
-    );
-    if (!("scoring" in body)) {
-      // Same JSON shape either way. Which branch runs depends on the daemon's
-      // TIMELINE_DEFAULT_SORT when --by is omitted, and a script parsing this
-      // cannot see that setting -- so emitting an array here and an object
-      // below would change the contract of `tsuzuri read --json` based on
-      // server configuration. `scoring: null` is "no ranking was applied".
-      if (globals().json) return printJson({ items: body.items, scoring: null });
-      if (body.items.length === 0) return log("nothing unread");
-      for (const item of body.items) {
+      // Which shape came back is a property of the response, not of the flag,
+      // precisely because the daemon may have chosen the ordering.
+      const body = await call<{ items: ItemSummary[] } | RankedItemsResponse>(
+        globals(),
+        `/items?${params}`,
+      );
+      if (!("scoring" in body)) {
+        // Same JSON shape either way. Which branch runs depends on the daemon's
+        // TIMELINE_DEFAULT_SORT when --by is omitted, and a script parsing this
+        // cannot see that setting -- so emitting an array here and an object
+        // below would change the contract of `tsuzuri read --json` based on
+        // server configuration. `scoring: null` is "no ranking was applied".
+        if (globals().json) return printJson({ items: body.items, scoring: null });
+        if (body.items.length === 0) return log("nothing unread");
+        for (const item of body.items) {
+          out(
+            `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}${otherReports(item, opts.collapse)}`,
+          );
+        }
+        return;
+      }
+
+      const response = body;
+      if (globals().json) return printJson(response);
+
+      // Say when the list is not actually ranked. Dates and scores produce the
+      // same-looking list, so silence here reads as "ranking thinks this is the
+      // order", which is the one thing it does not mean.
+      if (!response.scoring.active) {
+        log(`not ranked: ${response.scoring.reason}`);
+        if (response.scoring.signals < response.scoring.required) {
+          log(`${response.scoring.signals} of ${response.scoring.required} signals so far`);
+        }
+      }
+      if (response.items.length === 0) return log("nothing unread");
+
+      for (const item of response.items) {
+        // A leading dot marks a row the score did not choose. Without it, an
+        // exploration slot is indistinguishable from a ranking bug.
+        const mark = item.exploration ? "·" : " ";
         out(
-          `${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
+          `${mark}${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}${otherReports(item, opts.collapse)}`,
         );
       }
-      return;
-    }
+    },
+  );
 
-    const response = body;
-    if (globals().json) return printJson(response);
-
-    // Say when the list is not actually ranked. Dates and scores produce the
-    // same-looking list, so silence here reads as "ranking thinks this is the
-    // order", which is the one thing it does not mean.
-    if (!response.scoring.active) {
-      log(`not ranked: ${response.scoring.reason}`);
-      if (response.scoring.signals < response.scoring.required) {
-        log(`${response.scoring.signals} of ${response.scoring.required} signals so far`);
-      }
-    }
-    if (response.items.length === 0) return log("nothing unread");
-
-    for (const item of response.items) {
-      // A leading dot marks a row the score did not choose. Without it, an
-      // exploration slot is indistinguishable from a ranking bug.
-      const mark = item.exploration ? "·" : " ";
-      out(
-        `${mark}${item.id.slice(0, 8)}  ${formatAge(item.publishedAt).padEnd(5)} ${item.title ?? item.url}`,
-      );
-    }
-  });
+/**
+ * " +7" when a collapsed row stands for seven other reports of the story.
+ * Without it, collapsing is invisible: a row hiding duplicates looks exactly
+ * like a story only one outlet ran.
+ *
+ * Only when collapsed. Under --no-collapse every report is already on screen,
+ * and "+1" beside each would read as one more hidden behind it.
+ */
+function otherReports(item: { clusterSize: number }, collapsed: boolean): string {
+  return collapsed && item.clusterSize > 1 ? `  +${item.clusterSize - 1}` : "";
+}
 
 program
   .command("search <query...>")
@@ -276,11 +298,18 @@ program
   .command("mark <ids...>")
   .description("mark items read")
   .option("--unread", "mark unread instead")
-  .action(async (ids: string[], opts: { unread?: boolean }) => {
+  // Paired with `read --no-collapse`. `read` shows one row per story, so the
+  // id you mark stands for the story, and every report of it is read with it;
+  // otherwise the duplicates stay unread and reappear under --no-collapse.
+  .option("--no-collapse", "mark only the report named, not the whole story")
+  .action(async (ids: string[], opts: { unread?: boolean; collapse: boolean }) => {
     for (const id of ids) {
       await call(globals(), `/items/${id}/state`, {
         method: "POST",
-        raw: JSON.stringify({ read: !opts.unread }),
+        raw: JSON.stringify({
+          read: !opts.unread,
+          scope: opts.collapse ? "cluster" : "item",
+        }),
       });
     }
     log(`${opts.unread ? "unmarked" : "marked"} ${ids.length}`);

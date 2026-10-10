@@ -49,6 +49,7 @@ describeIfDb("interest profile and scoring", () => {
     recencyHalfLifeHours: 72,
     estimatedFactor: 0.7,
     windowDays: 30,
+    collapse: false,
   };
 
   beforeAll(async () => {
@@ -382,6 +383,7 @@ describeIfDb("interest profile and scoring", () => {
           sourceId: null,
           windowDays: 30,
           exclude: [],
+          collapse: false,
         },
         NOW,
       );
@@ -399,6 +401,7 @@ describeIfDb("interest profile and scoring", () => {
           sourceId: null,
           windowDays: 30,
           exclude: ["y-unrelated", "x-fresh"],
+          collapse: false,
         },
         NOW,
       );
@@ -415,6 +418,7 @@ describeIfDb("interest profile and scoring", () => {
         sourceId: null,
         windowDays: 30,
         exclude: [] as string[],
+        collapse: false,
       };
       const first = await explorationCandidates(handle.sql, options, NOW);
       const second = await explorationCandidates(handle.sql, options, NOW);
@@ -432,10 +436,90 @@ describeIfDb("interest profile and scoring", () => {
           sourceId: null,
           windowDays: 30,
           exclude: [],
+          collapse: false,
         },
         NOW,
       );
       expect(rows).toHaveLength(0);
+    });
+  });
+
+  describe("collapsing duplicates", () => {
+    /**
+     * x-fresh and x-week-old both match the interest, and here they are two
+     * reports of one story with x-week-old as its representative. Collapsing
+     * must show the story once, through the representative -- in the ranked
+     * part of the page and in the exploration part, which are separate
+     * queries and would otherwise each need their own guarantee.
+     */
+    async function seedCluster(): Promise<void> {
+      const [cluster] = await handle.sql<Array<{ id: string }>>`
+        INSERT INTO clusters (representative_item_id, size, first_published_at, last_published_at)
+        VALUES ('x-week-old', 2, '2026-08-05T00:00:00Z', '2026-08-11T00:00:00Z')
+        RETURNING id
+      `;
+      for (const itemId of ["x-week-old", "x-fresh"]) {
+        await handle.sql`
+          INSERT INTO item_clusters (item_id, cluster_id, matched_by)
+          VALUES (${itemId}, ${cluster?.id as string}::uuid, ${itemId === "x-fresh" ? "simhash" : null})
+        `;
+      }
+    }
+
+    async function dropClusters(): Promise<void> {
+      await handle.sql`DELETE FROM item_clusters`;
+      await handle.sql`DELETE FROM clusters`;
+    }
+
+    test("the ranked page shows a story once, through its representative", async () => {
+      await resetState();
+      await seedProfile();
+      await seedCluster();
+      try {
+        const expanded = await scoreItems(handle.sql, { ...scoreDefaults, collapse: false }, NOW);
+        expect(expanded.map((item) => item.id)).toContain("x-fresh");
+        expect(expanded.map((item) => item.id)).toContain("x-week-old");
+
+        const collapsed = await scoreItems(handle.sql, { ...scoreDefaults, collapse: true }, NOW);
+        const ids = collapsed.map((item) => item.id);
+        // x-fresh would outrank its own representative on recency; collapsing
+        // must still not let it stand in for the story.
+        expect(ids).not.toContain("x-fresh");
+        expect(collapsed.find((item) => item.id === "x-week-old")?.clusterSize).toBe(2);
+      } finally {
+        await dropClusters();
+      }
+    });
+
+    test("the exploration part of the page collapses on the same rule", async () => {
+      await resetState();
+      await seedCluster();
+      try {
+        const options = {
+          userId: DEFAULT_USER_ID,
+          limit: 20,
+          unreadOnly: false,
+          sourceId: null,
+          windowDays: 30,
+          exclude: [] as string[],
+        };
+        const expanded = await explorationCandidates(
+          handle.sql,
+          { ...options, collapse: false },
+          NOW,
+        );
+        expect(expanded.map((item) => item.id)).toContain("x-fresh");
+
+        const collapsed = await explorationCandidates(
+          handle.sql,
+          { ...options, collapse: true },
+          NOW,
+        );
+        expect(collapsed.map((item) => item.id)).not.toContain("x-fresh");
+        expect(collapsed.find((item) => item.id === "x-week-old")?.clusterSize).toBe(2);
+      } finally {
+        await dropClusters();
+      }
     });
   });
 });

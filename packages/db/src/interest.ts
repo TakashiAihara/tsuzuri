@@ -261,7 +261,20 @@ export type ScoredItem = {
   starredAt: string | null;
   interest: number;
   affinitySimilarity: number;
+  /** Items reporting the same story, including this one. 1 when it is alone. */
+  clusterSize: number;
 };
+
+/**
+ * Keep only rows that stand for a story: an item no cluster has claimed, or
+ * the stored representative of its cluster.
+ *
+ * Not DISTINCT ON over the filtered list. That would pick, per cluster, the
+ * first row surviving the unread filter -- so reading the representative would
+ * promote the next unread member into its place, and the story would come
+ * back. A fixed representative cannot be replaced by a filter.
+ */
+const STORY_ROW = `(ic.cluster_id IS NULL OR cl.representative_item_id = i.id)`;
 
 export type ScoreOptions = {
   userId: string;
@@ -274,6 +287,8 @@ export type ScoreOptions = {
   estimatedFactor: number;
   /** How far back to consider candidates, in days. */
   windowDays: number;
+  /** One row per story rather than one per report of it. */
+  collapse: boolean;
 };
 
 /**
@@ -335,6 +350,7 @@ export async function scoreItems(
            st.read_at AS "readAt",
            st.starred_at AS "starredAt",
            m.affinity_similarity AS "affinitySimilarity",
+           COALESCE(cl.size, 1)::int AS "clusterSize",
            m.affinity_similarity
              -- GREATEST(0, ...) on the age: a feed may publish up to a day
              -- into the future and ingest stores it, which makes the exponent
@@ -354,7 +370,10 @@ export async function scoreItems(
     FROM matched m
     JOIN items i ON i.id = m.id
     LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ${options.userId}
+    LEFT JOIN item_clusters ic ON ic.item_id = i.id
+    LEFT JOIN clusters cl ON cl.id = ic.cluster_id
     WHERE (${!options.unreadOnly} OR st.read_at IS NULL)
+      AND (${!options.collapse} OR ${sql.unsafe(STORY_ROW)})
       AND (
         ${options.sourceId}::uuid IS NULL
         OR EXISTS (
@@ -375,6 +394,8 @@ export type ExplorationOptions = {
   windowDays: number;
   /** Ids already chosen by scoring, which must not be offered again. */
   exclude: readonly string[];
+  /** One row per story, as in scoreItems. */
+  collapse: boolean;
 };
 
 /**
@@ -417,13 +438,17 @@ export async function explorationCandidates(
              i.summary,
              st.read_at AS "readAt",
              st.starred_at AS "starredAt",
+             COALESCE(cl.size, 1)::int AS "clusterSize",
              sr.reads
       FROM items i
       JOIN item_sources src ON src.item_id = i.id
       JOIN source_reads sr ON sr.source_id = src.source_id
       LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ${options.userId}
+      LEFT JOIN item_clusters ic ON ic.item_id = i.id
+      LEFT JOIN clusters cl ON cl.id = ic.cluster_id
       WHERE i.published_at > ${instant(now)}::timestamptz
                              - make_interval(days => ${options.windowDays}::int)
+        AND (${!options.collapse} OR ${sql.unsafe(STORY_ROW)})
         AND NOT (i.id = ANY(${[...options.exclude]}::text[]))
         AND (${!options.unreadOnly} OR st.read_at IS NULL)
         AND (
@@ -444,6 +469,7 @@ export async function explorationCandidates(
            summary,
            "readAt",
            "starredAt",
+           "clusterSize",
            0::double precision AS "affinitySimilarity",
            0::double precision AS interest
     FROM candidates

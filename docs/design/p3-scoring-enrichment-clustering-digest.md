@@ -217,7 +217,10 @@ CREATE TABLE item_clusters (
   item_id    text PRIMARY KEY REFERENCES items (id) ON DELETE CASCADE,
   cluster_id uuid NOT NULL REFERENCES clusters (id) ON DELETE CASCADE,
   -- How it matched, for debugging a cluster that looks wrong.
-  matched_by text NOT NULL CHECK (matched_by IN ('embedding', 'simhash', 'both')),
+  -- NULL for the member that founded the cluster. Corrected while
+  -- implementing: the draft had NOT NULL, but the founder matched nothing and
+  -- still needs a row, or the worker would pick it up as pending forever.
+  matched_by text CHECK (matched_by IN ('embedding', 'simhash', 'both')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX item_clusters_by_cluster ON item_clusters (cluster_id);
@@ -250,13 +253,17 @@ Either signal alone is enough; `matched_by` records which fired. An item joins t
 
 The worker runs on the same shape as the embedding backfill: poll for items with no `item_clusters` row, no queue table, resumable, and safe to run repeatedly. `CLUSTERING_ENABLED` defaults to false.
 
+Corrected while implementing: with an embedding model in use, an item is not clustered until the backfill has given it a vector or recorded a failure for it. Membership is decided once and never revisited, so clustering an item before its vector exists would decide it with one signal missing, and two reports of a rewritten story would stay split for good depending only on which worker reached them first.
+
 ### Collapsing
 
-Collapsing is a query-time decision, expressed as `DISTINCT ON (COALESCE(cluster_id::text, item_id))` over the ranked or ordered list — an unclustered item is its own group, so one query serves both cases. Verified against the planner.
+Collapsing is a query-time decision: a listing keeps an item that no cluster has claimed, or the stored representative of its cluster.
+
+Corrected while implementing: the draft expressed this as `DISTINCT ON (COALESCE(cluster_id::text, item_id))` over the ranked or ordered list. Applied after the unread filter, that picks the first surviving member of each cluster, so reading the representative promotes the next unread member into its place and the story comes back — the failure D24 exists to prevent, reachable even with read propagation, through any read that does not propagate. Filtering to the stored representative cannot be undone by another filter.
 
 The representative is the cluster member with the earliest non-estimated `published_at`, ties broken by longest `search_text`: the outlet that published first, and among simultaneous ones the version with the most content. Deterministic, and computable without reference to anything user-specific. An attractive alternative — the version from the subscription you read most — is recorded and not taken. See D23.
 
-When a listing is collapsed, marking the visible row read marks every member of its cluster read. Anything else resurfaces the same story under the next representative, which is exactly what the issue asks to stop. `POST /items/:id/state` gains `scope: item|cluster`, defaulting to `item`; the CLI and MCP pass `cluster` when they collapsed. Note that a propagated read is not noise for interest scoring: a cluster is one story by construction, so "you read this story" is true of every member. See D24.
+When a listing is collapsed, marking the visible row read marks every member of its cluster read. Anything else resurfaces the same story under the next representative, which is exactly what the issue asks to stop. `POST /items/:id/state` gains `scope: item|cluster`, defaulting to `item`; the CLI passes `cluster` from `mark`, since `read` collapses by default. Only the read is carried: a star or a skip is about the article in front of you, and copying it to every syndicated copy would count one opinion several times in the interest profile. The MCP server's `mark_read` stays at `item`, because the ids it receives may come from `search_articles`, which never collapses, and it cannot tell which listing an id came from; a representative filter means a read that does not propagate still cannot bring the story back. Note that a propagated read is not noise for interest scoring: a cluster is one story by construction, so "you read this story" is true of every member. See D24.
 
 `--no-collapse` and `collapse=false` expand.
 

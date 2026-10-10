@@ -2,7 +2,7 @@
 
 A self-hosted feed reader built for a CLI and for AI agents, with first-class support for sites that do not publish a feed at all.
 
-> Status: early. Ingest, the CLI, hybrid search, the MCP server and interest scoring work end to end. Summarisation, tagging, article duplicate clustering, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
+> Status: early. Ingest, the CLI, hybrid search, the MCP server, interest scoring and article duplicate clustering work end to end. Summarisation, tagging, digests, the web UI and the plugin layer are not built yet — see [Roadmap](#roadmap).
 
 ## Why another reader
 
@@ -184,6 +184,40 @@ not ranked: not enough reading history yet
 | `TIMELINE_DEFAULT_SORT` | `recent` | `recent` or `score`, when `--by` is not given |
 
 The profile rebuilds on its own; `tsuzuri doctor` shows whether ranking is active and how many interests it found. Switching embedding models discards it along with the vectors, since a profile only means something in the space it was built in.
+
+### Collapsing duplicates
+
+The same story reaches you through several subscriptions. Items are already one per canonical URL, so the identical article arriving twice is one item; what is left is the same news rewritten by eight outlets. `tsuzuri read` shows it as one row:
+
+```text
+b8f2a1c3  2h    Council approves transit plan  +7
+```
+
+`+7` is how many other reports the row stands for. `tsuzuri read --no-collapse` shows all of them.
+
+```bash
+CLUSTERING_ENABLED=true bun run apps/daemon/src/index.ts
+```
+
+Off by default, but it needs no model. Two signals decide whether two articles are one story, and either is enough:
+
+- **SimHash** over the article text catches wire copy republished near-verbatim, and works with no embedding model configured at all.
+- **Embedding distance** catches the same story told in different words, once an embedding model is configured.
+
+They fail in different places. SimHash measures how much of the text changed, so it is reliable on an article body and not on a title with a line of summary: a two-word edit moves a 200-character text past the threshold and leaves a full article untouched. A feed that publishes only titles is left to the embedding signal.
+
+The row is the outlet that published first. A guessed date never wins that, and between reports published at the same moment the one with the most text does. Marking it read reads every report of the story, so the duplicates do not come back under `--no-collapse` or count as unread; `tsuzuri mark --no-collapse` reads only the one you named. A star stays on the article you starred, since starring eight copies of one story would count one opinion eight times.
+
+Reports more than `CLUSTER_WINDOW_HOURS` apart are different stories, which is also what keeps the comparison cheap. Search never collapses: when you searched for something, every version of it is a result.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CLUSTERING_ENABLED` | `false` | Run the clustering worker |
+| `CLUSTER_WINDOW_HOURS` | `72` | How far apart two reports of one story may be published |
+| `CLUSTER_MAX_DISTANCE` | `0.15` | Cosine distance below which two articles are one story |
+| `CLUSTER_SIMHASH_MAX_BITS` | `6` | Bits out of 64 within which two articles are one story |
+
+`tsuzuri doctor` shows how many clusters exist and how many articles are still waiting. With an embedding model configured, an article waits for its vector before it is clustered, so the backlog drains behind the embedding backfill.
 
 ## MCP server
 

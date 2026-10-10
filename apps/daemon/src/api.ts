@@ -1,20 +1,24 @@
 import { searchTerms } from "@tsuzuri/core";
 import {
+  clusterMemberIds,
+  clusters,
   type Database,
   DEFAULT_USER_ID,
   hybridSearch,
+  itemClusters,
   itemSources,
   itemState,
   items,
   sources,
 } from "@tsuzuri/db";
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import PQueue from "p-queue";
 import type postgres from "postgres";
 import { z } from "zod";
 
 import type { Config } from "./config.ts";
+import type { ClusteringService } from "./enrich/clustering.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
 import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
@@ -39,6 +43,7 @@ export type ApiDeps = {
   config: Config;
   embeddings: EmbeddingService;
   interest: InterestService;
+  clustering: ClusteringService;
 };
 
 const addSourceSchema = z.object({
@@ -65,11 +70,18 @@ const listItemsSchema = z.object({
    * `recent` unless someone changed it.
    */
   sort: z.enum(["recent", "score"]).optional(),
+  /**
+   * One row per story rather than one per report of it. On by default: a
+   * story syndicated to eight outlets occupying eight rows is the thing
+   * clustering exists to stop. Has no effect while clustering is off, since
+   * then nothing belongs to a cluster.
+   */
+  collapse: z.stringbool().default(true),
 });
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
-  const { db, sql: rawSql, fetcher, config, embeddings, interest } = deps;
+  const { db, sql: rawSql, fetcher, config, embeddings, interest, clustering } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -179,7 +191,7 @@ export function createApi(deps: ApiDeps) {
   app.get("/items", async (c) => {
     const parsed = listItemsSchema.safeParse(c.req.query());
     if (!parsed.success) return c.json({ error: z.treeifyError(parsed.error) }, 400);
-    const { unread, limit, sourceId } = parsed.data;
+    const { unread, limit, sourceId, collapse } = parsed.data;
     const sort = parsed.data.sort ?? config.TIMELINE_DEFAULT_SORT;
 
     /**
@@ -196,9 +208,10 @@ export function createApi(deps: ApiDeps) {
         limit,
         unreadOnly: unread,
         sourceId: sourceId ?? null,
+        collapse,
       });
       if (page.scoring.active) return c.json({ items: page.items, scoring: page.scoring });
-      const fallback = await listRecent({ unread, limit, sourceId });
+      const fallback = await listRecent({ unread, limit, sourceId, collapse });
       return c.json({
         items: fallback.map((item) => ({
           ...item,
@@ -210,7 +223,7 @@ export function createApi(deps: ApiDeps) {
       });
     }
 
-    return c.json({ items: await listRecent({ unread, limit, sourceId }) });
+    return c.json({ items: await listRecent({ unread, limit, sourceId, collapse }) });
   });
 
   /** The reverse-chronological listing, shared by the plain and degraded paths. */
@@ -218,12 +231,21 @@ export function createApi(deps: ApiDeps) {
     unread: boolean;
     limit: number;
     sourceId?: string | undefined;
+    collapse: boolean;
   }) {
-    const { unread, limit, sourceId } = options;
+    const { unread, limit, sourceId, collapse } = options;
 
     const conditions = [];
     if (unread) conditions.push(isNull(itemState.readAt));
     if (sourceId) conditions.push(eq(itemSources.sourceId, sourceId));
+    // A story row is an item no cluster has claimed, or its cluster's stored
+    // representative. Why a fixed representative rather than DISTINCT ON is
+    // written beside STORY_ROW in packages/db/src/interest.ts.
+    if (collapse) {
+      conditions.push(
+        or(isNull(itemClusters.clusterId), eq(clusters.representativeItemId, items.id)),
+      );
+    }
 
     const rows = await db
       .selectDistinctOn([items.publishedAt, items.id], {
@@ -236,6 +258,7 @@ export function createApi(deps: ApiDeps) {
         summary: items.summary,
         readAt: itemState.readAt,
         starredAt: itemState.starredAt,
+        clusterSize: sql<number>`COALESCE(${clusters.size}, 1)::int`,
       })
       .from(items)
       .innerJoin(itemSources, eq(itemSources.itemId, items.id))
@@ -243,6 +266,8 @@ export function createApi(deps: ApiDeps) {
         itemState,
         and(eq(itemState.itemId, items.id), eq(itemState.userId, DEFAULT_USER_ID)),
       )
+      .leftJoin(itemClusters, eq(itemClusters.itemId, items.id))
+      .leftJoin(clusters, eq(clusters.id, itemClusters.clusterId))
       .where(conditions.length > 0 ? and(...conditions) : undefined)
       .orderBy(desc(items.publishedAt), items.id)
       .limit(limit);
@@ -309,6 +334,14 @@ export function createApi(deps: ApiDeps) {
         read: z.boolean().optional(),
         starred: z.boolean().optional(),
         skipped: z.boolean().optional(),
+        /**
+         * `cluster` carries a read to every report of the same story (D24),
+         * which is what a client that showed the story as one row means by
+         * "I read this". Only the read is carried: a star or a skip is about
+         * the article in front of you, and copying it to eight syndicated
+         * copies would count one opinion eight times in the interest profile.
+         */
+        scope: z.enum(["item", "cluster"]).default("item"),
       })
       .safeParse(await c.req.json());
     if (!body.success) return c.json({ error: z.treeifyError(body.error) }, 400);
@@ -330,6 +363,22 @@ export function createApi(deps: ApiDeps) {
         set: { ...patch, updatedAt: now },
       })
       .returning();
+
+    if (body.data.scope === "cluster" && body.data.read !== undefined) {
+      const others = (await clusterMemberIds(rawSql, resolved.id)).filter(
+        (id) => id !== resolved.id,
+      );
+      if (others.length > 0) {
+        const readAt = body.data.read ? now : null;
+        await db
+          .insert(itemState)
+          .values(others.map((itemId) => ({ userId: DEFAULT_USER_ID, itemId, readAt })))
+          .onConflictDoUpdate({
+            target: [itemState.userId, itemState.itemId],
+            set: { readAt, updatedAt: now },
+          });
+      }
+    }
 
     return c.json({ state: row });
   });
@@ -463,6 +512,7 @@ export function createApi(deps: ApiDeps) {
           ...embeddingStatus,
         },
         scoring: await interest.status(),
+        clustering: await clustering.status(),
         // Everything below arrives in a later phase. Reporting it as "not
         // configured" beats leaving people to wonder why search is empty.
         llm: { enabled: false, reason: "not implemented until P3" },
