@@ -167,11 +167,20 @@ describeIfDb("clustering", () => {
     expect(await readAt(COPY)).toBeNull();
   });
 
-  test("scope=item, the default, reads only the report named", async () => {
-    await setState(WIRE, { read: true });
+  test("scope=item reads only the report named", async () => {
+    await setState(WIRE, { read: true, scope: "item" });
     expect(await readAt(WIRE)).not.toBeNull();
     expect(await readAt(COPY)).toBeNull();
-    await setState(WIRE, { read: false });
+    await setState(WIRE, { read: false, scope: "item" });
+  });
+
+  test("with no scope a read is carried across the story, as MCP's mark_read sends it", async () => {
+    // COPY is what search returns; reading it must not leave WIRE unread in
+    // the collapsed list.
+    await setState(COPY, { read: true });
+    expect(await readAt(WIRE)).not.toBeNull();
+    await setState(COPY, { read: false });
+    expect(await readAt(WIRE)).toBeNull();
   });
 
   test("a star is not carried across the cluster even with scope=cluster", async () => {

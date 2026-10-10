@@ -284,7 +284,9 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "mark_read",
     {
       title: "Mark articles read",
-      description: "Mark articles as read, or unread with read: false.",
+      description:
+        "Mark articles as read, or unread with read: false. Other reports of the same " +
+        "story (duplicates from other feeds) are marked with them.",
       inputSchema: {
         ids: z
           .array(z.string().min(1))

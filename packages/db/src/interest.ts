@@ -104,6 +104,10 @@ export type SignalledItem = {
  *
  * Items with no vector are excluded rather than defaulted. There is no sensible
  * position in the space for an article that has not been embedded.
+ *
+ * One row per story (D24): a read carried to eight reports of the same story
+ * is one opinion, so the members of a cluster fold into the member reacted to
+ * last, with each kind of signal taken from whichever member has it.
  */
 export async function signalledItems(
   sql: postgres.Sql,
@@ -118,20 +122,39 @@ export async function signalledItems(
       embedding: string;
     }>
   >`
-    SELECT s.item_id AS "itemId",
-           s.starred_at AS "starredAt",
-           s.read_at AS "readAt",
-           s.skipped_at AS "skippedAt",
-           e.embedding::text AS embedding
-    FROM item_state s
-    JOIN item_embeddings e ON e.item_id = s.item_id
-    WHERE s.user_id = ${options.userId}
-      AND (s.starred_at IS NOT NULL OR s.read_at IS NOT NULL OR s.skipped_at IS NOT NULL)
-    ORDER BY GREATEST(
-      COALESCE(s.starred_at, 'epoch'::timestamptz),
-      COALESCE(s.read_at, 'epoch'::timestamptz),
-      COALESCE(s.skipped_at, 'epoch'::timestamptz)
-    ) DESC
+    WITH reacted AS (
+      SELECT s.item_id, s.starred_at, s.read_at, s.skipped_at, e.embedding,
+             COALESCE(ic.cluster_id::text, s.item_id::text) AS story,
+             GREATEST(
+               COALESCE(s.starred_at, 'epoch'::timestamptz),
+               COALESCE(s.read_at, 'epoch'::timestamptz),
+               COALESCE(s.skipped_at, 'epoch'::timestamptz)
+             ) AS latest
+      FROM item_state s
+      JOIN item_embeddings e ON e.item_id = s.item_id
+      LEFT JOIN item_clusters ic ON ic.item_id = s.item_id
+      WHERE s.user_id = ${options.userId}
+        AND (s.starred_at IS NOT NULL OR s.read_at IS NOT NULL OR s.skipped_at IS NOT NULL)
+    ),
+    stories AS (
+      SELECT DISTINCT ON (story)
+             item_id,
+             max(starred_at) OVER w AS starred_at,
+             max(read_at) OVER w AS read_at,
+             max(skipped_at) OVER w AS skipped_at,
+             max(latest) OVER w AS story_latest,
+             embedding
+      FROM reacted
+      WINDOW w AS (PARTITION BY story)
+      ORDER BY story, latest DESC, item_id
+    )
+    SELECT item_id AS "itemId",
+           starred_at AS "starredAt",
+           read_at AS "readAt",
+           skipped_at AS "skippedAt",
+           embedding::text AS embedding
+    FROM stories
+    ORDER BY story_latest DESC
     LIMIT ${options.limit}
   `;
 
@@ -232,19 +255,24 @@ export async function readProfileSummary(
  * How many signals exist, for deciding whether scoring may activate.
  *
  * Counts individual signals rather than rows: an article you read and then
- * starred is two, because it told us two things. Undecayed, because this
+ * starred is two, because it told us two things. Per story, as in
+ * signalledItems, so a read carried across a cluster counts once. Undecayed, because this
  * answers "is there enough history to cluster" and an old signal still counts
  * as history even once it barely counts as evidence.
  */
 export async function signalCount(sql: postgres.Sql, userId: string): Promise<number> {
   const rows = await sql<Array<{ count: number }>>`
     SELECT (
-      count(*) FILTER (WHERE starred_at IS NOT NULL)
-      + count(*) FILTER (WHERE read_at IS NOT NULL)
-      + count(*) FILTER (WHERE skipped_at IS NOT NULL)
+      count(DISTINCT story) FILTER (WHERE starred_at IS NOT NULL)
+      + count(DISTINCT story) FILTER (WHERE read_at IS NOT NULL)
+      + count(DISTINCT story) FILTER (WHERE skipped_at IS NOT NULL)
     )::int AS count
-    FROM item_state
-    WHERE user_id = ${userId}
+    FROM (
+      SELECT s.*, COALESCE(ic.cluster_id::text, s.item_id::text) AS story
+      FROM item_state s
+      LEFT JOIN item_clusters ic ON ic.item_id = s.item_id
+      WHERE s.user_id = ${userId}
+    ) per_story
   `;
   return rows[0]?.count ?? 0;
 }

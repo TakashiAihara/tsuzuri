@@ -349,13 +349,14 @@ export function createApi(deps: ApiDeps) {
         starred: z.boolean().optional(),
         skipped: z.boolean().optional(),
         /**
-         * `cluster` carries a read to every report of the same story (D24),
-         * which is what a client that showed the story as one row means by
-         * "I read this". Only the read is carried: a star or a skip is about
-         * the article in front of you, and copying it to eight syndicated
-         * copies would count one opinion eight times in the interest profile.
+         * `cluster` (the default) carries a read to every report of the same
+         * story (D24), so a story read through search or MCP does not stay
+         * unread in the collapsed list. `item` is for a client showing every
+         * report. Only the read is carried: a star or a skip is about the
+         * article in front of you. Carried reads do not inflate the interest
+         * profile, which folds a cluster into one signal.
          */
-        scope: z.enum(["item", "cluster"]).default("item"),
+        scope: z.enum(["item", "cluster"]).default("cluster"),
       })
       .safeParse(await c.req.json());
     if (!body.success) return c.json({ error: z.treeifyError(body.error) }, 400);
