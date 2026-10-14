@@ -753,6 +753,20 @@ describeIfDb("enrichments", () => {
       expect(await attachTags(handle.sql, "b", [ids.get("vulkan") as string], "model")).toBe(0);
     });
 
+    test("returning an approved tag to candidate detaches it too", async () => {
+      await suggestTag(handle.sql, "vulkan", "Vulkan", MODEL, TAGS_VERSION);
+      await setTagStatus(handle.sql, "vulkan", "approved");
+      const ids = await tagIds(handle);
+      await attachTags(handle.sql, "a", [ids.get("vulkan") as string], "model");
+
+      await setTagStatus(handle.sql, "vulkan", "candidate");
+
+      const attached = await rows<{ item: string }>(handle.sql`
+        SELECT item_id AS item FROM item_tags
+      `);
+      expect(attached).toEqual([]);
+    });
+
     test("approving leaves the articles it was not on alone", async () => {
       await suggestTag(handle.sql, "vulkan", "Vulkan", MODEL, TAGS_VERSION);
       await setTagStatus(handle.sql, "vulkan", "approved");

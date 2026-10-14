@@ -315,7 +315,9 @@ export async function setTagStatus(
     WHERE slug = ${slug}
     RETURNING slug
   `;
-  if (rows.length === 0 || status !== "rejected") return rows.length > 0;
+  // Any status but approved detaches it: an item's tags are read as approved
+  // without asking the vocabulary again.
+  if (rows.length === 0 || status === "approved") return rows.length > 0;
 
   await sql`
     DELETE FROM item_tags
