@@ -838,6 +838,8 @@ describeIfDb("createEnrichmentService", () => {
   });
 
   test("a forced rerun the hour cuts short says so, and continuing it asks only what is left", async () => {
+    // One worker, because two can each pass the hour check on the last call
+    // (the documented overshoot) and this test is about where the hour stops.
     // Two kinds per article and an hour of three calls: the first run gets
     // through a's summary and tags and b's summary, and leaves b's tags.
     await seedItem("a", { hoursAgo: 6 * 24 });
@@ -850,6 +852,7 @@ describeIfDb("createEnrichmentService", () => {
     const first = await service(chat, {
       ENRICH_TAGS: "true",
       ENRICH_MAX_ITEMS_PER_HOUR: "3",
+      ENRICH_CONCURRENCY: "1",
     }).runOver({
       since,
       kind: null,
@@ -878,7 +881,11 @@ describeIfDb("createEnrichmentService", () => {
   test("a rerun the hour has already emptied is bounded, not finished", async () => {
     await seedItem("a", { hoursAgo: 6 * 24 });
     const { chat, asked } = stubChat(answerEachPrompt());
-    const enrichment = service(chat, { ENRICH_TAGS: "true", ENRICH_MAX_ITEMS_PER_HOUR: "2" });
+    const enrichment = service(chat, {
+      ENRICH_TAGS: "true",
+      ENRICH_MAX_ITEMS_PER_HOUR: "2",
+      ENRICH_CONCURRENCY: "1",
+    });
     const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
 
     // a's summary and tags spend the hour, then b arrives with nothing left.
