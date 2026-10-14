@@ -5,6 +5,7 @@ import { createApi } from "../api.ts";
 import { loadConfig } from "../config.ts";
 import { createClusteringService } from "./clustering.ts";
 import { createEmbeddingService } from "./embeddings.ts";
+import { createEnrichmentService } from "./enrichment.ts";
 import { createInterestService } from "./interest.ts";
 
 /**
@@ -105,6 +106,12 @@ describeIfDb("clustering", () => {
     await embeddings.start();
     const interest = createInterestService({ sql: handle.sql, config, embeddings });
     clustering = createClusteringService({ sql: handle.sql, config, embeddings });
+    const enrichment = createEnrichmentService({
+      sql: handle.sql,
+      config,
+      interest,
+      provider: null,
+    });
     app = createApi({
       db: handle.db,
       sql: handle.sql,
@@ -113,6 +120,7 @@ describeIfDb("clustering", () => {
       embeddings,
       interest,
       clustering,
+      enrichment,
     });
   });
 

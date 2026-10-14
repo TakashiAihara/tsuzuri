@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -184,6 +185,106 @@ export const itemClusters = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index("item_clusters_by_cluster").on(table.clusterId)],
+);
+
+/**
+ * What a chat model said about an item, from 0006_enrichments.sql.
+ *
+ * model and prompt_version are part of the key, so a prompt change writes
+ * beside the previous answer rather than over it. The CHECK limiting kind to
+ * the three there are lives in the migration; this mirror states what it can.
+ */
+export const enrichments = pgTable(
+  "enrichments",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
+
+    /** The language a translation targets; empty for every other kind. */
+    lang: text("lang").notNull().default(""),
+
+    model: text("model").notNull(),
+    promptVersion: text("prompt_version").notNull(),
+    content: jsonb("content").$type<unknown>().notNull(),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
+    }),
+    index("enrichments_by_created_at").on(table.createdAt),
+    index("enrichments_by_tags")
+      .on(table.model, table.promptVersion)
+      .where(sql`${table.kind} = 'tags'`),
+  ],
+);
+
+export const enrichmentFailures = pgTable(
+  "enrichment_failures",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<"summary" | "translation" | "tags">().notNull(),
+    lang: text("lang").notNull().default(""),
+    model: text("model").notNull(),
+    promptVersion: text("prompt_version").notNull(),
+    failures: integer("failures").notNull().default(1),
+    lastError: text("last_error"),
+    /** When the call was spent. See the note on the column in the migration. */
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.itemId, table.kind, table.lang, table.model, table.promptVersion],
+    }),
+    index("enrichment_failures_by_attempt").on(table.lastAttemptAt),
+  ],
+);
+
+/**
+ * The closed set of tags a model may choose from.
+ *
+ * Deliberately not seeded: an empty vocabulary runs tagging in suggest-only
+ * mode until somebody approves its first tags (D28).
+ */
+export const tagVocabulary = pgTable(
+  "tag_vocabulary",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull(),
+    label: text("label").notNull(),
+    status: text("status")
+      .$type<"approved" | "candidate" | "rejected">()
+      .notNull()
+      .default("candidate"),
+    observations: integer("observations").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+  },
+  (table) => [unique("tag_vocabulary_slug_key").on(table.slug)],
+);
+
+export const itemTags = pgTable(
+  "item_tags",
+  {
+    itemId: text("item_id")
+      .notNull()
+      .references(() => items.id, { onDelete: "cascade" }),
+    tagId: uuid("tag_id")
+      .notNull()
+      .references(() => tagVocabulary.id, { onDelete: "cascade" }),
+    source: text("source").$type<"model" | "manual">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.itemId, table.tagId] }),
+    index("item_tags_by_tag").on(table.tagId),
+  ],
 );
 
 export type SourceRow = typeof sources.$inferSelect;

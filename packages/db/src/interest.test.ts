@@ -200,6 +200,27 @@ describeIfDb("interest profile and scoring", () => {
       expect(unrelated?.interest).toBeLessThan(first?.interest as number);
     });
 
+    test("scores only the ids it is given, in interest order", async () => {
+      // Enrichment chooses its own candidates and then spends on the best of
+      // them. Without this filter the ranking would be over the whole window,
+      // whose top rows are the ones the pass has already paid for.
+      await resetState();
+      await seedProfile();
+      const rows = await scoreItems(
+        handle.sql,
+        { ...scoreDefaults, ids: ["y-unrelated", "x-fresh"] },
+        NOW,
+      );
+      expect(rows.map((row) => row.id)).toEqual(["x-fresh", "y-unrelated"]);
+
+      const narrowed = await scoreItems(
+        handle.sql,
+        { ...scoreDefaults, ids: ["y-unrelated"] },
+        NOW,
+      );
+      expect(narrowed.map((row) => row.id)).toEqual(["y-unrelated"]);
+    });
+
     test("decays a week-old item to about a fifth of its similarity", async () => {
       await resetState();
       await seedProfile();

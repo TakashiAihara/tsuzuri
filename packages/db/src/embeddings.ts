@@ -57,7 +57,7 @@ export type PendingItem = {
  * The ingest path sidesteps this by going through Drizzle's typed operators;
  * this file talks to the driver directly, so it does the conversion itself.
  */
-function instant(at: Date): string {
+export function instant(at: Date): string {
   return at.toISOString();
 }
 
@@ -285,7 +285,7 @@ export async function insertEmbeddings(
  * picked up again on its own once that is fixed, without anybody remembering
  * to ask for it.
  */
-const MAX_RETRY_BACKOFF_SECONDS = 24 * 60 * 60;
+export const MAX_RETRY_BACKOFF_SECONDS = 24 * 60 * 60;
 
 /** Seconds to wait before retrying an item that has failed this many times. */
 export function retryBackoffSeconds(failures: number): number {

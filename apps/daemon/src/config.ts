@@ -148,35 +148,129 @@ const configSchema = z.object({
    * whatever happens to exist. Tune per corpus and per model.
    */
   SEARCH_MAX_DISTANCE: z.coerce.number().positive().max(2).default(0.6),
+
+  /**
+   * The chat model, as opposed to the one that measures.
+   *
+   * Disabled by default and with no default model, for the reason embeddings
+   * have none: a model cannot be chosen on somebody's behalf. Unlike an
+   * embedding model this one commits nothing on disk -- every row records the
+   * model that wrote it, so a switch costs nothing but the calls.
+   */
+  CHAT_PROVIDER: z.enum(["none", "openai-compatible", "anthropic", "gemini"]).default("none"),
+  /** Required once a provider is set. */
+  CHAT_BASE_URL: z.string().optional(),
+  /** Optional; local runtimes usually want no key at all. */
+  CHAT_API_KEY: z.string().optional(),
+  /** Required once a provider is set. */
+  CHAT_MODEL: z.string().optional(),
+  /** Per-request output bound. A summary is a few sentences; a body is not. */
+  CHAT_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(1024),
+  /** Per-request deadline. */
+  CHAT_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+
+  /**
+   * What the pass does once a model is configured.
+   *
+   * These decide what a model is asked, not whether one is: with no provider
+   * nothing here runs, which is what makes an install with no chat model a
+   * supported configuration rather than a broken one.
+   */
+  ENRICH_SUMMARY: z.stringbool().default(true),
+  ENRICH_TAGS: z.stringbool().default(true),
+  /** Target language, named the way a person would. Unset means no translation. */
+  ENRICH_TRANSLATE_TO: z.string().optional(),
+  /** Ranked items considered per pass. */
+  ENRICH_TOP_N: z.coerce.number().int().positive().default(20),
+  /** How far back a pass looks. */
+  ENRICH_WINDOW_HOURS: z.coerce.number().int().positive().default(48),
+  /**
+   * Spend bound on items, over an hour rather than per pass.
+   *
+   * Per pass would make the cost a function of how often the daemon happens to
+   * be restarted; per hour is what somebody can predict before turning it on.
+   */
+  ENRICH_MAX_ITEMS_PER_HOUR: z.coerce.number().int().positive().default(60),
+  /** Concurrent chat requests. Low, for the same reason embeddings are low. */
+  ENRICH_CONCURRENCY: z.coerce.number().int().positive().max(32).default(2),
+  /**
+   * Observations before a suggested tag is worth somebody's decision.
+   *
+   * Not a promotion: a candidate reaching it appears in `tsuzuri tags review`
+   * and is still not a tag until a person approves it (D28).
+   */
+  TAG_CANDIDATE_PROMOTION_THRESHOLD: z.coerce.number().int().positive().default(5),
 });
 
 /**
- * A provider without a model or a base URL is a configuration error, not a
+ * The settings a provider that has been switched on is missing.
+ *
+ * Empty for a provider that is off, which is the case where a missing base URL
+ * or model means nothing: the feature is not running and says so.
+ */
+function missingFor(
+  provider: string,
+  variable: string,
+  settings: Record<string, string | undefined>,
+): { key: string; message: string }[] {
+  if (provider === "none") return [];
+  return Object.entries(settings)
+    .filter(([, value]) => !value)
+    .map(([key]) => ({ key, message: `required when ${variable} is "${provider}"` }));
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A provider without the settings it needs is a configuration error, not a
  * disabled feature.
  *
- * The daemon tolerates embeddings failing to start so that a broken optional
- * feature cannot stop the reader. That tolerance would otherwise turn a typo
- * into silence: someone sets EMBEDDING_PROVIDER, embeddings never run, and
- * nothing says why. Catching it in the schema makes it a startup error with
- * the missing variable named.
+ * The daemon tolerates an optional feature failing to start so that a broken
+ * one cannot stop the reader. That tolerance would otherwise turn a typo into
+ * silence: someone sets CHAT_PROVIDER, summaries never appear, and nothing says
+ * why. Catching it in the schema makes it a startup error naming the variable
+ * that is missing -- the same rule and the same reason as the embedding ones.
+ *
+ * The base URL is checked for being a URL at all rather than only for being
+ * present, because a value that parses nowhere is refused by the provider
+ * builder, which runs where nothing can report it as a configuration problem.
  */
-const configSchemaWithEmbeddingRules = configSchema.superRefine((config, ctx) => {
-  if (config.EMBEDDING_PROVIDER === "none") return;
-  for (const key of ["EMBEDDING_BASE_URL", "EMBEDDING_MODEL"] as const) {
-    if (!config[key]) {
-      ctx.addIssue({
-        code: "custom",
-        path: [key],
-        message: `required when EMBEDDING_PROVIDER is "${config.EMBEDDING_PROVIDER}"`,
-      });
-    }
+const configSchemaWithFeatureRules = configSchema.superRefine((config, ctx) => {
+  const missing = [
+    ...missingFor(config.EMBEDDING_PROVIDER, "EMBEDDING_PROVIDER", {
+      EMBEDDING_BASE_URL: config.EMBEDDING_BASE_URL,
+      EMBEDDING_MODEL: config.EMBEDDING_MODEL,
+    }),
+    ...missingFor(config.CHAT_PROVIDER, "CHAT_PROVIDER", {
+      CHAT_BASE_URL: config.CHAT_BASE_URL,
+      CHAT_MODEL: config.CHAT_MODEL,
+    }),
+  ];
+
+  for (const issue of missing) {
+    ctx.addIssue({ code: "custom", path: [issue.key], message: issue.message });
+  }
+
+  if (config.CHAT_PROVIDER !== "none" && config.CHAT_BASE_URL && !isHttpUrl(config.CHAT_BASE_URL)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["CHAT_BASE_URL"],
+      message: "must be an http or https URL",
+    });
   }
 });
 
 export type Config = z.infer<typeof configSchema>;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const parsed = configSchemaWithEmbeddingRules.safeParse(env);
+  const parsed = configSchemaWithFeatureRules.safeParse(env);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
