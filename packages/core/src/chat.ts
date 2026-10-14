@@ -146,6 +146,9 @@ async function postJson(
   try {
     response = await fetch(url, {
       method: "POST",
+      // Not followed: the request carries the API key and the article text,
+      // and a redirect would send both to wherever it points.
+      redirect: "manual",
       headers: { "content-type": "application/json", ...headers },
       body: JSON.stringify(body),
       // The caller's signal still cancels; the deadline is added to it rather
@@ -163,6 +166,14 @@ async function postJson(
     );
   }
 
+  // A redirect means CHAT_BASE_URL is not the endpoint, which is the setup's
+  // to fix, so it is reported the way a wrong URL is.
+  if (response.status >= 300 && response.status < 400) {
+    throw new ChatError(
+      `chat request was redirected (${response.status}); set CHAT_BASE_URL to the endpoint itself`,
+      "configuration",
+    );
+  }
   if (!response.ok) {
     const text = (await response.text().catch(() => "")).slice(0, 500);
     throw new ChatError(

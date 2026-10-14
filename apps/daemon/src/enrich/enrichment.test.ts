@@ -415,6 +415,32 @@ describeIfDb("createEnrichmentService", () => {
     expect(summarised.sort()).toEqual(["newest", "stale-star"]);
   });
 
+  test("the hour pays for items in the order selection chose, star first", async () => {
+    // "aaa" sorts first by id, which is the order the store returns inputs in;
+    // the star is what selection put first. Two kinds each and an hour of two
+    // calls, so whichever item goes first takes the whole hour.
+    await seedItem("aaa", { hoursAgo: 1 });
+    await seedItem("zzz-star", { hoursAgo: 20, starred: true });
+    const { chat } = stubChat(answerEachPrompt());
+
+    await service(chat, {
+      ENRICH_TAGS: "true",
+      ENRICH_MAX_ITEMS_PER_HOUR: "2",
+      ENRICH_CONCURRENCY: "1",
+    }).runPass();
+
+    const summarised = (await storedSummaries()).map((row) => row.itemId);
+    expect(summarised).toEqual(["zzz-star"]);
+  });
+
+  test("an outage stops the rest of the queue instead of failing item by item", async () => {
+    for (const id of ["a", "b", "c", "d", "e"]) await seedItem(id);
+    const { chat, asked } = stubChat(() => new ChatError("chat request failed (503)", "retryable"));
+
+    await expect(service(chat, { ENRICH_CONCURRENCY: "1" }).runPass()).rejects.toThrow(/503/);
+    expect(asked).toHaveLength(1);
+  });
+
   test("spends on the best match rather than the newest article", async () => {
     await seedItem("near", { hoursAgo: 3 });
     await seedItem("new-but-unrelated", { hoursAgo: 1 });
@@ -838,8 +864,6 @@ describeIfDb("createEnrichmentService", () => {
   });
 
   test("a forced rerun the hour cuts short says so, and continuing it asks only what is left", async () => {
-    // One worker, because two can each pass the hour check on the last call
-    // (the documented overshoot) and this test is about where the hour stops.
     // Two kinds per article and an hour of three calls: the first run gets
     // through a's summary and tags and b's summary, and leaves b's tags.
     await seedItem("a", { hoursAgo: 6 * 24 });
@@ -852,7 +876,6 @@ describeIfDb("createEnrichmentService", () => {
     const first = await service(chat, {
       ENRICH_TAGS: "true",
       ENRICH_MAX_ITEMS_PER_HOUR: "3",
-      ENRICH_CONCURRENCY: "1",
     }).runOver({
       since,
       kind: null,
@@ -884,7 +907,6 @@ describeIfDb("createEnrichmentService", () => {
     const enrichment = service(chat, {
       ENRICH_TAGS: "true",
       ENRICH_MAX_ITEMS_PER_HOUR: "2",
-      ENRICH_CONCURRENCY: "1",
     });
     const since = new Date(Date.now() - 7 * 24 * 60 * 60_000);
 

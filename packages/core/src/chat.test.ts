@@ -14,6 +14,7 @@ type FetchCall = {
   headers: Record<string, string>;
   body: unknown;
   signal: AbortSignal | null | undefined;
+  redirect: RequestInit["redirect"];
 };
 
 const calls: FetchCall[] = [];
@@ -28,6 +29,7 @@ function useFetch(respond: (call: FetchCall) => Response | Promise<Response>): v
       body:
         init?.body === undefined || init?.body === null ? undefined : JSON.parse(String(init.body)),
       signal: init?.signal,
+      redirect: init?.redirect,
     };
     calls.push(call);
     return respond(call);
@@ -295,6 +297,18 @@ describe("the output bound", () => {
     await expect(
       provider("openai-compatible").complete({ ...REQUEST, maxOutputTokens: 64 }),
     ).rejects.toThrow(/64-token output bound/);
+  });
+
+  test("a redirect is not followed, and says the base url is wrong", async () => {
+    // Followed, it would send the API key and the article to wherever it points.
+    useFetch(
+      () =>
+        new Response(null, { status: 302, headers: { location: "https://elsewhere.example/" } }),
+    );
+    await expect(provider("openai-compatible").complete(REQUEST)).rejects.toMatchObject({
+      kind: "configuration",
+    });
+    expect(calls[0]?.redirect).toBe("manual");
   });
 
   test("reaching the bound is a configuration error, not a fault of the article", async () => {

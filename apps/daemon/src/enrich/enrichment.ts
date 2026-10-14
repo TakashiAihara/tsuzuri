@@ -274,7 +274,13 @@ function toTagSlug(name: string): string | null {
  * wrapper, because a call is not knowable in advance of making it: an answer
  * that does not parse costs a second one.
  */
-type Allowance = { left: number };
+/**
+ * What is left of the hour for one run. `reserved` counts calls a worker has
+ * claimed but not yet made: the claim is taken synchronously, right after the
+ * worker decides to call, so concurrent workers cannot each see the last call
+ * as free across the awaits in between.
+ */
+type Allowance = { left: number; reserved: number };
 
 /** What a response carries about an article no model has touched. */
 const UNENRICHED: ItemEnrichment = {
@@ -345,7 +351,12 @@ export function createEnrichmentService(deps: {
     ...provider,
     complete(request, signal) {
       callTimes.push(Date.now());
-      if (spending) spending.left -= 1;
+      // A claimed call is already paid for; anything else -- the retry of an
+      // answer that did not parse -- is paid here.
+      if (spending) {
+        if (spending.reserved > 0) spending.reserved -= 1;
+        else spending.left -= 1;
+      }
       return provider.complete(request, signal).then((answer) => {
         lastError = null;
         return answer;
@@ -563,16 +574,7 @@ export function createEnrichmentService(deps: {
       if (stopping) break;
       // Between kinds rather than once per item: one article can be several
       // calls -- one for each kind, plus a retry of an answer that did not
-      // parse -- and the hour is a budget of calls. Checked before the call
-      // rather than reserved, so ENRICH_CONCURRENCY workers can each pass the
-      // check on the last call: the bound can be exceeded by up to
-      // ENRICH_CONCURRENCY - 1 calls, plus their parse retries.
-      if (allowance.left <= 0) {
-        // Kinds of this item were left unpaid, so the run is bounded even
-        // when every item was reached.
-        run.bounded = true;
-        break;
-      }
+      // parse -- and the hour is a budget of calls.
       const lang = want.lang ?? "";
       const target: EnrichmentTarget = {
         kind: want.kind,
@@ -596,6 +598,19 @@ export function createEnrichmentService(deps: {
           ? stored.length > 0
           : stored.some((row) => new Date(row.createdAt) >= cutoff);
       if (answered) continue;
+
+      // After the store has answered and with no await before the claim, so a
+      // kind that needs no call does not count against the hour and two
+      // workers cannot both take the last call. Only a parse retry can still
+      // run past the bound.
+      if (allowance.left <= 0) {
+        // Kinds of this item were left unpaid, so the run is bounded even
+        // when every item was reached.
+        run.bounded = true;
+        break;
+      }
+      allowance.left -= 1;
+      allowance.reserved += 1;
 
       asked = true;
       try {
@@ -664,6 +679,16 @@ export function createEnrichmentService(deps: {
     return total.bounded || waiting > total.items;
   }
 
+  /**
+   * The inputs in the order selection chose them. The store answers by id, and
+   * the order is the ranking: under the hourly bound the first items are the
+   * ones paid for.
+   */
+  function inOrder(ids: readonly string[], inputs: readonly EnrichmentInput[]): EnrichmentInput[] {
+    const byId = new Map(inputs.map((input) => [input.id, input]));
+    return ids.flatMap((id) => byId.get(id) ?? []);
+  }
+
   function emptyRun(): EnrichmentRun {
     return {
       items: 0,
@@ -719,7 +744,10 @@ export function createEnrichmentService(deps: {
           try {
             return await enrichOne(chat, item, wanted, cutoff, allowance);
           } catch (error) {
-            if (isConfiguration(error)) refused = true;
+            // enrichOne throws only what it did not record against the item --
+            // a configuration error, an outage, a timeout -- and every item
+            // queued behind it would meet the same, spending the hour on it.
+            refused = true;
             throw error;
           }
         }),
@@ -803,11 +831,11 @@ export function createEnrichmentService(deps: {
     if (!counted || wanted.length === 0) return { ...emptyRun(), idle: true };
 
     const budget = await callsLeft(now);
-    const allowance = { left: budget };
+    const allowance: Allowance = { left: budget, reserved: 0 };
     const ids = await choosePass(now, budget);
     if (ids.length === 0) return { ...emptyRun(), idle: true };
 
-    const inputs = await enrichmentInputs(sql, ids.slice(0, budget));
+    const inputs = inOrder(ids.slice(0, budget), await enrichmentInputs(sql, ids.slice(0, budget)));
     const total = await spend(counted, inputs, wanted, null, allowance);
     // The list is already cut to ENRICH_TOP_N and to the window, so what the
     // pass did not reach is what the hour could not pay for.
@@ -1014,7 +1042,7 @@ export function createEnrichmentService(deps: {
         // The request's own instant unless the caller named one, so that the
         // cutoff in the answer is a value a later call can pass back unchanged.
         const cutoff = force ? (forceBefore ?? now) : null;
-        const allowance: Allowance = { left: await callsLeft(now) };
+        const allowance: Allowance = { left: await callsLeft(now), reserved: 0 };
         const selection = await enrichmentCandidates(sql, {
           userId,
           model: counted.model,
@@ -1028,7 +1056,8 @@ export function createEnrichmentService(deps: {
         });
 
         const ids = selection.candidates;
-        const inputs = await enrichmentInputs(sql, ids.slice(0, allowance.left));
+        const chosen = ids.slice(0, allowance.left);
+        const inputs = inOrder(chosen, await enrichmentInputs(sql, chosen));
         const total = await spend(counted, inputs, wanted, cutoff, allowance);
         // From what matched rather than from what was fetched: the fetch is
         // capped by the hour, so a full fetch says nothing about what waits.
