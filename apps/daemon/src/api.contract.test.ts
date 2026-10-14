@@ -276,7 +276,7 @@ describeIfDb("api contract", () => {
     expect(withForce.forceBefore).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  test("POST /enrich continues a forced rerun from the cutoff it was given", async () => {
+  test("POST /enrich measures a forced rerun against the cutoff it was given", async () => {
     const cutoff = new Date().toISOString();
 
     const body = await parsed(enrichRunSchema, "/enrich", {

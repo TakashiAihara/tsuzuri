@@ -204,12 +204,12 @@ describe("completeJson", () => {
 
   test("a whole-reply object whose value holds a fenced block is read whole", async () => {
     // The case that tells the whole-reply step from the fence step: looking for
-    // a fence first would return the inner block, which has the wrong shape.
-    const inner = '```json\n{"other": 1}\n```';
-    const { provider, asked } = stubProvider([JSON.stringify({ summary: `see ${inner}` })]);
+    // a fence first would return `{}`, which parses but has the wrong shape, and
+    // the retry would be spent on a reply that was right.
+    const { provider, asked } = stubProvider(['{"summary":"see ```{}```"}']);
     const result = await completeJson(provider, REQUEST, summaryReplySchema);
 
-    expect(result).toEqual({ summary: `see ${inner}` });
+    expect(result).toEqual({ summary: "see ```{}```" });
     expect(asked).toHaveLength(1);
   });
 
