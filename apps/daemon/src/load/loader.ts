@@ -131,8 +131,8 @@ export function createLoader(deps: LoaderDeps) {
       const entries: Record<string, SourceFetchStateRow> = {};
       for (const [id, entry] of Object.entries(parseState(bytes).subscriptions)) {
         // One value PostgreSQL refuses would fail the whole UPDATE, so a bad
-        // entry is skipped alone. Timestamps are re-serialised: Date.parse
-        // accepts forms ("2026") that timestamptz does not.
+        // entry is skipped alone. Not guarded: lone surrogates in text, which
+        // only a hand-edited state file could hold.
         const times = {
           nextFetchAt: toTimestamp(entry.nextFetchAt),
           lastFetchedAt: toTimestamp(entry.lastFetchedAt),
@@ -142,7 +142,12 @@ export function createLoader(deps: LoaderDeps) {
         const badText = (["etag", "lastModified", "contentHash", "lastError"] as const).find(
           (field) => !isStorableText(entry[field]),
         );
-        const bad = badTime?.[0] ?? badText;
+        const badOther = !isStorableText(id)
+          ? "id"
+          : entry.consecutiveFailures > INT4_MAX
+            ? "consecutiveFailures"
+            : undefined;
+        const bad = badTime?.[0] ?? badText ?? badOther;
         if (bad) {
           log(`${STATE_KEY}: ${id}: ${bad} cannot be stored, skipped`);
           continue;
@@ -175,12 +180,18 @@ function isDate(value: unknown): value is Date {
   return year >= 1 && year <= 9999;
 }
 
-// null and missing stay null; undefined means "cannot be stored".
+const INT4_MAX = 2_147_483_647;
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+
+// Only the UTC ISO form the collector writes: Date accepts looser forms and
+// silently moves them ("2026-02-30" to March, "1" to 2001, no zone to local
+// time). null and missing stay null; undefined means "cannot be stored".
 function toTimestamp(value: unknown): string | null | undefined {
   if (value === null || value === undefined) return null;
-  if (typeof value !== "string") return undefined;
+  if (typeof value !== "string" || !ISO_UTC.test(value)) return undefined;
   const date = new Date(value);
-  return isDate(date) ? date.toISOString() : undefined;
+  if (!isDate(date) || date.toISOString().slice(0, 19) !== value.slice(0, 19)) return undefined;
+  return value;
 }
 
 function isStorableText(value: unknown): boolean {

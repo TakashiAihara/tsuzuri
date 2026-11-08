@@ -229,11 +229,13 @@ describeIfDb("loader", () => {
       await put(KEY_1, [
         itemRow(ID_A),
         itemRow(ID_B, { source_id: "00000000-0000-0000-0000-00000000dead" }),
+        // Not a uuid at all: compared as text, so it cannot fail a cast.
+        itemRow(ID_C, { source_id: "not-a-uuid" }),
       ]);
 
       const result = await loader().loadPending();
 
-      expect(result).toEqual({ objects: 1, inserted: 2, linked: 1, rejected: 0, stoppedAt: null });
+      expect(result).toEqual({ objects: 1, inserted: 3, linked: 1, rejected: 0, stoppedAt: null });
       const links = await handle.sql<{ item_id: string }[]>`SELECT item_id FROM item_sources`;
       expect(links.map((l) => l.item_id)).toEqual([ID_A]);
     });
@@ -276,6 +278,11 @@ describeIfDb("loader", () => {
       ["a published_at in year 0", { published_at: new Date("0000-06-01T00:00:00Z") }],
       ["a U+0000 in author", { author: `a${String.fromCharCode(0)}b` }],
       ["a U+0000 in source_id", { source_id: `x${String.fromCharCode(0)}` }],
+      ["a U+0000 in url", { url: `https://e.com/a${String.fromCharCode(0)}` }],
+      [
+        "a U+0000 in canonical_url whose id matches it",
+        { canonical_url: `u${String.fromCharCode(0)}`, id: sha256(`u${String.fromCharCode(0)}`) },
+      ],
     ];
 
     for (const [name, overrides] of invalid) {
@@ -431,6 +438,11 @@ describeIfDb("loader", () => {
       expect(result.objects).toBe(0);
       expect(result.stoppedAt).toEqual({ key: KEY_1, error: "cannot read object: object is gone" });
       expect(await count("loaded_objects")).toBe(0);
+
+      await rm(join(dir, KEY_1));
+      const next = await loader().loadPending();
+
+      expect(next).toEqual({ objects: 1, inserted: 1, linked: 1, rejected: 0, stoppedAt: null });
     });
 
     test("an object the database refuses commits nothing and stops the run before later keys", async () => {
@@ -550,6 +562,13 @@ describeIfDb("loader", () => {
       ["nextFetchAt", "+010000-01-01T00:00:00.000Z"],
       ["lastError", `bad${String.fromCharCode(0)}`],
       ["etag", 7],
+      ["lastModified", `x${String.fromCharCode(0)}`],
+      ["contentHash", `x${String.fromCharCode(0)}`],
+      ["nextFetchAt", "2026-02-30T00:00:00.000Z"],
+      ["nextFetchAt", "2026-11-09"],
+      ["lastFetchedAt", "2026"],
+      ["lastSuccessAt", "2026-11-08T12:00:00"],
+      ["consecutiveFailures", 2_147_483_648],
     ] as const) {
       test(`skips a source whose ${field} is ${JSON.stringify(value)} and syncs the rest`, async () => {
         const [other] = await handle.sql<{ id: string }[]>`
@@ -573,12 +592,10 @@ describeIfDb("loader", () => {
       });
     }
 
-    test("stores a timestamp Date.parse accepts in a form PostgreSQL would refuse", async () => {
-      await putState({ [sourceId]: entry({ lastFetchedAt: "2026" }) });
+    test("skips a subscription id PostgreSQL cannot compare and syncs the rest", async () => {
+      await putState({ [`x${String.fromCharCode(0)}`]: entry(), [sourceId]: entry() });
 
       expect(await loader().syncSourceState()).toBe(1);
-      const [source] = await handle.sql`SELECT last_fetched_at FROM sources`;
-      expect(iso(source?.last_fetched_at)).toBe("2026-01-01T00:00:00.000Z");
     });
 
     test("keeps a disabled source disabled and ignores unknown ids", async () => {
