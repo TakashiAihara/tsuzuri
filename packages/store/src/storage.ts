@@ -100,6 +100,9 @@ export function fileStorage(root: string): Storage {
         await writeFile(tmp, data);
         // fsync the file before the rename and the directory after it:
         // without both, a power loss can lose the data or the rename itself.
+        // Directories that mkdir just created are not synced into their own
+        // parents, so the first put into a new dt= partition is not durable
+        // until something else syncs it.
         const file = await open(tmp, "r");
         try {
           await file.sync();
