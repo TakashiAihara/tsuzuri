@@ -1,11 +1,13 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
- * The store of record: objects addressed by "/"-separated keys. `file://` and
- * `s3://` implementations must behave identically, because the collector,
- * viewer and other producers share the same prefixes. The store is not
- * append-only: `put` overwrites, and `_state` documents rely on that.
+ * The store of record: objects addressed by "/"-separated keys. The collector,
+ * viewer and other producers share the same prefixes, so both backends apply
+ * one key rule — but they are not identical: file:// cannot hold both "p" and
+ * "p/q" where S3 can, and file:// follows symlinks on get/put while its list
+ * does not report them. The store is not append-only: `put` overwrites, and
+ * `_state` documents rely on that.
  */
 export type Storage = {
   /** Short identifier for logs, e.g. "file:///data" or "s3://bucket". */
@@ -22,21 +24,25 @@ export type Storage = {
 type Env = Record<string, string | undefined>;
 
 // One key rule for both backends, applied with no normalisation: a key is
-// "/"-separated segments matching SEGMENT — ASCII only, no empty segment and
-// no leading dot, so "." and ".." cannot appear — and an object key does not
-// end in "/". A list prefix follows the same rule but may be empty and may end
-// in "/", its last segment being only a partial match.
-const SEGMENT = /^[A-Za-z0-9_=-][A-Za-z0-9._=-]*$/;
+// "/"-separated segments matching SEGMENT — ASCII only, no empty segment, no
+// leading dot so "." and ".." cannot appear, and at most 200 characters so the
+// file backend's temporary name stays under the 255-byte file-name limit —
+// and an object key does not end in "/". A list prefix follows the same rule
+// but may be empty and may end in "/", its last segment being only a partial
+// match.
+const SEGMENT = /^[A-Za-z0-9_=-][A-Za-z0-9._=-]{0,199}$/;
 
 function invalidKey(key: string): Error {
   return new Error(`invalid storage key ${JSON.stringify(key)}`);
 }
 
-function assertKey(key: string): void {
+function isObjectKey(key: string): boolean {
   // A trailing "/" leaves an empty last segment, which SEGMENT refuses.
-  for (const segment of key.split("/")) {
-    if (!SEGMENT.test(segment)) throw invalidKey(key);
-  }
+  return key.split("/").every((segment) => SEGMENT.test(segment));
+}
+
+function assertKey(key: string): void {
+  if (!isObjectKey(key)) throw invalidKey(key);
 }
 
 function assertPrefix(prefix: string): void {
@@ -51,12 +57,13 @@ function errnoCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException).code;
 }
 
-// fileStorage keeps one directory as the root; keys are paths inside it, and
-// the shared key rule is also what keeps them inside the root. The root is
-// resolved once so locate() always reports an absolute path. put writes a
-// temporary file and renames it over the target, so a reader sees the old or
-// the new object, never a partial one. Symlinks inside the root are followed,
-// not defended against.
+// fileStorage keeps one directory as the root; keys are paths inside it. The
+// shared key rule refuses traversal and absolute keys, which is what keeps
+// them inside the root; it does not defend against symlinks — get/put follow
+// them, while list does not report them. The root is resolved once so
+// locate() always reports an absolute path. put writes a temporary file and
+// renames it over the target, so a reader sees the old or the new object,
+// never a partial one.
 export function fileStorage(root: string): Storage {
   const rootDir = resolve(root);
 
@@ -83,14 +90,29 @@ export function fileStorage(root: string): Storage {
     put: async (key, data) => {
       assertKey(key);
       const path = pathFor(key);
-      await mkdir(dirname(path), { recursive: true });
+      const dir = dirname(path);
+      await mkdir(dir, { recursive: true });
       // The temporary file sits in the same directory so the rename stays on
       // one filesystem and replaces the target atomically. Its leading dot
       // breaks the key rule, so a concurrent list never returns it.
-      const tmp = join(dirname(path), `.${basename(path)}.${crypto.randomUUID()}.tmp`);
+      const tmp = join(dir, `.${basename(path)}.${crypto.randomUUID()}.tmp`);
       try {
         await writeFile(tmp, data);
+        // fsync the file before the rename and the directory after it:
+        // without both, a power loss can lose the data or the rename itself.
+        const file = await open(tmp, "r");
+        try {
+          await file.sync();
+        } finally {
+          await file.close();
+        }
         await rename(tmp, path);
+        const parent = await open(dir, "r");
+        try {
+          await parent.sync();
+        } finally {
+          await parent.close();
+        }
       } catch (error) {
         await rm(tmp, { force: true }).catch(() => {});
         throw error;
@@ -146,9 +168,9 @@ export type S3Like = {
 };
 
 /**
- * The Bun.S3Client options for `bucket`, read from the standard AWS_* names in
- * `env` rather than process.env. Any option left undefined falls back to Bun's
- * own reading of process.env.
+ * The Bun.S3Client options for `bucket`: the standard AWS_* names are read
+ * from `env`, and any option left undefined falls back to Bun's own reading
+ * of the S3_ and AWS_ variables in process.env.
  */
 export function s3ClientOptions(bucket: string, env: Env = process.env): Bun.S3Options {
   return {
@@ -163,8 +185,10 @@ export function s3ClientOptions(bucket: string, env: Env = process.env): Bun.S3O
 
 /**
  * Any S3-compatible bucket (R2 included) through Bun's built-in client, or an
- * injected S3Like. Credentials come from the standard AWS_* names in `env`, not
- * process.env, so tests and callers can pass an explicit environment.
+ * injected S3Like. Client options come from the standard AWS_* names in `env`;
+ * any left undefined fall back to Bun's own reading of the S3_ and AWS_
+ * variables in process.env, so tests and callers can pass an explicit
+ * environment.
  */
 export function s3Storage(bucket: string, env: Env = process.env, client?: S3Like): Storage {
   const missing = (["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] as const).filter(
@@ -198,7 +222,11 @@ export function s3Storage(bucket: string, env: Env = process.env, client?: S3Lik
           prefix,
           ...(continuationToken !== undefined ? { continuationToken } : {}),
         });
-        for (const object of page.contents ?? []) keys.push(object.key);
+        for (const object of page.contents ?? []) {
+          // S3 holds keys the shared rule refuses (folder markers, spaces,
+          // non-ASCII); like fileStorage's walk, list reports only real keys.
+          if (isObjectKey(object.key)) keys.push(object.key);
+        }
         if (!page.isTruncated) break;
         const next = page.nextContinuationToken;
         if (next === undefined) {

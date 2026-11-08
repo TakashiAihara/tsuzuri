@@ -5,8 +5,10 @@ import { parquetWriteBuffer } from "hyparquet-writer";
 export type ColumnType = "STRING" | "TIMESTAMP" | "BOOLEAN" | "INT32" | "DOUBLE";
 export type Schema = Record<string, ColumnType>;
 
-// Values are checked against the declared column type and never coerced:
-// a string where INT32 belongs is a bug in the caller, not something to fix up.
+// A column a row leaves out — the key absent, or the value null or undefined —
+// is written as null. Every other value is checked against the declared column
+// type and never coerced on a type mismatch: a string where INT32 belongs is a
+// bug in the caller, not something to fix up.
 const validators: Record<ColumnType, (value: unknown) => boolean> = {
   STRING: (value) => typeof value === "string",
   TIMESTAMP: (value) => value instanceof Date && !Number.isNaN(value.getTime()),
@@ -27,6 +29,7 @@ function checkValue(rowIndex: number, name: string, type: ColumnType, value: unk
         ? "invalid Date"
         : "Date"
       : typeof value;
+  // rowIndex is the row's 0-based position in the input array.
   throw new Error(`row ${rowIndex}, column "${name}": expected ${type}, got ${actual}`);
 }
 
@@ -58,14 +61,9 @@ export function writeParquet(rows: Record<string, unknown>[], schema: Schema): U
 export async function readParquet(bytes: Uint8Array): Promise<Record<string, unknown>[]> {
   const file = {
     byteLength: bytes.byteLength,
-    // View the backing buffer at byteOffset first: the Uint8Array does not
-    // necessarily start at offset 0 of its buffer.
-    slice: (start: number, end?: number) =>
-      new Uint8Array(
-        bytes.buffer,
-        bytes.byteOffset + start,
-        (end ?? bytes.byteLength) - start,
-      ).slice().buffer,
+    // TypedArray.slice is relative to the view and returns a fresh buffer, so
+    // a non-zero byteOffset needs no special handling.
+    slice: (start: number, end?: number) => bytes.slice(start, end).buffer,
   };
   return parquetReadObjects({ file, compressors });
 }
