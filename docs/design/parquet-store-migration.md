@@ -104,7 +104,8 @@ flowchart LR
 
 ### 1. Storage provider
 
-- `packages/store`: a `Storage` interface (`put`, `get`, `list`, `locate`) with `file://` and `s3://` implementations, chosen by configuration. Bun's built-in S3 client covers any S3-compatible endpoint, R2 included.
+- `packages/store`: a `Storage` interface (`put`, `get`, `list`, `locate`) with `file://` and `s3://` implementations. Bun's built-in S3 client covers any S3-compatible endpoint, R2 included.
+- Configuration: `TSUZURI_STORAGE` is `file://<dir>` or `s3://<bucket>`. Credentials and endpoint are the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION`); R2 is selected by setting the endpoint. The default is `file://./data`, so a first run works with no configuration and the daemon reads what it wrote. The standalone `tsuzuri collect` (step 3) has no default and refuses to start without `TSUZURI_STORAGE`, because a cron job that lost its environment would otherwise write to a directory nobody reads.
 - Parquet write and read helpers. Library choice is decided by a spike inside this step (see Unverified): DuckDB is the stronger reader and matches what users will analyse with, but it is a native module and may not survive `bun build --compile` (issue #17); a pure-JS writer is the fallback.
 - No behaviour change. Covers issue #9 (object storage for original HTML) at the interface level; retained HTML can use the same provider later.
 
@@ -178,5 +179,5 @@ Settled outside this document; recorded here when answered.
 
 - AI outputs in storage: decided 2026-11-08. Enrichments and embeddings are written to storage, because re-running a chat model over every item on each rebuild is not practical. Rejected: recomputing on rebuild, which keeps storage to fetched items and user actions but makes a rebuild cost a full model pass.
 - Storage layout names: decided 2026-11-08, the prefixes in the table above. Rejected: a `curated/<collector>/<table>/dt=` layout, which only adds a level for a second collector that does not exist.
-- Configuration names: the environment variables that select the storage provider and its credentials.
+- Configuration names: decided 2026-11-08, as written in step 1. Rejected: no default anywhere, which avoids the cron failure but makes the first run fail for everyone.
 - Existing data: whether any running instance has PostgreSQL data that needs a one-time export into storage. If none, no export tool is built.
