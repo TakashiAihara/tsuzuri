@@ -67,7 +67,7 @@ Names decided 2026-11-08. They are a public contract, because other producers wr
 | Prefix | Content | Written by | Mutability |
 |---|---|---|---|
 | `items/dt=YYYY-MM-DD/<runId>.parquet` | Items fetched in one collector run, all subscriptions together | collector | append, compacted |
-| `inbox/<producer>/dt=YYYY-MM-DD/<id>.parquet` | Items in the same schema from another producer | other producers | append |
+| `inbox/<producer>/dt=YYYY-MM-DD/<id>.parquet` | Items in the same schema from another producer | other producers | append, compacted |
 | `events/dt=YYYY-MM-DD/<batchId>.parquet` | Subscription and item-state events | viewer | append, compacted |
 | `_runs/<runId>.json` | One record per collector run: requests, items, failures | collector | append, deleted after 30 days |
 | `derived/enrichments/`, `derived/embeddings/<model>/` | AI outputs (step 7) | enrichment and embedding workers | append |
@@ -87,7 +87,7 @@ The Parquet columns are the existing `items` columns that ingest writes (`id`, `
 
 - One event table, with a `kind` column: `subscribe`, `unsubscribe`, `update_subscription`, `read`, `unread`, `star`, `unstar`, `skip`, `unskip`, `approve_tag`, `reject_tag`. Columns: `event_id`, `kind`, `user_id`, `at`, `item_id` (item events), `source_id`, `tag` (tag events) and a JSON `payload`. A subscription's `source_id` is generated once, when it is created, and every later event for it carries the same id, so folding recreates `sources` with the ids that `items.source_id` already refers to. Subscription events' payload: url, kind, config, title, site_url, fetch_interval_seconds — every column a subscription can be created or updated with today).
 - Subscriptions are events too, rather than one JSON object rewritten on change. A rewritten object needs a conditional write (`If-Match`) to stop the CLI and the Web UI from overwriting each other; appending events needs no coordination and reuses the item-state machinery. Whether the providers and Bun's client support conditional writes was not checked, because this choice does not depend on it.
-- Current state is folded per state, not per item: the last of `read`/`unread` sets `read_at`, the last of `star`/`unstar` sets `starred_at`, and the last of `skip`/`unskip` sets `skipped_at`, matching the separate columns of `item_state` (`saved_at` exists but nothing writes it yet; its events are added with whatever first does). Subscriptions fold to the last event per subscription, tags to the last decision per tag. Daily compaction writes a snapshot of current state and drops the events it covers, so a rebuild reads one snapshot plus the days since.
+- Current state is folded per state, not per item: the last of `read`/`unread` sets `read_at`, the last of `star`/`unstar` sets `starred_at`, and the last of `skip`/`unskip` sets `skipped_at`, matching the separate columns of `item_state` (`saved_at` exists but nothing writes it yet; its events are added with whatever first does). Subscriptions fold to the last event per subscription, and an `unsubscribe` removes the subscription from the result, as `DELETE /sources/:id` removes the row today; subscribing to the same URL again creates a new subscription with a new id, so `UNIQUE (user_id, url)` holds after a rebuild. Tags fold to the last decision per tag. "Last" is by `at`, ties broken by `event_id`. Only the viewer daemon writes events (one per storage, like the collector), so `at` comes from one clock. Daily compaction writes a snapshot of current state and drops the events it covers, so a rebuild reads one snapshot plus the days since.
 - The viewer buffers events and flushes them every few seconds and on shutdown. The buffer is spooled to a local file first, so a process crash or restart loses nothing that was acknowledged to the user. Without the spool, the PostgreSQL row would show an item as read until the next rebuild silently unread it.
 - Losing the host's disk inside the flush window does lose those few seconds of actions. This is accepted: writing to storage before answering would put an object-storage round trip and one tiny object behind every click, and what is at risk is read and star marks, not articles.
 
@@ -132,19 +132,19 @@ flowchart LR
 ### 4. Read and star as events
 
 - `POST /items/:id/state` appends item-state events through the spooled buffer and keeps updating `item_state` immediately.
-- Cluster-scope reads (D24 in the P3 design: reading a collapsed row reads its members) are written as one event per member item, not one per cluster, and only for members that are not already read. That matches the API, which keeps an existing `read_at` on propagation (`COALESCE`), so a rebuild does not move an earlier read time. Cluster membership is derived and can change on rebuild; the event must record what the user actually marked.
+- Cluster-scope reads (D24 in the P3 design: reading a collapsed row reads its members) are written as one event per member item, not one per cluster, and only for members that are not already read. That matches the API, which keeps an existing `read_at` on propagation (`COALESCE`), so a rebuild does not move an earlier read time. Propagated unreads are written the same way, one `unread` per member, because the API clears `read_at` on every member. Cluster membership is derived and can change on rebuild; the event must record what the user actually marked.
 - Interest scoring reads `item_state` as before; its signals survive a rebuild because `item_state` does.
 - Same carry-over as step 3: on the first start, if storage holds no item-state events, the daemon writes events for the existing `item_state` rows.
 
 ### 5. Compaction
 
-- Daily job: merge yesterday's `items` files into one, fold events older than a day into a state snapshot, and delete `_runs` records older than 30 days. Run records are for diagnosis; the state that matters is in `_state`, so dropping old ones loses nothing a rebuild needs.
+- Daily job: merge yesterday's `items` files into one, merge each producer's `inbox` files for the day the same way, fold events older than a day into a state snapshot, and delete `_runs` records older than 30 days. Run records are for diagnosis; the state that matters is in `_state`, so dropping old ones loses nothing a rebuild needs.
 - Compaction writes the new file before deleting the old ones, so a crash in the middle never loses rows. The merged file is a new object the loader has not seen, and it loads it again; that is harmless because loading is idempotent per row, not per object: items insert with `ON CONFLICT DO NOTHING` on the item id, and events carry a unique `event_id` and fold to the last event per key. The loaded-objects table only saves work, it is not what prevents duplicates.
 
 ### 6. Inbox for other producers
 
 - The loader also lists `inbox/*/`. Rows are validated against the published schema; a file that fails validation is recorded as rejected with the reason and skipped, never partially loaded, and the rest of the inbox continues.
-- A producer is subscribed explicitly, like a feed: `tsuzuri subscribe inbox:<producer>` appends a `subscribe` event with kind `inbox`. The loader loads only producers with a current subscription; files from any other producer stay in storage unloaded, and subscribing later loads everything already there. Unsubscribing stops loading new files and removes the `item_sources` rows, as for feeds. Nothing subscribes automatically, so nothing besides the viewer writes events.
+- A producer is subscribed explicitly, like a feed: `tsuzuri subscribe inbox:<producer>` goes through `POST /sources` with kind `inbox` and url `inbox:<producer>`, and appends a `subscribe` event. For kind `inbox` the request schema skips the URL check and `checkFetchTarget` (nothing is fetched); instead the producer name must match `[a-z0-9][a-z0-9-]*`, which is also what keeps it a single storage path segment. The loader loads only producers with a current subscription; files from any other producer stay in storage unloaded, and subscribing later loads everything already there. Unsubscribing stops loading new files and removes the `item_sources` rows, as for feeds. Nothing subscribes automatically, so nothing besides the viewer writes events.
 - Migration adds `inbox` to the `sources.kind` CHECK constraint, and the zod enums in `packages/core` and `packages/api` gain the same value.
 - Changes on the producer side are out of scope for this repository.
 
@@ -178,7 +178,7 @@ Checked before or during step 1, not assumed:
 
 - DuckDB reads R2 through a `TYPE s3` secret with a custom endpoint and `s3://` URLs. Another project found `TYPE r2` secrets apply only to `r2://` URLs; whether the generic S3 form works against R2 is not measured.
 - `hyparquet-writer` inside `bun build --compile` output on darwin and on arm64 (only linux-x64 was measured).
-- Listing cost: R2 counts `ListObjects` as a Class A operation. The loader lists after each flush, at most every five minutes: about 8,600 lists a month for `items/`, plus the same again for `events/` and `inbox/` once those steps land. Under the free tier of one million, but an estimate, not a measurement.
+- Listing cost: R2 counts `ListObjects` as a Class A operation. The loader lists after each flush, at most every five minutes, and only the date partitions from the last one it loaded onward (`startAfter`), so the cost does not grow with history: about 8,600 lists a month for `items/`, the same for `events/`, and the same per subscribed producer for `inbox/`. Under the free tier of one million, but an estimate, not a measurement.
 
 ## Open decisions
 
