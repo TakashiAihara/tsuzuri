@@ -642,6 +642,51 @@ describe("when a flush happens (behaviours 6 and 9)", () => {
     expect(await storage.list("items/")).toHaveLength(2);
   });
 
+  test("a flush with nothing to write still restarts the interval", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, { flushIntervalMs: 1000 });
+    advance(5000);
+    expect(await collector.flush()).toBeNull();
+    advance(10);
+    await collector.tick([sub("a")]);
+    expect(await storage.list("items/")).toEqual([]);
+    advance(1000);
+    await collector.tick([]);
+    expect(await storage.list("items/")).toHaveLength(1);
+  });
+
+  test("each flush writes only the rows buffered since the previous one", async () => {
+    const harness = fakeSources({
+      "https://a.example/feed.xml": fetched([post("a")]),
+      "https://b.example/feed.xml": fetched([post("b")]),
+    });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    await collector.flush();
+    advance(1000);
+    await collector.tick([sub("b")]);
+    await collector.flush();
+
+    const keys = await storage.list("items/");
+    expect(keys).toHaveLength(2);
+    const second = await rowsAt(keys[1] ?? "");
+    expect(second.map((row) => row.title)).toEqual(["b"]);
+  });
+
+  test("a subscription whose source throws does not stop the others in the same tick", async () => {
+    const harness = fakeSources({ "https://b.example/feed.xml": fetched([post("b")]) });
+    const collector = make(harness);
+    await collector.tick([sub("a"), sub("b")]);
+    await collector.flush();
+
+    expect(harness.calls.map((ctx) => ctx.url)).toEqual([
+      "https://a.example/feed.xml",
+      "https://b.example/feed.xml",
+    ]);
+    const keys = await storage.list("items/");
+    expect((await rowsAt(keys[0] ?? "")).map((row) => row.title)).toEqual(["b"]);
+  });
+
   test("flushIntervalMs comes from the options", async () => {
     const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
     const collector = make(harness, { flushIntervalMs: 1000 });
