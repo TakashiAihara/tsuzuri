@@ -1,6 +1,6 @@
 # Parquet store: collector → object storage → viewer
 
-Status: plan, not built. Open decisions are listed at the end and are not settled by this document.
+Status: plan, not built. The open decisions listed at the end were settled on 2026-11-08.
 
 ## Summary
 
@@ -180,4 +180,4 @@ Settled outside this document; recorded here when answered.
 - AI outputs in storage: decided 2026-11-08. Enrichments and embeddings are written to storage, because re-running a chat model over every item on each rebuild is not practical. Rejected: recomputing on rebuild, which keeps storage to fetched items and user actions but makes a rebuild cost a full model pass.
 - Storage layout names: decided 2026-11-08, the prefixes in the table above. Rejected: a `curated/<collector>/<table>/dt=` layout, which only adds a level for a second collector that does not exist.
 - Configuration names: decided 2026-11-08, as written in step 1. Rejected: no default anywhere, which avoids the cron failure but makes the first run fail for everyone.
-- Existing data: whether any running instance has PostgreSQL data that needs a one-time export into storage. If none, no export tool is built.
+- Existing data: answered 2026-11-08, no running instance holds data worth keeping. No export tool is built.
