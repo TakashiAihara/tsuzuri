@@ -19,7 +19,7 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 
 ## Items
 
-`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null, and the loader refuses a row that does.
+`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader (step 2b of the design, not built yet) will refuse a row that does.
 
 | Column | Parquet type | Required | Meaning |
 |---|---|---|---|
@@ -32,11 +32,11 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 | `published_at` | INT64 (TIMESTAMP_MILLIS, UTC) | yes | Publication time; fetch time when the source gave no usable date |
 | `published_at_estimated` | BOOLEAN | yes | True when `published_at` is the fetch time |
 | `content_html` | BYTE_ARRAY (UTF8) | no | Article body as HTML |
-| `summary` | BYTE_ARRAY (UTF8) | no | The source's short description, as published. May repeat the body |
+| `summary` | BYTE_ARRAY (UTF8) | no | The source's short description with whitespace collapsed (as are `title` and `author`). May repeat the body |
 | `fetched_at` | INT64 (TIMESTAMP_MILLIS, UTC) | yes | When the item was fetched |
-| `source_id` | BYTE_ARRAY (UTF8) | yes | The subscription that delivered it. Inbox producers cannot know it; for inbox files the subscription comes from the producer path (step 6) |
+| `source_id` | BYTE_ARRAY (UTF8) | yes, in `items/` | The subscription that delivered it. Inbox producers cannot know it and may leave it null; for inbox files the subscription comes from the producer path (step 6) |
 | `schema_version` | INT32 | yes | `1` |
 | `raw` | BYTE_ARRAY (UTF8) | no | The item as the source produced it before normalisation, as JSON text (for a feed: `url`, `title`, `author`, `guid`, `publishedAtRaw`, `contentHtml`, `summary`) |
 
 - tsuzuri writes SNAPPY-compressed files. It reads SNAPPY, ZSTD, GZIP, BROTLI and LZ4 files and uncompressed ones.
-- The same `id` may appear in several files. When the copies differ, the one with the earliest `fetched_at` wins, ties broken by object key and then row position.
+- The same `id` may appear in several files. When the copies differ, the one with the earliest `fetched_at` wins, ties broken by object key and then row position (applied by the loader, step 2b).

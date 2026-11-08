@@ -1483,7 +1483,7 @@ function within<T>(promise: Promise<T>, ms = 2000): Promise<T> {
   return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
 }
 
-describe("a subscription that cannot be turned into rows (behaviour M)", () => {
+describe("one item that cannot be turned into a row (behaviour M)", () => {
   const bigint = Object.assign(post("y"), { big: 10n }) as RawItem;
   const getter = raw("https://example.com/posts/g");
   Object.defineProperty(getter, "title", {
@@ -1492,13 +1492,13 @@ describe("a subscription that cannot be turned into rows (behaviour M)", () => {
       throw new Error("getter boom");
     },
   });
-  const cases: [string, FetchResult, string][] = [
-    ["raw JSON that cannot be serialised", fetched([post("x"), bigint]), "BigInt"],
-    ["an item whose getter throws", fetched([post("x"), getter]), "getter boom"],
+  const cases: [string, FetchResult][] = [
+    ["raw JSON that cannot be serialised", fetched([post("x"), bigint])],
+    ["an item whose getter throws", fetched([post("x"), getter])],
   ];
 
-  for (const [name, broken, fragment] of cases) {
-    test(`${name} fails that subscription only`, async () => {
+  for (const [name, broken] of cases) {
+    test(`${name} is skipped on its own; the rest of the fetch is written`, async () => {
       const harness = fakeSources({
         "https://a.example/feed.xml": broken,
         "https://b.example/feed.xml": fetched([post("b")]),
@@ -1506,32 +1506,45 @@ describe("a subscription that cannot be turned into rows (behaviour M)", () => {
       const collector = make(harness);
       const result = await within(collector.tick([sub("a"), sub("b")]));
       expect(result.subscriptions).toEqual([
-        {
-          id: "a",
-          status: "failed",
-          seen: 0,
-          written: 0,
-          error: expect.stringContaining(fragment),
-        },
+        { id: "a", status: "fetched", seen: 1, written: 1 },
         { id: "b", status: "fetched", seen: 1, written: 1 },
       ]);
       const state = await collector.state();
-      expect(state.subscriptions.a).toMatchObject({
-        consecutiveFailures: 1,
-        lastError: expect.stringContaining(fragment),
-        lastFetchedAt: "2026-11-08T12:34:56.000Z",
-        nextFetchAt: "2026-11-08T14:34:56.000Z",
-        recentIds: [],
-        contentHash: null,
-      });
-      expect(state.subscriptions.b?.recentIds).toEqual([P_B]);
+      expect(state.subscriptions.a?.recentIds).toHaveLength(1);
+      expect(state.subscriptions.a?.consecutiveFailures).toBe(0);
 
       await collector.flush();
       const keys = await storage.list("items/");
-      expect(keys).toHaveLength(1);
-      expect((await rowsAt(keys[0] as string)).map((row) => row.id)).toEqual([ID_B]);
+      expect((await rowsAt(keys[0] as string)).map((row) => row.title)).toEqual(["x", "b"]);
     });
   }
+
+  test("a failure outside the items fails that subscription only, as a retryable failure", async () => {
+    const poisoned = { status: "fetched", items: [post("x")] } as unknown as FetchResult;
+    Object.defineProperty(poisoned, "contentHash", {
+      enumerable: true,
+      get() {
+        throw new Error("contentHash boom");
+      },
+    });
+    const harness = fakeSources({
+      "https://a.example/feed.xml": poisoned,
+      "https://b.example/feed.xml": fetched([post("b")]),
+    });
+    const collector = make(harness);
+    const result = await within(collector.tick([sub("a"), sub("b")]));
+    expect(result.subscriptions).toEqual([
+      { id: "a", status: "failed", seen: 0, written: 0, error: "contentHash boom" },
+      { id: "b", status: "fetched", seen: 1, written: 1 },
+    ]);
+    expect((await collector.state()).subscriptions.a).toMatchObject({
+      consecutiveFailures: 1,
+      nextFetchAt: "2026-11-08T14:34:56.000Z",
+    });
+    await collector.flush();
+    const keys = await storage.list("items/");
+    expect((await rowsAt(keys[0] as string)).map((row) => row.title)).toEqual(["b"]);
+  });
 });
 
 describe("state entries are validated one by one (behaviour N)", () => {
@@ -1749,11 +1762,43 @@ describe("overlapping ticks (behaviour Q)", () => {
     }
   });
 
-  test("a tick queued behind a flush is still accepted once nothing runs", async () => {
+  test("a tick called while a flush is in flight queues behind it and runs", async () => {
     const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
     const collector = make(harness);
-    await collector.flush();
-    expect((await collector.tick([sub("a")])).subscriptions).toHaveLength(1);
+    const flushing = collector.flush();
+    const ticking = collector.tick([sub("a")]);
+    await within(flushing);
+    expect((await within(ticking)).subscriptions).toHaveLength(1);
+  });
+
+  test("a NaN concurrency still fetches", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, { concurrency: Number.NaN });
+    expect((await within(collector.tick([sub("a")]))).subscriptions).toHaveLength(1);
+  });
+
+  test("three flushes in one second get three distinct run ids", async () => {
+    const harness = fakeSources({});
+    const collector = make(harness, { random: () => 0 });
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      harness.results[`https://s${i}.example/feed.xml`] = fetched([post(`p${i}`)]);
+      await collector.tick([sub(`s${i}`)]);
+      const run = await collector.flush();
+      ids.push(run?.runId ?? "");
+    }
+    expect(new Set(ids).size).toBe(3);
+    expect(await storage.list("items/")).toHaveLength(3);
+  });
+
+  test("after shutdown a remaining subscription's source is not called", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const controller = new AbortController();
+    controller.abort();
+    const collector = make(harness, { signal: controller.signal });
+    await within(collector.tick([sub("a"), sub("b", { kind: "rule" })]));
+    expect(harness.calls).toHaveLength(0);
+    expect((await collector.state()).subscriptions).toEqual({});
   });
 });
 

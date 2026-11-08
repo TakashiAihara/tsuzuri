@@ -208,7 +208,8 @@ export function createCollector(deps: CollectorDeps) {
   const now = deps.now ?? (() => new Date());
   const random = deps.random ?? Math.random;
   const flushIntervalMs = deps.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
-  const concurrency = Math.max(1, deps.concurrency ?? DEFAULT_CONCURRENCY);
+  const requested = deps.concurrency ?? DEFAULT_CONCURRENCY;
+  const concurrency = Number.isFinite(requested) ? Math.max(1, Math.floor(requested)) : 1;
   const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   const sources: ReadonlyMap<string, Source> = deps.sources ?? registry;
   const startedAt = now().getTime();
@@ -233,8 +234,9 @@ export function createCollector(deps: CollectorDeps) {
   let buffer: ItemRow[] = [];
   let pendingStartedAt: Date | null = null;
   let lastFlushAt = startedAt;
-  // Only the previous flush can share a second with this one.
-  let lastRunId = "";
+  // Run ids already used within the current second; reset when the second changes.
+  let runIdSecond = "";
+  const runIdsThisSecond = new Set<string>();
 
   // One chain serialises every tick and flush: a flush called while a tick's
   // fetches are in flight waits for them, so no row or result is lost or
@@ -289,6 +291,9 @@ export function createCollector(deps: CollectorDeps) {
     const base: SubscriptionFetchState =
       effective === "unsupported" ? { ...prev, status: "active" } : prev;
 
+    // After shutdown nothing new is started.
+    if (deps.signal?.aborted) return { kind: "skip" };
+
     if (!implementation) {
       return { kind: "unsupported", at: now(), prev: base };
     }
@@ -334,7 +339,7 @@ export function createCollector(deps: CollectorDeps) {
       fetchPromise.then(finish);
     });
 
-    if (settled === "shutdown" || deps.signal?.aborted) return { kind: "skip" };
+    if (settled === "shutdown") return { kind: "skip" };
     const at = now();
     if (settled === "timeout") {
       return {
@@ -406,9 +411,16 @@ export function createCollector(deps: CollectorDeps) {
       return { id: sub.id, status: "unchanged", seen: 0, written: 0 };
     }
 
+    // One item that cannot be normalised or serialised is skipped on its own;
+    // it stays out of recentIds, so the next fetch tries it again.
     const normalized = result.items.flatMap((rawItem) => {
-      const item = normalizeItem(rawItem, { baseUrl: sub.url, fetchedAt: at });
-      return item === null ? [] : [{ raw: rawItem, item }];
+      try {
+        const item = normalizeItem(rawItem, { baseUrl: sub.url, fetchedAt: at });
+        return item === null ? [] : [{ raw: JSON.stringify(rawItem), item }];
+      } catch (error) {
+        console.error(`collect skipped an item from ${sub.url}:`, error);
+        return [];
+      }
     });
 
     // recentIds is rebuilt from the latest fetch alone, so an item still in
@@ -442,7 +454,7 @@ export function createCollector(deps: CollectorDeps) {
         fetched_at: at,
         source_id: sub.id,
         schema_version: ITEM_SCHEMA_VERSION,
-        raw: JSON.stringify(rawItem),
+        raw: rawItem,
       });
       written += 1;
     }
@@ -541,11 +553,16 @@ export function createCollector(deps: CollectorDeps) {
     // two flushes inside the same second must not share one.
     let nonce = 0;
     let runId = newRunId(flushTime, random, nonce);
-    while (runId === lastRunId) {
+    const second = runId.slice(0, runId.indexOf("-"));
+    if (second !== runIdSecond) {
+      runIdSecond = second;
+      runIdsThisSecond.clear();
+    }
+    while (runIdsThisSecond.has(runId)) {
       nonce += 1;
       runId = newRunId(flushTime, random, nonce);
     }
-    lastRunId = runId;
+    runIdsThisSecond.add(runId);
     const run: FlushResult = {
       runId,
       startedAt: (pendingStartedAt ?? flushTime).toISOString(),
