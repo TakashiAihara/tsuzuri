@@ -26,6 +26,13 @@ let enrichResponse: unknown = {
   forceBefore: null,
 };
 let tagsResponse: unknown = { tags: [] };
+let rebuildResponse: unknown = {
+  objects: 0,
+  inserted: 0,
+  linked: 0,
+  rejected: 0,
+  stoppedAt: null,
+};
 let translateResponse: unknown = { itemId: "aa11", lang: "Japanese", text: "", cached: false };
 let showResponse: unknown = {
   item: null,
@@ -54,6 +61,7 @@ const daemon = Bun.serve({
     }
     if (url.pathname === "/enrich") return Response.json(enrichResponse);
     if (url.pathname === "/enrich/prune") return Response.json({ pruned: 4 });
+    if (url.pathname === "/rebuild") return Response.json(rebuildResponse);
     if (url.pathname === "/tags") return Response.json(tagsResponse);
     if (/^\/tags\/[^/]+\/(approve|reject)$/.test(url.pathname)) {
       const [, , slug, decision] = url.pathname.split("/");
@@ -439,5 +447,68 @@ describe("show", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("The feed's own summary.");
     expect(stdout).toContain("The body, as stored.");
+  });
+});
+
+describe("tsuzuri rebuild", () => {
+  // The wording is the CLI's; what is pinned is that each count is printed next
+  // to the name of the field it came from, as "7 objects" or "objects 7".
+  const counted = (text: string, name: string, n: number) =>
+    new RegExp(`(\\b${n}\\s+${name}\\b|\\b${name}[:=]?\\s*${n}\\b)`).test(text);
+
+  test("asks the daemon to rebuild and prints what it applied", async () => {
+    rebuildResponse = { objects: 7, inserted: 13, linked: 17, rejected: 3, stoppedAt: null };
+    const before = requests.length;
+
+    const { code, stderr } = await run(["rebuild"]);
+
+    expect(code).toBe(0);
+    expect(requests.slice(before).map((r) => [r.method, r.path])).toEqual([["POST", "/rebuild"]]);
+    for (const [name, n] of [
+      ["objects", 7],
+      ["inserted", 13],
+      ["linked", 17],
+      ["rejected", 3],
+    ] as const) {
+      expect(counted(stderr, name, n), `${name} ${n} in: ${stderr}`).toBe(true);
+    }
+  });
+
+  test("says nothing about a stop when the run did not stop", async () => {
+    rebuildResponse = { objects: 7, inserted: 13, linked: 17, rejected: 3, stoppedAt: null };
+    const { code, stdout, stderr } = await run(["rebuild"]);
+    expect(code).toBe(0);
+    expect(counted(stderr, "objects", 7)).toBe(true);
+    expect(`${stdout}${stderr}`).not.toMatch(/stopped/i);
+  });
+
+  test("names the object a stopped run waits at, and why", async () => {
+    const key = "items/dt=2026-11-08/20261108T010203Z-0badcafe.parquet";
+    rebuildResponse = {
+      objects: 2,
+      inserted: 5,
+      linked: 5,
+      rejected: 0,
+      stoppedAt: { key, error: "cannot read object: object is gone" },
+    };
+
+    const { stderr } = await run(["rebuild"]);
+
+    expect(stderr).toContain(key);
+    expect(stderr).toContain("cannot read object: object is gone");
+    expect(counted(stderr, "objects", 2)).toBe(true);
+  });
+
+  test("--json emits the response verbatim on stdout", async () => {
+    rebuildResponse = {
+      objects: 4,
+      inserted: 9,
+      linked: 11,
+      rejected: 1,
+      stoppedAt: { key: "items/dt=2026-11-08/20261108T000000Z-00000001.parquet", error: "boom" },
+    };
+    const { stdout, code } = await run(["--json", "rebuild"]);
+    expect(code).toBe(0);
+    expect(JSON.parse(stdout)).toEqual(rebuildResponse as Record<string, unknown>);
   });
 });

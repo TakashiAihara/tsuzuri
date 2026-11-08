@@ -1,4 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+// A namespace import for the schemas step 2c adds (rebuildResponseSchema and
+// doctorStorageSchema, the schema of GET /doctor's `storage` field): a missing
+// named export would fail every test in this file at load.
+import * as contract from "@tsuzuri/api";
 import {
   embeddingStatusSchema,
   enrichPruneResponseSchema,
@@ -20,14 +27,18 @@ import {
 } from "@tsuzuri/api";
 import { ChatError, type ChatProvider, type ChatRequest } from "@tsuzuri/core";
 import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
+import { fileStorage, type Storage } from "@tsuzuri/store";
 import type { z } from "zod";
 
 import { createApi } from "./api.ts";
+import { createCollector } from "./collect/collector.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
+import { createLoader } from "./load/loader.ts";
+import { createLoadRunner } from "./load/runner.ts";
 
 /**
  * The daemon's real responses, parsed through the shared contract.
@@ -82,6 +93,8 @@ describeIfDb("api contract", () => {
    * a service whose model says no.
    */
   let deps: Omit<Parameters<typeof createApi>[0], "enrichment">;
+  let storageDir: string;
+  let storage: Storage;
 
   const ITEM_ID = `c0ffee11${"2".repeat(56)}`;
   // Two ids sharing a prefix, so the ambiguity path is actually reachable.
@@ -129,6 +142,15 @@ describeIfDb("api contract", () => {
       interest,
       provider: chat,
     });
+    // Step 2c: the API takes the collector and the load runner (see the
+    // createApi shape at the top of ingest-run.test.ts). The
+    // fetcher serves a feed with no items, so the contract run adds no article.
+    storageDir = await mkdtemp(join(tmpdir(), "tsuzuri-contract-"));
+    storage = fileStorage(storageDir);
+    const emptyFeed =
+      '<?xml version="1.0"?><rss version="2.0"><channel><title>A</title></channel></rss>';
+    const collectorFetcher = async () =>
+      new Response(emptyFeed, { status: 200, headers: { "content-type": "application/rss+xml" } });
     deps = {
       db: handle.db,
       sql: handle.sql,
@@ -137,6 +159,8 @@ describeIfDb("api contract", () => {
       embeddings,
       interest,
       clustering,
+      collector: createCollector({ storage, fetcher: collectorFetcher, degradeAfterFailures: 3 }),
+      loads: createLoadRunner(createLoader({ sql: handle.sql, storage, log: () => {} })),
     };
     app = createApi({ ...deps, enrichment });
   });
@@ -161,6 +185,7 @@ describeIfDb("api contract", () => {
 
   afterAll(async () => {
     await handle?.close();
+    await rm(storageDir, { recursive: true, force: true });
   });
 
   async function parsed<T extends z.ZodTypeAny>(
@@ -461,8 +486,26 @@ describeIfDb("api contract", () => {
   });
 
   test("POST /ingest/run", async () => {
-    // Nothing is due, so this polls nothing and still has to answer in shape.
-    await parsed(ingestRunResponseSchema, "/ingest/run", { method: "POST" });
+    // The one subscription has no saved state, so it is due and the collector
+    // fetches it; the shape is the same whether or not anything is polled.
+    const body = await parsed(ingestRunResponseSchema, "/ingest/run", { method: "POST" });
+    expect(body.polled).toBe(1);
+    expect(body.outcomes).toHaveLength(1);
+  });
+
+  test("POST /rebuild", async () => {
+    const body = await parsed(contract.rebuildResponseSchema, "/rebuild", { method: "POST" });
+    expect(body.stoppedAt).toBeNull();
+    expect(typeof body.objects).toBe("number");
+  });
+
+  test("GET /doctor reports the last loader run under storage", async () => {
+    // The ingest test above ran the loader, so there is a run to report.
+    const response = await app.fetch(new Request("http://test/doctor"));
+    const body = (await response.json()) as { storage: unknown };
+    const report = contract.doctorStorageSchema.parse(body.storage);
+    expect(report.stoppedAt).toBeNull();
+    expect(report.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   test("POST /sources/import-opml", async () => {
@@ -530,5 +573,65 @@ describeIfDb("api contract", () => {
         expect(errorResponseSchema.safeParse(await response.json()).success).toBe(true);
       });
     }
+  });
+});
+
+describeIfDb("api contract with a stuck object", () => {
+  // The suite above must not see this object, so it runs last and owns its
+  // storage. A garbage object under items/ stops every loader run at its key.
+  const STUCK = "items/dt=2000-01-01/20000101T000000Z-00000000.parquet";
+  let handle: ReturnType<typeof createDatabase>;
+  let dir: string;
+  let app: ReturnType<typeof createApi>;
+
+  beforeAll(async () => {
+    handle = createDatabase({ url: DATABASE_URL as string, max: 4 });
+    dir = await mkdtemp(join(tmpdir(), "tsuzuri-contract-stuck-"));
+    const storage = fileStorage(dir);
+    await storage.put(STUCK, "this is not parquet");
+
+    const config = loadConfig({ DATABASE_URL: DATABASE_URL as string });
+    const embeddings = createEmbeddingService({ sql: handle.sql, config });
+    await embeddings.start();
+    const interest = createInterestService({ sql: handle.sql, config, embeddings });
+    await interest.start();
+    app = createApi({
+      db: handle.db,
+      sql: handle.sql,
+      fetcher: fetch,
+      config,
+      embeddings,
+      interest,
+      clustering: createClusteringService({ sql: handle.sql, config, embeddings }),
+      enrichment: createEnrichmentService({ sql: handle.sql, config, interest, provider: null }),
+      storage,
+      collector: createCollector({
+        storage,
+        fetcher: async () => new Response(""),
+        degradeAfterFailures: 3,
+      }),
+      loader: createLoader({ sql: handle.sql, storage, log: () => {} }),
+    });
+  });
+
+  afterAll(async () => {
+    await handle?.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("POST /rebuild names the stuck key in the contract's shape", async () => {
+    const response = await app.fetch(new Request("http://test/rebuild", { method: "POST" }));
+    const body = contract.rebuildResponseSchema.parse(await response.json());
+    expect(body.objects).toBe(0);
+    expect(body.stoppedAt?.key).toBe(STUCK);
+    expect(body.stoppedAt?.error).toMatch(/^cannot read object: /);
+  });
+
+  test("GET /doctor storage carries the stuck key in the contract's shape", async () => {
+    await app.fetch(new Request("http://test/rebuild", { method: "POST" }));
+    const response = await app.fetch(new Request("http://test/doctor"));
+    const body = (await response.json()) as { storage: unknown };
+    const report = contract.doctorStorageSchema.parse(body.storage);
+    expect(report.stoppedAt?.key).toBe(STUCK);
   });
 });
