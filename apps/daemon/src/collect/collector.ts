@@ -155,7 +155,7 @@ function parseEntry(value: unknown): SubscriptionFetchState | null {
   };
 }
 
-function parseState(bytes: Uint8Array): CollectorState {
+export function parseState(bytes: Uint8Array): CollectorState {
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(bytes));

@@ -3,7 +3,14 @@ import { eq, sql as raw } from "drizzle-orm";
 
 import { createDatabase, type Database } from "./client.ts";
 import { migrate } from "./migrate.ts";
-import { DEFAULT_USER_ID, itemSources, itemState, items, sources } from "./schema.ts";
+import {
+  DEFAULT_USER_ID,
+  itemSources,
+  itemState,
+  items,
+  loadedObjects,
+  sources,
+} from "./schema.ts";
 
 /**
  * Integration test against a real PostgreSQL with pgroonga and pgvector.
@@ -191,5 +198,28 @@ describeIfDb("schema", () => {
 
     const itemRows = await db.select().from(items);
     expect(itemRows).toHaveLength(1);
+  });
+
+  test("round-trips a loaded object through Drizzle with its defaults", async () => {
+    const key = "items/dt=2026-11-08/20261108T000000Z-00000001.parquet";
+
+    await db.insert(loadedObjects).values({ key, rows: 5 });
+
+    const [stored] = await db.select().from(loadedObjects).where(eq(loadedObjects.key, key));
+    expect(stored?.rows).toBe(5);
+    expect(stored?.rejected).toBe(0);
+    expect(stored?.loadedAt).toBeInstanceOf(Date);
+  });
+
+  test("loaded_objects refuses a repeated key and negative counts", async () => {
+    const key = "items/dt=2026-11-08/20261108T000000Z-00000001.parquet";
+
+    await expect(run(db.insert(loadedObjects).values({ key, rows: 1 }))).rejects.toThrow();
+    await expect(
+      run(db.insert(loadedObjects).values({ key: "k-neg", rows: -1 })),
+    ).rejects.toThrow();
+    await expect(
+      run(db.insert(loadedObjects).values({ key: "k-rej", rows: 0, rejected: -1 })),
+    ).rejects.toThrow();
   });
 });

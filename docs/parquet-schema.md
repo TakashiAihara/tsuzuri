@@ -19,7 +19,7 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 
 ## Items
 
-`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader (step 2b of the design, not built yet) will refuse a row that does.
+`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader refuses such a row on its own and applies the rest of the file. It also refuses a row whose `id` is not the SHA-256 of its `canonical_url`, whose `url` or `canonical_url` is empty, whose timestamps fall outside the years 1 to 9999, or whose loaded text columns (every text column above except `raw`) contain U+0000 or, for the optional ones, a value of another type. `raw` is not loaded and is not checked.
 
 | Column | Parquet type | Required | Meaning |
 |---|---|---|---|
@@ -39,4 +39,5 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 | `raw` | BYTE_ARRAY (UTF8) | no | The item as the source produced it before normalisation, as JSON text (for a feed: `url`, `title`, `author`, `guid`, `publishedAtRaw`, `contentHtml`, `summary`) |
 
 - tsuzuri writes SNAPPY-compressed files. It reads SNAPPY, ZSTD, GZIP, BROTLI and LZ4 files and uncompressed ones.
-- The same `id` may appear in several files. When the copies differ, the one with the earliest `fetched_at` wins, ties broken by object key and then row position (applied by the loader, step 2b).
+- The same `id` may appear in several files. When the copies differ, the first one the loader applies wins: files apply in key order, and within a file the row with the earliest `fetched_at` comes first, ties keeping the row position. A file that cannot be read or applied stops the loader there, so a later key never applies before an earlier one in the same run.
+- Key order follows write order only to the second: two flushes within the same second sort by their random suffix, not by time. It also breaks when a clock steps back or a second producer writes into `items/`: a key that sorts before files already applied is applied after them and loses.

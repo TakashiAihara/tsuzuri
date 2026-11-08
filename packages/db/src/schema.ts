@@ -287,6 +287,20 @@ export const itemTags = pgTable(
   ],
 );
 
+/**
+ * Which storage objects the loader has applied, from 0007_loaded_objects.sql.
+ *
+ * `rows` counts the rows that passed validation (duplicates within the
+ * object included), `rejected` the ones validation refused; both CHECKs live
+ * in the migration.
+ */
+export const loadedObjects = pgTable("loaded_objects", {
+  key: text("key").primaryKey(),
+  rows: integer("rows").notNull(),
+  rejected: integer("rejected").notNull().default(0),
+  loadedAt: timestamp("loaded_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type SourceRow = typeof sources.$inferSelect;
 export type NewSourceRow = typeof sources.$inferInsert;
 export type ItemRow = typeof items.$inferSelect;
