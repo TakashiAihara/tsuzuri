@@ -7,15 +7,14 @@ import { createDatabase, migrate } from "@tsuzuri/db";
 import { fileStorage, type Storage } from "@tsuzuri/store";
 
 import { createApi } from "./api.ts";
-import { createCollector } from "./collect/collector.ts";
+
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
-import { createLoader } from "./load/loader.ts";
-import { createLoadRunner } from "./load/runner.ts";
+import { createIngestion } from "./ingestion.ts";
 
 /**
  * Step 2c: the API fetches through the collector and fills PostgreSQL through
@@ -27,9 +26,9 @@ import { createLoadRunner } from "./load/runner.ts";
  *   createApi({ db, sql, fetcher, config, embeddings, interest, clustering,
  *               enrichment, collector, loads })
  *
- * - `collector` is what createCollector returns.
- * - `loads` is createLoadRunner(loader): it serialises every loader run (the
- *   scheduler's, /ingest/run's and /rebuild's) and remembers the last one.
+ * - `collector` and `loads` come from createIngestion, the daemon's own
+ *   wiring: each flush that wrote a file is followed by a load, and `loads`
+ *   serialises every loader run and remembers the last one.
  *
  * Response shapes assumed:
  *
@@ -171,10 +170,11 @@ describeIfDb("ingest through the collector and the loader", () => {
     fetched = [];
     hold = null;
 
-    const collector = createCollector({ storage, fetcher, degradeAfterFailures: 3 });
-    const loader = createLoader({
+    const { collector, loads } = createIngestion({
       sql: handle.sql,
       storage,
+      fetcher,
+      config: { ...config, DEGRADE_AFTER_FAILURES: 3 },
       log: () => {},
     });
     app = createApi({
@@ -184,7 +184,7 @@ describeIfDb("ingest through the collector and the loader", () => {
       config,
       ...services,
       collector,
-      loads: createLoadRunner(loader),
+      loads,
     });
   });
 

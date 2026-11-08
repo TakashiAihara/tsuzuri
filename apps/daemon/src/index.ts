@@ -1,15 +1,17 @@
 import { createChatProvider } from "@tsuzuri/core";
-import { createDatabase, migrate } from "@tsuzuri/db";
-import PQueue from "p-queue";
+import { createDatabase, migrate, sources } from "@tsuzuri/db";
+import { storageFromEnv } from "@tsuzuri/store";
 
 import { createApi } from "./api.ts";
+import { seedState } from "./collect/collector.ts";
+import { toSeedEntries, toSubscription } from "./collect/subscriptions.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
-import { dueSources, ingestSource } from "./ingest/run.ts";
+import { createIngestion } from "./ingestion.ts";
 
 const config = loadConfig();
 const { db, sql, close } = createDatabase({ url: config.DATABASE_URL });
@@ -26,45 +28,57 @@ const fetcher = createFetcher({
   allowPrivateTargets: config.FETCH_ALLOW_PRIVATE_TARGETS,
 });
 
+const storage = storageFromEnv();
+const { collector, loads } = createIngestion({
+  sql,
+  storage,
+  fetcher,
+  config,
+  log: (message) => console.error(message),
+});
+
+async function loadAndLog(): Promise<void> {
+  try {
+    await loads.load();
+  } catch (error) {
+    console.error("load failed:", error);
+  }
+}
+
+// Switching from direct ingest: without this every feed is refetched with no
+// validators. Objects written before a restart are then caught up.
+try {
+  const seeded = await seedState(storage, toSeedEntries(await db.select().from(sources)));
+  if (seeded) console.error("seeded _state/collector.json from the sources table");
+} catch (error) {
+  console.error("collector state could not be seeded:", error);
+}
+await loadAndLog();
+
 /**
  * Polling loop.
  *
- * Due times live in the database rather than in an in-memory cron, so a restart
- * does not reset every subscription's schedule and re-poll all of them at once.
+ * Which subscriptions are due is the collector's call, from its own state in
+ * storage, so a restart does not reset every schedule and re-poll all of them
+ * at once. The loop waits for each tick before sleeping, so ticks never overlap.
  */
 const SCHEDULER_TICK_MS = 30_000;
 let stopping = false;
+let inFlight: Promise<void> = Promise.resolve();
 
 async function tick(): Promise<void> {
-  const rows = await dueSources(db, config.FETCH_CONCURRENCY * 5);
-  if (rows.length === 0) return;
-
-  const queue = new PQueue({ concurrency: config.FETCH_CONCURRENCY });
-  await Promise.all(
-    rows.map((row) =>
-      queue.add(async () => {
-        try {
-          await ingestSource(row, {
-            db,
-            fetcher,
-            degradeAfterFailures: config.DEGRADE_AFTER_FAILURES,
-          });
-        } catch (error) {
-          // One broken subscription must not stop the loop for the rest.
-          console.error(`ingest failed for ${row.url}:`, error);
-        }
-      }),
-    ),
-  );
+  try {
+    const rows = await db.select().from(sources);
+    await collector.tick(rows.map(toSubscription));
+  } catch (error) {
+    console.error("scheduler tick failed:", error);
+  }
 }
 
 async function scheduler(): Promise<void> {
   while (!stopping) {
-    try {
-      await tick();
-    } catch (error) {
-      console.error("scheduler tick failed:", error);
-    }
+    inFlight = tick();
+    await inFlight;
     await Bun.sleep(SCHEDULER_TICK_MS);
   }
 }
@@ -142,6 +156,8 @@ const app = createApi({
   interest,
   clustering,
   enrichment,
+  collector,
+  loads,
 });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
@@ -151,6 +167,15 @@ void scheduler();
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     stopping = true;
+    await inFlight;
+    // A storage failure here loses only what this flush held, and the fetch
+    // state was not advanced for it, so the next start fetches it again.
+    try {
+      await collector.flush();
+    } catch (error) {
+      console.error("final flush failed:", error);
+    }
+    await loadAndLog();
     await server.stop();
     await enrichment.stop();
     await interest.stop();

@@ -2165,6 +2165,21 @@ describe("onFlush (step 2c)", () => {
     expect(calls).toBe(1);
   });
 
+  test("a flush with no new items, only an unchanged fetch, still calls onFlush", async () => {
+    const seen: FlushResult[] = [];
+    const harness = fakeSources({
+      "https://a.example/feed.xml": { status: "unchanged", reason: "not-modified" },
+    });
+    const collector = make(harness, { onFlush: (result) => void seen.push(result) });
+
+    await collector.tick([sub("a")]);
+    await collector.flush();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.items).toBe(0);
+    expect(seen[0]?.subscriptions.map((s) => s.status)).toEqual(["unchanged"]);
+  });
+
   test("a flush the interval triggers inside a tick calls onFlush as well", async () => {
     const seen: FlushResult[] = [];
     const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });

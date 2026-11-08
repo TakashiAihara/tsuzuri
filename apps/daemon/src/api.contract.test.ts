@@ -604,13 +604,12 @@ describeIfDb("api contract with a stuck object", () => {
       interest,
       clustering: createClusteringService({ sql: handle.sql, config, embeddings }),
       enrichment: createEnrichmentService({ sql: handle.sql, config, interest, provider: null }),
-      storage,
       collector: createCollector({
         storage,
         fetcher: async () => new Response(""),
         degradeAfterFailures: 3,
       }),
-      loader: createLoader({ sql: handle.sql, storage, log: () => {} }),
+      loads: createLoadRunner(createLoader({ sql: handle.sql, storage, log: () => {} })),
     });
   });
 

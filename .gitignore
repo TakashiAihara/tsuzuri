@@ -8,3 +8,6 @@ dist/
 # Local-only docker compose overrides (host-specific workarounds)
 compose.override.yaml
 compose.override.yml
+
+# Default TSUZURI_STORAGE (file://./data)
+/data/

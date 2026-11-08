@@ -57,6 +57,13 @@ export type SubscriptionResult = {
 
 export type TickResult = {
   subscriptions: SubscriptionResult[];
+  /** True when the call returned at once because another tick was running or queued. */
+  busy: boolean;
+};
+
+export type TickOptions = {
+  /** Ignore nextFetchAt and any backoff. A disabled subscription is still skipped. */
+  force?: boolean;
 };
 
 /** The _runs/<runId>.json record of one flush. */
@@ -81,6 +88,12 @@ export type CollectorDeps = {
   /** Per-fetch abort deadline, always combined with deps.signal. */
   fetchTimeoutMs?: number;
   signal?: AbortSignal;
+  /**
+   * Called, and awaited by flush, after every flush that wrote its _runs
+   * record and _state, with or without an items file: a flush of failures
+   * alone still changes the fetch state the loader copies to sources.
+   */
+  onFlush?: (result: FlushResult) => void | Promise<void>;
 };
 
 /** Longest backoff after repeated failures, so a dead feed is still retried daily. */
@@ -153,6 +166,25 @@ function parseEntry(value: unknown): SubscriptionFetchState | null {
     ...(saved as SubscriptionFetchState),
     recentIds: Array.isArray(recentIds) ? recentIds : [],
   };
+}
+
+/**
+ * Writes _state/collector.json from per-subscription fetch state, only when it
+ * is absent. Returns whether it wrote. recentIds starts empty, so each feed's
+ * first fetch writes the items it already has once more.
+ */
+export async function seedState(
+  storage: Storage,
+  entries: Record<string, Omit<SubscriptionFetchState, "recentIds">>,
+): Promise<boolean> {
+  if ((await storage.get(STATE_KEY)) !== null) return false;
+  const subscriptions: Record<string, SubscriptionFetchState> = {};
+  for (const [id, entry] of Object.entries(entries)) {
+    subscriptions[id] = { ...entry, recentIds: [] };
+  }
+  const state: CollectorState = { version: 1, subscriptions };
+  await storage.put(STATE_KEY, JSON.stringify(state));
+  return true;
 }
 
 export function parseState(bytes: Uint8Array): CollectorState {
@@ -255,6 +287,7 @@ export function createCollector(deps: CollectorDeps) {
     sub: CollectorSubscription,
     state: CollectorState,
     tickStart: Date,
+    force: boolean,
   ): Promise<FetchOutcome> => {
     const saved = state.subscriptions[sub.id];
     const effective = saved?.status ?? sub.status;
@@ -271,7 +304,7 @@ export function createCollector(deps: CollectorDeps) {
       effective === "degraded" ||
       (effective === "unsupported" && implementation !== undefined);
     if (!eligible) return { kind: "skip" };
-    if (saved && new Date(saved.nextFetchAt).getTime() > tickStart.getTime()) {
+    if (!force && saved && new Date(saved.nextFetchAt).getTime() > tickStart.getTime()) {
       return { kind: "skip" };
     }
 
@@ -477,7 +510,10 @@ export function createCollector(deps: CollectorDeps) {
     return { id: sub.id, status: "fetched", seen: normalized.length, written };
   };
 
-  const tickInner = async (subscriptions: CollectorSubscription[]): Promise<TickResult> => {
+  const tickInner = async (
+    subscriptions: CollectorSubscription[],
+    force: boolean,
+  ): Promise<TickResult> => {
     const state = await loadState();
     const tickStart = now();
 
@@ -507,7 +543,7 @@ export function createCollector(deps: CollectorDeps) {
         cursor += 1;
         const sub = unique[index];
         if (sub === undefined) continue;
-        outcomes[index] = await runSubscription(sub, state, tickStart);
+        outcomes[index] = await runSubscription(sub, state, tickStart, force);
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, () => worker()));
@@ -537,7 +573,7 @@ export function createCollector(deps: CollectorDeps) {
       results.push(result);
     }
 
-    return { subscriptions: results };
+    return { subscriptions: results, busy: false };
   };
 
   const flushInner = async (): Promise<FlushResult | null> => {
@@ -584,6 +620,7 @@ export function createCollector(deps: CollectorDeps) {
     buffer = [];
     pendingStartedAt = null;
     lastFlushAt = flushTime.getTime();
+    await deps.onFlush?.(run);
     return run;
   };
 
@@ -591,12 +628,12 @@ export function createCollector(deps: CollectorDeps) {
   // returns empty at once. flush() still queues behind the chain.
   let tickActive = false;
   return {
-    tick: (subscriptions: CollectorSubscription[]) => {
-      if (tickActive) return Promise.resolve<TickResult>({ subscriptions: [] });
+    tick: (subscriptions: CollectorSubscription[], options?: TickOptions) => {
+      if (tickActive) return Promise.resolve<TickResult>({ subscriptions: [], busy: true });
       tickActive = true;
       return enqueue(async () => {
         try {
-          return await tickInner(subscriptions);
+          return await tickInner(subscriptions, options?.force ?? false);
         } finally {
           tickActive = false;
         }

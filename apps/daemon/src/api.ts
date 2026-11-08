@@ -16,10 +16,11 @@ import {
 } from "@tsuzuri/db";
 import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
-import PQueue from "p-queue";
 import type postgres from "postgres";
 import { z } from "zod";
 
+import type { createCollector } from "./collect/collector.ts";
+import { toSubscription } from "./collect/subscriptions.ts";
 import type { Config } from "./config.ts";
 import type { ClusteringService } from "./enrich/clustering.ts";
 import type { EmbeddingService } from "./enrich/embeddings.ts";
@@ -27,7 +28,7 @@ import { EnrichmentPreconditionError, type EnrichmentService } from "./enrich/en
 import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
 import type { Fetcher } from "./ingest/fetcher.ts";
-import { dueSources, ingestSource } from "./ingest/run.ts";
+import type { LoadRunner } from "./load/runner.ts";
 import { parseOpml } from "./opml.ts";
 import { parseSince } from "./search-params.ts";
 
@@ -49,6 +50,8 @@ export type ApiDeps = {
   interest: InterestService;
   clustering: ClusteringService;
   enrichment: EnrichmentService;
+  collector: ReturnType<typeof createCollector>;
+  loads: LoadRunner;
 };
 
 const addSourceSchema = z.object({
@@ -86,7 +89,8 @@ const listItemsSchema = z.object({
 
 export function createApi(deps: ApiDeps) {
   // Aliased: `sql` in this file is Drizzle's template tag, imported above.
-  const { db, sql: rawSql, fetcher, config, embeddings, interest, clustering, enrichment } = deps;
+  const { db, sql: rawSql, config, embeddings, interest, clustering, enrichment } = deps;
+  const { collector, loads } = deps;
   const app = new Hono();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -171,36 +175,42 @@ export function createApi(deps: ApiDeps) {
   /**
    * Poll subscriptions now.
    *
-   * `all=true` ignores next_fetch_at, which is what a human wants right after
-   * importing an OPML file or adding a feed.
+   * `all=true` ignores the collector's schedule, which is what a human wants
+   * right after importing an OPML file or adding a feed. Which subscriptions
+   * are due is the collector's call, from its own state in storage.
    */
   app.post("/ingest/run", async (c) => {
     const all = c.req.query("all") === "true";
     const limit = Number(c.req.query("limit") ?? 500);
 
-    const rows = all ? await db.select().from(sources).limit(limit) : await dueSources(db, limit);
+    const rows = await db.select().from(sources).limit(limit);
+    const { subscriptions: outcomes, busy } = await collector.tick(rows.map(toSubscription), {
+      force: all,
+    });
+    if (busy) return c.json({ error: "a fetch is already running" }, 409);
 
-    const queue = new PQueue({ concurrency: config.FETCH_CONCURRENCY });
-    const outcomes = await Promise.all(
-      rows.map((row) =>
-        queue.add(() =>
-          ingestSource(row, {
-            db,
-            fetcher,
-            degradeAfterFailures: config.DEGRADE_AFTER_FAILURES,
-          }),
-        ),
-      ),
-    );
-
-    const settled = outcomes.filter((outcome) => outcome !== undefined);
+    // flush() waits for the load its onFlush hook runs, so when this flush
+    // wrote a file, that load already applied it and a second one would
+    // report 0. Without a hook (or when its load failed) load here.
+    const before = loads.last();
+    await collector.flush();
+    const after = loads.last();
+    const load = after !== null && after !== before ? after : await loads.load();
     return c.json({
-      polled: settled.length,
-      inserted: settled.reduce((sum, o) => sum + (o?.inserted ?? 0), 0),
-      failed: settled.filter((o) => o?.status === "failed").length,
-      outcomes: settled,
+      polled: outcomes.length,
+      inserted: load.inserted,
+      failed: outcomes.filter((o) => o.status === "failed").length,
+      outcomes,
     });
   });
+
+  /**
+   * Re-apply every object in storage to PostgreSQL.
+   *
+   * Items are not deleted first: item_state is not in storage yet, so removing
+   * items would cascade it away.
+   */
+  app.post("/rebuild", async (c) => c.json(await loads.rebuild()));
 
   app.get("/items", async (c) => {
     const parsed = listItemsSchema.safeParse(c.req.query());
@@ -723,6 +733,7 @@ export function createApi(deps: ApiDeps) {
 
     return c.json({
       database: { extensions: [...extensions] },
+      storage: loads.last(),
       counts,
       features: {
         embeddings: {

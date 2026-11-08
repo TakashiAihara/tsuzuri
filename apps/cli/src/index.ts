@@ -7,6 +7,7 @@ import type {
   ItemEnrichment,
   ItemSummary,
   RankedItem,
+  RebuildResponse,
   ScoringState,
   SearchResponse,
   Source,
@@ -162,6 +163,21 @@ program
     );
     if (globals().json) return printJson(result);
     log(`polled ${result.polled}, new items ${result.inserted}, failed ${result.failed}`);
+  });
+
+program
+  .command("rebuild")
+  .description("re-apply every object in storage to PostgreSQL")
+  .action(async () => {
+    const result = await call<RebuildResponse>(globals(), "/rebuild", { method: "POST" });
+    if (globals().json) return printJson(result);
+    log(
+      `${result.objects} objects, ${result.inserted} inserted, ` +
+        `${result.linked} linked, ${result.rejected} rejected`,
+    );
+    if (result.stoppedAt) {
+      log(`stopped at ${result.stoppedAt.key}: ${result.stoppedAt.error}`);
+    }
   });
 
 program
