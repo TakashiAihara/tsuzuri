@@ -285,7 +285,7 @@ describeIfDb("ingest through the collector and the loader", () => {
       expect((await listed()).length).toBe(3);
     });
 
-    test("a load that is slow does not hold up the next flush or tick", async () => {
+    test("a load that is slow holds up neither the flush that queued it nor the next tick", async () => {
       const real = storage;
       let release: () => void = () => {};
       const gate = new Promise<void>((resolve) => {
@@ -309,14 +309,17 @@ describeIfDb("ingest through the collector and the loader", () => {
         status: "active" as const,
       };
 
-      await within(collector.tick([sub]));
-      // The load this flush queues waits on the gate; the flush does not.
-      await within(collector.flush());
-      const second = await within(collector.tick([sub], { force: true }));
+      try {
+        await within(collector.tick([sub]));
+        // The load this flush queues waits on the gate; the flush does not.
+        await within(collector.flush());
+        const second = await within(collector.tick([sub], { force: true }));
 
-      expect(second.busy).toBe(false);
-      expect(await listed()).toEqual([]);
-      release();
+        expect(second.busy).toBe(false);
+        expect(await listed()).toEqual([]);
+      } finally {
+        release();
+      }
       await loads.settled();
       expect((await listed()).length).toBe(3);
     });

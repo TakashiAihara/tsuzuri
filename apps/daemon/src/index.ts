@@ -42,11 +42,13 @@ const { collector, loads } = createIngestion({
   signal: shutdown.signal,
 });
 
-async function loadAndLog(): Promise<void> {
+async function loadAndLog(): Promise<boolean> {
   try {
     await loads.load();
+    return true;
   } catch (error) {
     console.error("load failed:", error);
+    return false;
   }
 }
 
@@ -194,8 +196,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
         flushed = await collector.flush();
       } catch (error) {
         console.error("final flush failed:", error);
+        code = 1;
       }
-      if (flushed === null) await loadAndLog();
+      if (flushed === null && !(await loadAndLog())) code = 1;
       await loads.settled();
       await enrichment.stop();
       await interest.stop();

@@ -103,27 +103,27 @@ describe("createLoadRunner", () => {
 
   test("settled resolves once every queued run has finished, failed ones included", async () => {
     const fake = fakeLoader();
-    let failNext = false;
+    let calls = 0;
     const runner = createLoadRunner({
       ...fake.loader,
       loadPending: async () => {
-        if (failNext) {
-          failNext = false;
-          throw new Error("load failed");
-        }
+        calls += 1;
+        if (calls === 2) throw new Error("load failed");
         return fake.loader.loadPending();
       },
     });
-    void runner.load();
-    failNext = true;
-    runner.load().catch(() => undefined);
-    void runner.rebuild();
+    const first = runner.load();
+    const failing = runner.load().catch((error: Error) => error.message);
+    const rebuilt = runner.rebuild();
 
     await runner.settled();
 
     expect(fake.calls.at(-1)).toBe("sync:end");
     expect(fake.calls.filter((c) => c === "reload:end")).toHaveLength(1);
     expect(runner.totals()).toEqual({ runs: 2, inserted: 6 });
+    expect(await first).toEqual(result(2, 5));
+    expect(await failing).toBe("load failed");
+    expect(await rebuilt).toEqual(result(7, 1));
   });
 
   test("a run that throws is reported to its caller and does not block the next one", async () => {

@@ -186,20 +186,24 @@ export function createApi(deps: ApiDeps) {
     // so cutting the list short here could leave a due one out.
     const rows = await db.select().from(sources);
     // Loads queued before this request (startup catch-up, an earlier flush,
-    // a rebuild) are not its own, so they finish before the count starts.
-    await loads.settled();
+    // a rebuild) are not its own, so the count starts once they finish. The
+    // tick starts first, so fetching does not wait behind them.
+    const earlier = loads.settled();
+    const ticking = collector.tick(rows.map(toSubscription), { force: all });
+    await earlier;
     const before = loads.totals();
-    const { subscriptions: outcomes, busy } = await collector.tick(rows.map(toSubscription), {
-      force: all,
-    });
+    const { subscriptions: outcomes, busy } = await ticking;
     if (busy) return c.json({ error: "a fetch is already running" }, 409);
 
     // A flush with something to write (this one, or the one the tick ran
     // when its interval came round) queues a load through onFlush. When no
     // load applied (none ran, or the hook's threw and was only logged), one
-    // more load here picks up what is pending. A sync that failed after an
-    // applied load is left to the next load. The items this request inserted
-    // are the runner's growth since the count started.
+    // more load here picks up what is pending. Left to the next load (and
+    // then missing from this answer's count): a sync that failed after an
+    // applied load, and a hook load that threw after another one applied.
+    // The items this request inserted are the runner's growth since the
+    // count started, which also takes in a load another request started
+    // inside that window.
     await collector.flush();
     await loads.settled();
     if (loads.totals().runs === before.runs) await loads.load();
