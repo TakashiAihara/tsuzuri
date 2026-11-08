@@ -10,6 +10,7 @@ import {
   type CollectorSubscription,
   createCollector,
   type SubscriptionFetchState,
+  type SubscriptionResult,
 } from "./collector.ts";
 
 const T0 = new Date("2026-11-08T12:34:56.000Z");
@@ -618,14 +619,23 @@ describe("items (behaviours 4 and 5)", () => {
     expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_A, P_C, P_D]);
 
     await collector.flush();
-    const [key] = await storage.list("items/");
-    expect((await rowsAt(key as string)).map((row) => row.id)).toEqual([
-      ID_A,
-      ID_B,
-      ID_C,
-      ID_A,
-      ID_D,
-    ]);
+    // Ticks an hour apart each flush on their own (the interval is 5 minutes), so
+    // the rows are spread over several files in write order.
+    const rows: Record<string, unknown>[] = [];
+    for (const key of await storage.list("items/")) rows.push(...(await rowsAt(key)));
+    expect(rows.map((row) => row.id)).toEqual([ID_A, ID_B, ID_C, ID_A, ID_D]);
+  });
+
+  test("a collector that fetches on every tick still flushes once the interval has passed", async () => {
+    const harness = fakeSources({});
+    const collector = make(harness, { flushIntervalMs: 1000 });
+    // Ticks at 0, 600, 1200 (flush), 1800, 2400 (flush), 3000 ms.
+    for (let i = 0; i < 6; i++) {
+      harness.results[`https://s${i}.example/feed.xml`] = fetched([post(`p${i}`)]);
+      await collector.tick([sub(`s${i}`)]);
+      advance(600);
+    }
+    expect(await storage.list("items/")).toHaveLength(2);
   });
 
   test("a failed or unchanged fetch keeps the previous recentIds (behaviour B)", async () => {
@@ -1086,7 +1096,7 @@ describe("serialised tick and flush (behaviour A)", () => {
       gated.open("https://a.example/feed.xml");
       const [tickResult, flushResult] = await Promise.all([tickPromise, flushPromise]);
 
-      const expected = [{ id: "a", status: "fetched", seen: 1, written: 1 }];
+      const expected: SubscriptionResult[] = [{ id: "a", status: "fetched", seen: 1, written: 1 }];
       expect(tickResult.subscriptions).toEqual(expected);
       expect(flushResult?.subscriptions).toEqual(expected);
       expect(flushResult?.items).toBe(1);
@@ -1220,7 +1230,7 @@ describe("concurrency (behaviour D)", () => {
 });
 
 describe("fetch timeout and signal (behaviour E)", () => {
-  const failedByAbort = [
+  const failedByAbort: SubscriptionResult[] = [
     { id: "a", status: "failed", seen: 0, written: 0, error: "aborted by signal" },
   ];
 
@@ -1261,6 +1271,7 @@ describe("state file validation (behaviours F and G)", () => {
     ["missing subscriptions", { version: 1 }],
     ["null subscriptions", { version: 1, subscriptions: null }],
     ["a string subscriptions", { version: 1, subscriptions: "x" }],
+    ["an array of subscriptions", { version: 1, subscriptions: [] }],
   ];
 
   for (const [name, content] of invalid) {

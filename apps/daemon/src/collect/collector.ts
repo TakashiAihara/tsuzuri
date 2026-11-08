@@ -1,4 +1,10 @@
-import { normalizeItem, type Source, type SourceKind, type SourceStatus } from "@tsuzuri/core";
+import {
+  type FetchResult,
+  normalizeItem,
+  type Source,
+  type SourceKind,
+  type SourceStatus,
+} from "@tsuzuri/core";
 import {
   ITEM_SCHEMA,
   ITEM_SCHEMA_VERSION,
@@ -44,6 +50,7 @@ export type SubscriptionResult = {
   id: string;
   status: "fetched" | "unchanged" | "failed";
   seen: number;
+  /** New rows this fetch buffered for the run that the next flush writes. */
   written: number;
   error?: string;
 };
@@ -69,7 +76,10 @@ export type CollectorDeps = {
   random?: () => number;
   degradeAfterFailures: number;
   flushIntervalMs?: number;
-  recentIdsPerSource?: number;
+  /** At most this many fetches are in flight within one tick. */
+  concurrency?: number;
+  /** Per-fetch abort deadline, always combined with deps.signal. */
+  fetchTimeoutMs?: number;
   signal?: AbortSignal;
 };
 
@@ -86,9 +96,12 @@ const MAX_BACKOFF_SECONDS = 24 * 60 * 60;
 const JITTER_RATIO = 0.1;
 
 const DEFAULT_FLUSH_INTERVAL_MS = 300_000;
-const DEFAULT_RECENT_IDS_PER_SOURCE = 200;
+const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_FETCH_TIMEOUT_MS = 60_000;
 const STATE_KEY = "_state/collector.json";
-const FETCH_TIMEOUT_MS = 60_000;
+// 16 hex characters keep _state small while collisions stay rare enough that
+// a rewritten row is harmless (loader inserts are idempotent per row).
+const RECENT_ID_PREFIX_LENGTH = 16;
 
 function backoffSeconds(intervalSeconds: number, consecutiveFailures: number): number {
   const grown = intervalSeconds * 2 ** Math.min(consecutiveFailures, 10);
@@ -100,18 +113,64 @@ function nextFetchAt(now: Date, intervalSeconds: number, random: () => number): 
   return new Date(now.getTime() + (intervalSeconds + jitter) * 1000);
 }
 
-// The timestamp keeps run ids sorting by write time; the hex only has to keep
-// two flushes inside the same second apart.
+// The timestamp keeps run ids sorting by write time; the 32 bits of hex only
+// have to keep two flushes inside the same second apart.
 function newRunId(at: Date, random: () => number): string {
   const stamp = at
     .toISOString()
     .replace(/[-:]/g, "")
     .replace(/\.\d{3}Z$/, "Z");
-  const suffix = Math.min(0xffff, Math.floor(random() * 0x10000))
+  const suffix = Math.floor(random() * 0x1_0000_0000)
     .toString(16)
-    .padStart(4, "0");
+    .padStart(8, "0");
   return `${stamp}-${suffix}`;
 }
+
+function invalidState(): Error {
+  return new Error(`invalid ${STATE_KEY}: expected {"version":1,"subscriptions":{...}}`);
+}
+
+function parseState(bytes: Uint8Array): CollectorState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw invalidState();
+  }
+  if (typeof parsed !== "object" || parsed === null) throw invalidState();
+  const { version, subscriptions } = parsed as {
+    version?: unknown;
+    subscriptions?: unknown;
+  };
+  if (
+    version !== 1 ||
+    typeof subscriptions !== "object" ||
+    subscriptions === null ||
+    Array.isArray(subscriptions)
+  ) {
+    throw invalidState();
+  }
+  const entries: Record<string, SubscriptionFetchState> = {};
+  for (const [id, value] of Object.entries(subscriptions)) {
+    const saved = (
+      typeof value === "object" && value !== null ? value : {}
+    ) as Partial<SubscriptionFetchState>;
+    entries[id] = {
+      ...(saved as SubscriptionFetchState),
+      recentIds: Array.isArray(saved.recentIds) ? saved.recentIds : [],
+    };
+  }
+  return { version: 1, subscriptions: entries };
+}
+
+/** What one subscription's fetch attempt produced, before results are ordered. */
+type FetchOutcome =
+  | { kind: "skip" }
+  | { kind: "unsupported"; at: Date; prev: SubscriptionFetchState }
+  | { kind: "done"; at: Date; prev: SubscriptionFetchState; result: FetchResult }
+  | { kind: "threw"; at: Date; prev: SubscriptionFetchState; error: unknown };
+
+type CompletedFetch = Exclude<FetchOutcome, { kind: "skip" }>;
 
 /**
  * The collector: polls due subscriptions and appends their items as Parquet.
@@ -126,7 +185,8 @@ export function createCollector(deps: CollectorDeps) {
   const now = deps.now ?? (() => new Date());
   const random = deps.random ?? Math.random;
   const flushIntervalMs = deps.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
-  const recentIdsPerSource = deps.recentIdsPerSource ?? DEFAULT_RECENT_IDS_PER_SOURCE;
+  const concurrency = Math.max(1, deps.concurrency ?? DEFAULT_CONCURRENCY);
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   const sources: ReadonlyMap<string, Source> = deps.sources ?? registry;
   const startedAt = now().getTime();
 
@@ -136,7 +196,7 @@ export function createCollector(deps: CollectorDeps) {
       .get(STATE_KEY)
       .then((bytes): CollectorState => {
         if (bytes === null) return { version: 1, subscriptions: {} };
-        return JSON.parse(new TextDecoder().decode(bytes)) as CollectorState;
+        return parseState(bytes);
       })
       .catch((error: unknown) => {
         // A failed read must not poison every later call.
@@ -151,25 +211,48 @@ export function createCollector(deps: CollectorDeps) {
   let pendingStartedAt: Date | null = null;
   let lastFlushAt = startedAt;
 
-  const fetchSubscription = async (
+  // One chain serialises every tick and flush: a flush called while a tick's
+  // fetches are in flight waits for them, so no row or result is lost or
+  // written twice. The flush a tick triggers runs inside the tick's own slot.
+  let chain: Promise<void> = Promise.resolve();
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = chain.then(work);
+    chain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+
+  const runSubscription = async (
     sub: CollectorSubscription,
     state: CollectorState,
-    tickNow: Date,
-  ): Promise<SubscriptionResult | null> => {
+    tickStart: Date,
+  ): Promise<FetchOutcome> => {
     const saved = state.subscriptions[sub.id];
     const effective = saved?.status ?? sub.status;
 
     // `disabled` is the user's choice and lives on the subscription; the
     // collector never writes it. Every other status is its own, from state.
-    if (sub.status === "disabled") return null;
-    if (effective !== "active" && effective !== "degraded") return null;
-    if (saved && new Date(saved.nextFetchAt).getTime() > tickNow.getTime()) return null;
+    if (sub.status === "disabled") return { kind: "skip" };
+
+    const implementation = sources.get(sub.kind);
+    // A saved "unsupported" is retried once an implementation exists; without
+    // one it stays skipped and its saved state is left untouched.
+    const eligible =
+      effective === "active" ||
+      effective === "degraded" ||
+      (effective === "unsupported" && implementation !== undefined);
+    if (!eligible) return { kind: "skip" };
+    if (saved && new Date(saved.nextFetchAt).getTime() > tickStart.getTime()) {
+      return { kind: "skip" };
+    }
 
     const prev: SubscriptionFetchState = saved ?? {
       etag: null,
       lastModified: null,
       contentHash: null,
-      nextFetchAt: tickNow.toISOString(),
+      nextFetchAt: tickStart.toISOString(),
       lastFetchedAt: null,
       lastSuccessAt: null,
       consecutiveFailures: 0,
@@ -177,27 +260,61 @@ export function createCollector(deps: CollectorDeps) {
       status: effective,
       recentIds: [],
     };
+    // A revived "unsupported" is processed exactly like an active one.
+    const base: SubscriptionFetchState =
+      effective === "unsupported" ? { ...prev, status: "active" } : prev;
 
-    const implementation = sources.get(sub.kind);
     if (!implementation) {
+      return { kind: "unsupported", at: now(), prev: base };
+    }
+
+    // The timeout always applies; deps.signal can only abort earlier.
+    const timeout = AbortSignal.timeout(fetchTimeoutMs);
+    const signal = deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout;
+    let result: FetchResult;
+    try {
+      result = await implementation.fetchItems({
+        url: sub.url,
+        config: sub.config,
+        state: { etag: prev.etag, lastModified: prev.lastModified, contentHash: prev.contentHash },
+        fetch: deps.fetcher,
+        signal,
+      });
+    } catch (error) {
+      return { kind: "threw", at: now(), prev: base, error };
+    }
+    return { kind: "done", at: now(), prev: base, result };
+  };
+
+  const applyOutcome = (
+    sub: CollectorSubscription,
+    outcome: CompletedFetch,
+    state: CollectorState,
+  ): SubscriptionResult => {
+    const at = outcome.at;
+    const prev = outcome.prev;
+
+    if (outcome.kind === "unsupported") {
       const lastError = `no implementation for kind "${sub.kind}"`;
       state.subscriptions[sub.id] = {
         ...prev,
         status: "unsupported",
         lastError,
-        lastFetchedAt: tickNow.toISOString(),
-        nextFetchAt: nextFetchAt(tickNow, sub.fetchIntervalSeconds, random).toISOString(),
+        lastFetchedAt: at.toISOString(),
+        nextFetchAt: nextFetchAt(at, sub.fetchIntervalSeconds, random).toISOString(),
       };
       return { id: sub.id, status: "failed", seen: 0, written: 0, error: lastError };
     }
 
-    const result = await implementation.fetchItems({
-      url: sub.url,
-      config: sub.config,
-      state: { etag: prev.etag, lastModified: prev.lastModified, contentHash: prev.contentHash },
-      fetch: deps.fetcher,
-      signal: deps.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    // A source that throws is a retryable failure with the thrown message.
+    const result: FetchResult =
+      outcome.kind === "threw"
+        ? {
+            status: "failed",
+            error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+            retryable: true,
+          }
+        : outcome.result;
 
     if (result.status === "failed") {
       const failures = prev.consecutiveFailures + 1;
@@ -208,9 +325,9 @@ export function createCollector(deps: CollectorDeps) {
         ...prev,
         consecutiveFailures: failures,
         lastError: result.error,
-        lastFetchedAt: tickNow.toISOString(),
+        lastFetchedAt: at.toISOString(),
         status: failures >= deps.degradeAfterFailures ? "degraded" : prev.status,
-        nextFetchAt: nextFetchAt(tickNow, interval, random).toISOString(),
+        nextFetchAt: nextFetchAt(at, interval, random).toISOString(),
       };
       return { id: sub.id, status: "failed", seen: 0, written: 0, error: result.error };
     }
@@ -220,24 +337,35 @@ export function createCollector(deps: CollectorDeps) {
         ...prev,
         consecutiveFailures: 0,
         lastError: null,
-        lastFetchedAt: tickNow.toISOString(),
-        lastSuccessAt: tickNow.toISOString(),
+        lastFetchedAt: at.toISOString(),
+        lastSuccessAt: at.toISOString(),
         status: prev.status === "degraded" ? "active" : prev.status,
-        nextFetchAt: nextFetchAt(tickNow, sub.fetchIntervalSeconds, random).toISOString(),
+        nextFetchAt: nextFetchAt(at, sub.fetchIntervalSeconds, random).toISOString(),
       };
       return { id: sub.id, status: "unchanged", seen: 0, written: 0 };
     }
 
     const normalized = result.items.flatMap((rawItem) => {
-      const item = normalizeItem(rawItem, { baseUrl: sub.url, fetchedAt: tickNow });
+      const item = normalizeItem(rawItem, { baseUrl: sub.url, fetchedAt: at });
       return item === null ? [] : [{ raw: rawItem, item }];
     });
 
-    const recentIds = [...prev.recentIds];
+    // recentIds is the prefix set of this fetch alone: feeds list newest first,
+    // so a rolling window would drop the newest ids first. A prefix from the
+    // previous fetch skips the row but still lands in the new list, which is
+    // what lets an item that left the feed be written again.
+    const previous = new Set(prev.recentIds);
+    const emitted = new Set<string>();
+    const recentIds: string[] = [];
     let written = 0;
     for (const { raw: rawItem, item } of normalized) {
-      if (recentIds.includes(item.id)) continue;
-      recentIds.push(item.id);
+      const prefix = item.id.slice(0, RECENT_ID_PREFIX_LENGTH);
+      const skip = previous.has(prefix) || emitted.has(prefix);
+      if (!emitted.has(prefix)) {
+        emitted.add(prefix);
+        recentIds.push(prefix);
+      }
+      if (skip) continue;
       buffer.push({
         id: item.id,
         url: item.url,
@@ -249,7 +377,7 @@ export function createCollector(deps: CollectorDeps) {
         published_at_estimated: item.publishedAtEstimated,
         content_html: item.contentHtml,
         summary: item.summary,
-        fetched_at: tickNow,
+        fetched_at: at,
         source_id: sub.id,
         schema_version: ITEM_SCHEMA_VERSION,
         raw: JSON.stringify(rawItem),
@@ -264,44 +392,55 @@ export function createCollector(deps: CollectorDeps) {
       contentHash: result.contentHash,
       consecutiveFailures: 0,
       lastError: null,
-      lastFetchedAt: tickNow.toISOString(),
-      lastSuccessAt: tickNow.toISOString(),
+      lastFetchedAt: at.toISOString(),
+      lastSuccessAt: at.toISOString(),
       status: prev.status === "degraded" ? "active" : prev.status,
-      nextFetchAt: nextFetchAt(tickNow, sub.fetchIntervalSeconds, random).toISOString(),
-      recentIds: recentIds.slice(Math.max(0, recentIds.length - recentIdsPerSource)),
+      nextFetchAt: nextFetchAt(at, sub.fetchIntervalSeconds, random).toISOString(),
+      recentIds,
     };
     return { id: sub.id, status: "fetched", seen: normalized.length, written };
   };
 
-  const tick = async (subscriptions: CollectorSubscription[]): Promise<TickResult> => {
+  const tickInner = async (subscriptions: CollectorSubscription[]): Promise<TickResult> => {
     const state = await loadState();
-    const tickNow = now();
-    const results: SubscriptionResult[] = [];
+    const tickStart = now();
+    const outcomes: FetchOutcome[] = new Array(subscriptions.length);
 
-    for (const sub of subscriptions) {
-      let result: SubscriptionResult | null;
-      try {
-        result = await fetchSubscription(sub, state, tickNow);
-      } catch (error) {
-        // Same isolation the scheduler gives ingestSource: one broken
-        // subscription must not stop the rest. Its state is untouched, so it
-        // stays due and is retried on the next tick.
-        console.error(`collect failed for ${sub.url}:`, error);
-        continue;
+    // Fetches run through a worker pool so at most `concurrency` are in flight;
+    // outcomes are applied afterwards in subscription order, which keeps tick
+    // results, _runs entries and buffered rows deterministic.
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < subscriptions.length) {
+        const index = cursor;
+        cursor += 1;
+        const sub = subscriptions[index];
+        if (sub === undefined) continue;
+        outcomes[index] = await runSubscription(sub, state, tickStart);
       }
-      if (result === null) continue;
-      pendingStartedAt ??= tickNow;
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, subscriptions.length) }, () => worker()),
+    );
+
+    const results: SubscriptionResult[] = [];
+    for (let index = 0; index < subscriptions.length; index += 1) {
+      const sub = subscriptions[index];
+      const outcome = outcomes[index];
+      if (sub === undefined || outcome === undefined || outcome.kind === "skip") continue;
+      const result = applyOutcome(sub, outcome, state);
+      pendingStartedAt ??= outcome.at;
       pending.push(result);
       results.push(result);
     }
 
-    if (tickNow.getTime() - lastFlushAt >= flushIntervalMs) {
-      await flush();
+    if (now().getTime() - lastFlushAt >= flushIntervalMs) {
+      await flushInner();
     }
     return { subscriptions: results };
   };
 
-  const flush = async (): Promise<FlushResult | null> => {
+  const flushInner = async (): Promise<FlushResult | null> => {
     const state = await loadState();
     const flushTime = now();
 
@@ -335,5 +474,9 @@ export function createCollector(deps: CollectorDeps) {
     return run;
   };
 
-  return { tick, flush, state: loadState };
+  return {
+    tick: (subscriptions: CollectorSubscription[]) => enqueue(() => tickInner(subscriptions)),
+    flush: () => enqueue(flushInner),
+    state: loadState,
+  };
 }
