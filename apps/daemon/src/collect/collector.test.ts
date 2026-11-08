@@ -21,6 +21,12 @@ const ID_B = "c39a8839222451ee389ef70b6c84492299eaf198e5afd8816fa9e3de421f121e";
 const ID_C = "4404d8fc43eda55c76c88199d06d26971450474878aeffcff8c3ed838f5e58e9";
 const ID_D = "81edf9f88782bc8507b6ba862dcbe51835f0c87f66e9b1d7a5782ceb25be5126";
 
+// recentIds keeps only the first 16 hex characters of an item id.
+const P_A = "75aa39e4ad17f2ea";
+const P_B = "c39a8839222451ee";
+const P_C = "4404d8fc43eda55c";
+const P_D = "81edf9f88782bc85";
+
 const COLUMNS = [
   "id",
   "url",
@@ -171,7 +177,7 @@ describe("state loading (behaviour 1)", () => {
   });
 
   test("a saved nextFetchAt in the future keeps its subscription from being fetched", async () => {
-    const saved = entry({ nextFetchAt: "2026-11-08T13:00:00.000Z", recentIds: [ID_A] });
+    const saved = entry({ nextFetchAt: "2026-11-08T13:00:00.000Z", recentIds: [P_A] });
     await seed({ a: saved, b: entry() });
     const harness = fakeSources({
       "https://a.example/feed.xml": fetched([]),
@@ -199,7 +205,7 @@ describe("state loading (behaviour 1)", () => {
       contentHash: "h0",
     });
     expect(ctx?.fetch).toBe(fetcher);
-    expect(ctx?.signal).toBe(signal);
+    expect(ctx?.signal.aborted).toBe(false);
   });
 
   test("storage is read once, not on every tick", async () => {
@@ -256,11 +262,33 @@ describe("which subscriptions are fetched (behaviour 2)", () => {
     expect((await collector.state()).subscriptions.d?.status).toBe("active");
   });
 
-  test("an unsupported subscription is not retried", async () => {
-    await seed({ a: entry({ status: "unsupported" }) });
-    const harness = fakeSources({ "https://a.example/feed.xml": fetched([]) });
-    await make(harness).tick([sub("a")]);
+  test("an unsupported subscription without an implementation stays skipped (behaviour I)", async () => {
+    const saved = entry({ status: "unsupported", lastError: 'no implementation for kind "rule"' });
+    await seed({ a: saved });
+    const harness = fakeSources({});
+    const collector = make(harness);
+    expect((await collector.tick([sub("a", { kind: "rule" })])).subscriptions).toEqual([]);
     expect(harness.calls).toHaveLength(0);
+    expect((await collector.state()).subscriptions.a).toEqual(saved);
+  });
+
+  test("a saved unsupported status is retried once an implementation exists and then counts as active (behaviour I)", async () => {
+    await seed({
+      a: entry({ status: "unsupported", lastError: 'no implementation for kind "feed"' }),
+    });
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([]) });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(1);
+    expect((await collector.state()).subscriptions.a).toEqual(
+      entry({
+        status: "active",
+        contentHash: "h1",
+        lastFetchedAt: "2026-11-08T12:34:56.000Z",
+        lastSuccessAt: "2026-11-08T12:34:56.000Z",
+        nextFetchAt: "2026-11-08T13:34:56.000Z",
+      }),
+    );
   });
 });
 
@@ -369,7 +397,7 @@ describe("state transitions (behaviour 3)", () => {
         etag: "old",
         lastModified: "old-lm",
         contentHash: "old-hash",
-        recentIds: [ID_A],
+        recentIds: [P_A],
       }),
     });
     const harness = fakeSources({
@@ -385,7 +413,7 @@ describe("state transitions (behaviour 3)", () => {
         etag: "old",
         lastModified: "old-lm",
         contentHash: "old-hash",
-        recentIds: [ID_A],
+        recentIds: [P_A],
         lastFetchedAt: "2026-11-08T12:34:56.000Z",
         lastSuccessAt: "2026-11-08T12:34:56.000Z",
         nextFetchAt: "2026-11-08T13:34:56.000Z",
@@ -487,7 +515,7 @@ describe("items (behaviours 4 and 5)", () => {
     await collector.flush();
 
     const [key] = await storage.list("items/");
-    expect(key).toMatch(/^items\/dt=2026-11-08\/20261108T123456Z-[0-9a-f]{4}\.parquet$/);
+    expect(key).toMatch(/^items\/dt=2026-11-08\/20261108T123456Z-80000000\.parquet$/);
     const rows = await rowsAt(key as string);
     expect(rows.map((row) => Object.keys(row))).toEqual([COLUMNS, COLUMNS]);
     expect(rows.map(({ raw: _raw, ...rest }) => rest)).toEqual([
@@ -539,24 +567,55 @@ describe("items (behaviours 4 and 5)", () => {
     expect(run.subscriptions).toEqual([{ id: "a", status: "fetched", seen: 1, written: 1 }]);
   });
 
-  test("ids kept in recentIds are skipped, and only the last recentIdsPerSource are kept", async () => {
+  test("an item whose 16-character prefix is in the previous recentIds is skipped (behaviours B, L)", async () => {
+    await seed({ a: entry({ recentIds: [P_A] }) });
     const harness = fakeSources({
-      "https://a.example/feed.xml": fetched([post("a"), post("b"), post("c")]),
+      "https://a.example/feed.xml": fetched([post("a"), post("b")]),
     });
-    const collector = make(harness, { recentIdsPerSource: 2 });
+    const collector = make(harness);
     await collector.tick([sub("a")]);
-    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([ID_B, ID_C]);
-
-    // A has fallen out of the window, so it is written again; B and C are not.
-    harness.results["https://a.example/feed.xml"] = fetched([
-      post("a"),
-      post("b"),
-      post("c"),
-      post("d"),
+    await collector.flush();
+    const [key] = await storage.list("items/");
+    expect((await rowsAt(key as string)).map((row) => row.id)).toEqual([ID_B]);
+    const [runKey] = await storage.list("_runs/");
+    expect((await storedJson(runKey as string)).subscriptions).toEqual([
+      { id: "a", status: "fetched", seen: 2, written: 1 },
     ]);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_A, P_B]);
+  });
+
+  test("recentIds are 16-hex prefixes, deduplicated, in feed order (behaviour B)", async () => {
+    const harness = fakeSources({
+      "https://a.example/feed.xml": fetched([post("c"), post("a"), post("c"), post("b")]),
+    });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    await collector.flush();
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_C, P_A, P_B]);
+    const [key] = await storage.list("items/");
+    expect((await rowsAt(key as string)).map((row) => row.id)).toEqual([ID_C, ID_A, ID_B]);
+    const [runKey] = await storage.list("_runs/");
+    const run = await storedJson(runKey as string);
+    expect((run.subscriptions as { written: number }[])[0]?.written).toBe(3);
+  });
+
+  test("recentIds hold only the latest fetched result, so an item that left the feed is written again (behaviour B)", async () => {
+    const harness = fakeSources({
+      "https://a.example/feed.xml": fetched([post("a"), post("b")]),
+    });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_A, P_B]);
+
+    harness.results["https://a.example/feed.xml"] = fetched([post("c")]);
     advance(3600_000);
     await collector.tick([sub("a")]);
-    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([ID_A, ID_D]);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_C]);
+
+    harness.results["https://a.example/feed.xml"] = fetched([post("a"), post("c"), post("d")]);
+    advance(3600_000);
+    await collector.tick([sub("a")]);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_A, P_C, P_D]);
 
     await collector.flush();
     const [key] = await storage.list("items/");
@@ -567,21 +626,53 @@ describe("items (behaviours 4 and 5)", () => {
       ID_A,
       ID_D,
     ]);
-    const [runKey] = await storage.list("_runs/");
-    expect((await storedJson(runKey as string)).subscriptions).toEqual([
-      { id: "a", status: "fetched", seen: 3, written: 3 },
-      { id: "a", status: "fetched", seen: 4, written: 2 },
-    ]);
   });
 
-  test("recentIdsPerSource defaults to 200", async () => {
-    const items = Array.from({ length: 201 }, (_, i) => post(`n${i}`));
-    const harness = fakeSources({ "https://a.example/feed.xml": fetched(items) });
+  test("a failed or unchanged fetch keeps the previous recentIds (behaviour B)", async () => {
+    await seed({ a: entry({ recentIds: [P_A, P_B] }), b: entry({ recentIds: [P_C] }) });
+    const harness = fakeSources({
+      "https://a.example/feed.xml": { status: "failed", error: "x", retryable: true },
+      "https://b.example/feed.xml": { status: "unchanged", reason: "not-modified" },
+    });
+    const collector = make(harness);
+    await collector.tick([sub("a"), sub("b")]);
+    const state = await collector.state();
+    expect(state.subscriptions.a?.recentIds).toEqual([P_A, P_B]);
+    expect(state.subscriptions.b?.recentIds).toEqual([P_C]);
+  });
+
+  test("a 300-item feed that gains one item at the front writes exactly that one row (behaviours B, L)", async () => {
+    const names = Array.from({ length: 300 }, (_, i) => `n${299 - i}`);
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched(names.map(post)) });
     const collector = make(harness);
     await collector.tick([sub("a")]);
+    await collector.flush();
+    const firstIds = await Promise.all(
+      names.map((name) => idOf(`https://example.com/posts/${name}`)),
+    );
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual(
+      firstIds.map((id) => id.slice(0, 16)),
+    );
+
+    harness.results["https://a.example/feed.xml"] = fetched(["n300", ...names].map(post));
+    advance(3600_000);
+    await collector.tick([sub("a")]);
+    await collector.flush();
+
+    const keys = await storage.list("items/");
+    expect(keys).toHaveLength(2);
+    const second = await rowsAt(keys[1] ?? "");
+    expect(second.map((row) => row.title)).toEqual(["n300"]);
+    const runKeys = await storage.list("_runs/");
+    expect((await storedJson(runKeys[1] as string)).subscriptions).toEqual([
+      { id: "a", status: "fetched", seen: 301, written: 1 },
+    ]);
+    const newId = await idOf("https://example.com/posts/n300");
     const recent = (await collector.state()).subscriptions.a?.recentIds;
-    expect(recent).toHaveLength(200);
-    expect(recent).not.toContain(await idOf("https://example.com/posts/n0"));
+    expect(recent).toHaveLength(301);
+    expect(recent?.[0]).toBe(newId.slice(0, 16));
+    expect(recent?.[1]).toBe((firstIds[0] as string).slice(0, 16));
+    expect(recent?.[300]).toBe((firstIds[299] as string).slice(0, 16));
   });
 
   test("two subscriptions each write an item they both carry", async () => {
@@ -754,14 +845,14 @@ describe("flush output (behaviour 7)", () => {
     await collector.flush();
 
     expect(await storage.list("items/")).toEqual([
-      "items/dt=2026-11-09/20261109T000100Z-0000.parquet",
+      "items/dt=2026-11-09/20261109T000100Z-00000000.parquet",
     ]);
-    expect(await storage.list("_runs/")).toEqual(["_runs/20261109T000100Z-0000.json"]);
-    const [row] = await rowsAt("items/dt=2026-11-09/20261109T000100Z-0000.parquet");
+    expect(await storage.list("_runs/")).toEqual(["_runs/20261109T000100Z-00000000.json"]);
+    const [row] = await rowsAt("items/dt=2026-11-09/20261109T000100Z-00000000.parquet");
     expect(row?.fetched_at).toEqual(new Date("2026-11-08T23:59:00.000Z"));
   });
 
-  test("the four hex digits come from random and run ids sort by write time", async () => {
+  test("the eight hex digits are floor(random * 2^32) and run ids sort by write time", async () => {
     let value = 0.9;
     const harness = fakeSources({
       "https://a.example/feed.xml": fetched([post("a")]),
@@ -777,9 +868,8 @@ describe("flush output (behaviour 7)", () => {
 
     const keys = await storage.list("_runs/");
     expect(keys).toHaveLength(2);
-    expect(keys[0]).toMatch(/^_runs\/20261108T123456Z-[0-9a-f]{4}\.json$/);
-    expect(keys[0]).not.toBe("_runs/20261108T123456Z-0000.json");
-    expect(keys[1]).toBe("_runs/20261108T123457Z-0000.json");
+    expect(keys[0]).toBe("_runs/20261108T123456Z-e6666666.json");
+    expect(keys[1]).toBe("_runs/20261108T123457Z-00000000.json");
   });
 
   test("_state is written last and holds the advanced state", async () => {
@@ -809,7 +899,7 @@ describe("flush output (behaviour 7)", () => {
     expect(puts.slice(0, 2).some((key) => key.startsWith("_runs/"))).toBe(true);
     const saved = await storedState();
     expect(saved).toEqual(await collector.state());
-    expect(saved.subscriptions.a?.recentIds).toEqual([ID_A]);
+    expect(saved.subscriptions.a?.recentIds).toEqual([P_A]);
   });
 
   test("a flush with only failures and unchanged results writes _runs and _state but no Parquet file", async () => {
@@ -885,7 +975,471 @@ describe("a failing Parquet write (behaviour 8)", () => {
     const [key] = await storage.list("items/");
     expect(await storage.list("items/")).toHaveLength(1);
     expect((await rowsAt(key as string)).map((row) => row.id)).toEqual([ID_A, ID_B]);
-    expect((await storedState()).subscriptions.a?.recentIds).toEqual([ID_A, ID_B]);
+    expect((await storedState()).subscriptions.a?.recentIds).toEqual([P_A, P_B]);
+  });
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Polls for at most ~1s so a broken implementation fails instead of hanging.
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 100; i += 1) {
+    if (condition()) return;
+    await sleep(10);
+  }
+  throw new Error("condition not reached");
+}
+
+// Each fetch blocks until the test opens its gate; a gate left closed rejects
+// after 3s so nothing can hang forever.
+function gatedSources() {
+  const started: string[] = [];
+  const gates = new Map<string, () => void>();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const source: Source = {
+    kind: "feed",
+    id: "gated",
+    fetchItems: async (ctx) => {
+      started.push(ctx.url);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("gate never opened")), 3000);
+          gates.set(ctx.url, () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      } finally {
+        inFlight -= 1;
+      }
+      return fetched([post(new URL(ctx.url).hostname.split(".")[0] ?? "x")]);
+    },
+  };
+  return {
+    sources: new Map<string, Source>([["feed", source]]),
+    calls: [] as SourceContext[],
+    results: {} as Record<string, FetchResult>,
+    started,
+    maxInFlight: () => maxInFlight,
+    open: (url: string) => {
+      const gate = gates.get(url);
+      if (!gate) throw new Error(`gate for ${url} not waiting`);
+      gate();
+    },
+    openAll: () => {
+      for (const gate of gates.values()) gate();
+    },
+  };
+}
+
+// The source returns only when its signal aborts, with a 1s bound of its own.
+function abortWaitingSources() {
+  const calls: SourceContext[] = [];
+  const source: Source = {
+    kind: "feed",
+    id: "abort-waiting",
+    fetchItems: (ctx) =>
+      new Promise<FetchResult>((_resolve, reject) => {
+        calls.push(ctx);
+        const timer = setTimeout(() => reject(new Error("signal never aborted")), 1000);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new Error("aborted by signal"));
+        };
+        if (ctx.signal.aborted) onAbort();
+        else ctx.signal.addEventListener("abort", onAbort, { once: true });
+      }),
+  };
+  return { sources: new Map<string, Source>([["feed", source]]), calls, results: {} };
+}
+
+// Advances the shared clock by 10s just before each fetch returns.
+function clockAdvancingSources() {
+  const source: Source = {
+    kind: "feed",
+    id: "advancing",
+    fetchItems: async (ctx) => {
+      advance(10_000);
+      return fetched([post(new URL(ctx.url).hostname.split(".")[0] ?? "x")]);
+    },
+  };
+  return {
+    sources: new Map<string, Source>([["feed", source]]),
+    calls: [] as SourceContext[],
+    results: {} as Record<string, FetchResult>,
+  };
+}
+
+describe("serialised tick and flush (behaviour A)", () => {
+  test("a flush called while a tick is in flight waits for it and writes its row", async () => {
+    const gated = gatedSources();
+    const collector = make(gated);
+    try {
+      const tickPromise = collector.tick([sub("a")]);
+      await until(() => gated.started.length === 1);
+      const flushPromise = collector.flush();
+      gated.open("https://a.example/feed.xml");
+      const [tickResult, flushResult] = await Promise.all([tickPromise, flushPromise]);
+
+      const expected = [{ id: "a", status: "fetched", seen: 1, written: 1 }];
+      expect(tickResult.subscriptions).toEqual(expected);
+      expect(flushResult?.subscriptions).toEqual(expected);
+      expect(flushResult?.items).toBe(1);
+
+      const keys = await storage.list("items/");
+      expect(keys).toHaveLength(1);
+      expect((await rowsAt(keys[0] as string)).map((row) => row.id)).toEqual([ID_A]);
+      expect(await storage.list("_runs/")).toHaveLength(1);
+      const saved = (await storedState()).subscriptions.a;
+      expect(saved?.nextFetchAt).toBe("2026-11-08T13:34:56.000Z");
+      expect(saved?.recentIds).toEqual([P_A]);
+    } finally {
+      gated.openAll();
+    }
+  });
+
+  test("two overlapping ticks fetch a subscription once and lose no result", async () => {
+    const gated = gatedSources();
+    const collector = make(gated);
+    try {
+      const first = collector.tick([sub("a")]);
+      const second = collector.tick([sub("a")]);
+      await until(() => gated.started.length === 1);
+      await sleep(30);
+      expect(gated.started).toHaveLength(1);
+      gated.open("https://a.example/feed.xml");
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(gated.started).toHaveLength(1);
+      expect(firstResult.subscriptions).toEqual([
+        { id: "a", status: "fetched", seen: 1, written: 1 },
+      ]);
+      expect(secondResult.subscriptions).toEqual([]);
+      await collector.flush();
+      const [key] = await storage.list("items/");
+      expect((await rowsAt(key as string)).map((row) => row.id)).toEqual([ID_A]);
+    } finally {
+      gated.openAll();
+    }
+  });
+
+  test("two overlapping flushes write once", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    const results = await Promise.all([collector.flush(), collector.flush()]);
+    expect(results.filter((result) => result !== null)).toHaveLength(1);
+    expect(await storage.list("items/")).toHaveLength(1);
+    expect(await storage.list("_runs/")).toHaveLength(1);
+  });
+});
+
+describe("per-subscription times (behaviour C)", () => {
+  test("each subscription's fetched_at, lastFetchedAt and nextFetchAt are read when its fetch completes", async () => {
+    const harness = clockAdvancingSources();
+    const collector = make(harness, { concurrency: 1 });
+    await collector.tick([sub("a"), sub("b")]);
+    await collector.flush();
+
+    const state = await collector.state();
+    expect(state.subscriptions.a).toMatchObject({
+      lastFetchedAt: "2026-11-08T12:35:06.000Z",
+      lastSuccessAt: "2026-11-08T12:35:06.000Z",
+      nextFetchAt: "2026-11-08T13:35:06.000Z",
+    });
+    expect(state.subscriptions.b).toMatchObject({
+      lastFetchedAt: "2026-11-08T12:35:16.000Z",
+      lastSuccessAt: "2026-11-08T12:35:16.000Z",
+      nextFetchAt: "2026-11-08T13:35:16.000Z",
+    });
+    const [key] = await storage.list("items/");
+    const rows = await rowsAt(key as string);
+    expect(rows.map((row) => [row.source_id, row.fetched_at])).toEqual([
+      ["a", new Date("2026-11-08T12:35:06.000Z")],
+      ["b", new Date("2026-11-08T12:35:16.000Z")],
+    ]);
+  });
+});
+
+describe("concurrency (behaviour D)", () => {
+  test("at most `concurrency` fetches are in flight and results keep the input order", async () => {
+    const gated = gatedSources();
+    const collector = make(gated, { concurrency: 2 });
+    try {
+      const tickPromise = collector.tick([sub("a"), sub("b"), sub("c"), sub("d")]);
+      await until(() => gated.started.length === 2);
+      await sleep(30);
+      expect(gated.started).toHaveLength(2);
+
+      // Release the second one first, so completion order differs from input order.
+      gated.open(gated.started[1] as string);
+      await until(() => gated.started.length === 3);
+      await sleep(30);
+      expect(gated.started).toHaveLength(3);
+      gated.open(gated.started[2] as string);
+      await until(() => gated.started.length === 4);
+      gated.openAll();
+      const result = await tickPromise;
+
+      expect(gated.maxInFlight()).toBe(2);
+      expect(result.subscriptions.map((entry) => entry.id)).toEqual(["a", "b", "c", "d"]);
+      const run = await collector.flush();
+      expect(run?.subscriptions.map((entry) => entry.id)).toEqual(["a", "b", "c", "d"]);
+      const [runKey] = await storage.list("_runs/");
+      expect((await storedJson(runKey as string)).subscriptions as { id: string }[]).toHaveLength(
+        4,
+      );
+    } finally {
+      gated.openAll();
+    }
+  });
+
+  test("the default concurrency is 4", async () => {
+    const gated = gatedSources();
+    const collector = make(gated);
+    try {
+      const subs = ["a", "b", "c", "d", "e", "f"].map((id) => sub(id));
+      const tickPromise = collector.tick(subs);
+      await until(() => gated.started.length === 4);
+      await sleep(30);
+      expect(gated.started).toHaveLength(4);
+      gated.openAll();
+      await until(() => gated.started.length === 6);
+      gated.openAll();
+      await tickPromise;
+      expect(gated.maxInFlight()).toBe(4);
+    } finally {
+      gated.openAll();
+    }
+  });
+});
+
+describe("fetch timeout and signal (behaviour E)", () => {
+  const failedByAbort = [
+    { id: "a", status: "failed", seen: 0, written: 0, error: "aborted by signal" },
+  ];
+
+  test("fetchTimeoutMs aborts the source's signal even when deps.signal never aborts", async () => {
+    const harness = abortWaitingSources();
+    const collector = make(harness, {
+      signal: new AbortController().signal,
+      fetchTimeoutMs: 20,
+    });
+    const result = await collector.tick([sub("a")]);
+    expect(result.subscriptions).toEqual(failedByAbort);
+    expect(harness.calls[0]?.signal.aborted).toBe(true);
+  });
+
+  test("fetchTimeoutMs applies without a deps.signal too", async () => {
+    const harness = abortWaitingSources();
+    const collector = make(harness, { fetchTimeoutMs: 20 });
+    expect((await collector.tick([sub("a")])).subscriptions).toEqual(failedByAbort);
+  });
+
+  test("aborting deps.signal aborts the signal the source sees", async () => {
+    const harness = abortWaitingSources();
+    const controller = new AbortController();
+    const collector = make(harness, { signal: controller.signal });
+    const tickPromise = collector.tick([sub("a")]);
+    await until(() => harness.calls.length === 1);
+    expect(harness.calls[0]?.signal.aborted).toBe(false);
+    controller.abort();
+    expect((await tickPromise).subscriptions).toEqual(failedByAbort);
+    expect(harness.calls[0]?.signal.aborted).toBe(true);
+  });
+});
+
+describe("state file validation (behaviours F and G)", () => {
+  const invalid: [string, unknown][] = [
+    ["a wrong version", { version: 2, subscriptions: {} }],
+    ["a missing version", { subscriptions: {} }],
+    ["missing subscriptions", { version: 1 }],
+    ["null subscriptions", { version: 1, subscriptions: null }],
+    ["a string subscriptions", { version: 1, subscriptions: "x" }],
+  ];
+
+  for (const [name, content] of invalid) {
+    test(`${name} is rejected on read`, async () => {
+      await storage.put(STATE_KEY, JSON.stringify(content));
+      const harness = fakeSources({ "https://a.example/feed.xml": fetched([]) });
+      await expect(make(harness).state()).rejects.toThrow("invalid _state/collector.json");
+      await expect(make(harness).tick([sub("a")])).rejects.toThrow("invalid _state/collector.json");
+      expect(harness.calls).toHaveLength(0);
+    });
+  }
+
+  test("an entry without recentIds is read as an empty list", async () => {
+    const { recentIds: _recentIds, ...legacy } = entry();
+    await storage.put(STATE_KEY, JSON.stringify({ version: 1, subscriptions: { a: legacy } }));
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([]);
+    await collector.tick([sub("a")]);
+    expect((await collector.state()).subscriptions.a?.recentIds).toEqual([P_A]);
+  });
+
+  test("a state file rejected as invalid is read again by the next call", async () => {
+    await storage.put(STATE_KEY, JSON.stringify({ version: 2, subscriptions: {} }));
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([]) });
+    const collector = make(harness);
+    await expect(collector.state()).rejects.toThrow("invalid _state/collector.json");
+    await seed({ a: entry({ nextFetchAt: "2026-11-08T13:00:00.000Z" }) });
+    expect((await collector.state()).subscriptions.a?.nextFetchAt).toBe("2026-11-08T13:00:00.000Z");
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(0);
+  });
+
+  test("a failed read is retried by the next tick, flush and state call", async () => {
+    let failGet = true;
+    const flakyGet: Storage = {
+      ...storage,
+      get: async (key) => {
+        if (failGet && key === STATE_KEY) throw new Error("read failed");
+        return storage.get(key);
+      },
+    };
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const build = () =>
+      createCollector({
+        storage: flakyGet,
+        fetcher,
+        sources: harness.sources,
+        now: () => clock,
+        random: () => 0.5,
+        degradeAfterFailures: 3,
+      });
+
+    const ticking = build();
+    await expect(ticking.tick([sub("a")])).rejects.toThrow("read failed");
+    const flushing = build();
+    await expect(flushing.flush()).rejects.toThrow("read failed");
+    const reading = build();
+    await expect(reading.state()).rejects.toThrow("read failed");
+    expect(harness.calls).toHaveLength(0);
+
+    failGet = false;
+    expect((await ticking.tick([sub("a")])).subscriptions).toEqual([
+      { id: "a", status: "fetched", seen: 1, written: 1 },
+    ]);
+    expect(await flushing.flush()).toBeNull();
+    expect(await reading.state()).toEqual({ version: 1, subscriptions: {} });
+  });
+});
+
+describe("a source that throws (behaviour H)", () => {
+  const error = "no scripted result for https://a.example/feed.xml";
+
+  test("counts as a retryable failure with the thrown message and is backed off", async () => {
+    const harness = fakeSources({});
+    const collector = make(harness);
+    const result = await collector.tick([sub("a")]);
+    expect(result.subscriptions).toEqual([
+      { id: "a", status: "failed", seen: 0, written: 0, error },
+    ]);
+    expect((await collector.state()).subscriptions.a).toEqual(
+      entry({
+        consecutiveFailures: 1,
+        lastError: error,
+        lastFetchedAt: "2026-11-08T12:34:56.000Z",
+        nextFetchAt: "2026-11-08T14:34:56.000Z",
+      }),
+    );
+
+    // Not retried on the next tick.
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(1);
+
+    await collector.flush();
+    const [runKey] = await storage.list("_runs/");
+    expect((await storedJson(runKey as string)).subscriptions).toEqual([
+      { id: "a", status: "failed", seen: 0, written: 0, error },
+    ]);
+    expect((await storedState()).subscriptions.a?.consecutiveFailures).toBe(1);
+  });
+
+  test("degrades the subscription at the threshold", async () => {
+    await seed({ a: entry({ consecutiveFailures: 2 }) });
+    const collector = make(fakeSources({}));
+    await collector.tick([sub("a")]);
+    const saved = (await collector.state()).subscriptions.a;
+    expect(saved?.status).toBe("degraded");
+    expect(saved?.consecutiveFailures).toBe(3);
+    expect(saved?.nextFetchAt).toBe("2026-11-08T20:34:56.000Z");
+  });
+});
+
+describe("run id (behaviour J)", () => {
+  async function runKeyFor(random: () => number): Promise<string> {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, { random });
+    await collector.tick([sub("a")]);
+    await collector.flush();
+    const [key] = await storage.list("_runs/");
+    await rm(join(dir, "_runs"), { recursive: true, force: true });
+    await rm(join(dir, "items"), { recursive: true, force: true });
+    await rm(join(dir, "_state"), { recursive: true, force: true });
+    return key as string;
+  }
+
+  test("the suffix is floor(random * 2^32) as 8 zero-padded hex digits", async () => {
+    expect(await runKeyFor(() => 0.5)).toBe("_runs/20261108T123456Z-80000000.json");
+    expect(await runKeyFor(() => 0.9)).toBe("_runs/20261108T123456Z-e6666666.json");
+    expect(await runKeyFor(() => 1 / 4294967296)).toBe("_runs/20261108T123456Z-00000001.json");
+    expect(await runKeyFor(() => 0)).toBe("_runs/20261108T123456Z-00000000.json");
+  });
+});
+
+describe("_runs startedAt (behaviour K)", () => {
+  test("startedAt is the first fetch since the previous flush and finishedAt the flush time", async () => {
+    const harness = clockAdvancingSources();
+    const collector = make(harness, { concurrency: 1 });
+    await collector.tick([sub("a"), sub("b")]);
+    const first = await collector.flush();
+    expect(first?.startedAt).toBe("2026-11-08T12:35:06.000Z");
+    expect(first?.finishedAt).toBe("2026-11-08T12:35:16.000Z");
+
+    advance(60_000);
+    await collector.tick([sub("c")]);
+    const second = await collector.flush();
+    expect(second?.startedAt).toBe("2026-11-08T12:36:26.000Z");
+    expect(second?.finishedAt).toBe("2026-11-08T12:36:26.000Z");
+    const keys = await storage.list("_runs/");
+    expect((await storedJson(keys[1] as string)).startedAt).toBe("2026-11-08T12:36:26.000Z");
+  });
+
+  test("a tick in which nothing is due does not start a run", async () => {
+    const harness = fakeSources({ "https://b.example/feed.xml": fetched([post("b")]) });
+    const collector = make(harness);
+    await collector.tick([sub("a", { status: "disabled" })]);
+    advance(1000);
+    await collector.tick([sub("b")]);
+    advance(1000);
+    const run = await collector.flush();
+    expect(run?.startedAt).toBe("2026-11-08T12:34:57.000Z");
+    expect(run?.finishedAt).toBe("2026-11-08T12:34:58.000Z");
+  });
+});
+
+describe("_runs written (behaviour L)", () => {
+  test("written counts the new rows buffered for that subscription, not the rows seen", async () => {
+    await seed({ a: entry({ recentIds: [P_A, P_B] }) });
+    const harness = fakeSources({
+      "https://a.example/feed.xml": fetched([post("a"), post("b"), post("c")]),
+      "https://b.example/feed.xml": fetched([post("a"), post("b")]),
+    });
+    const collector = make(harness);
+    await collector.tick([sub("a"), sub("b")]);
+    const run = await collector.flush();
+    expect(run?.subscriptions).toEqual([
+      { id: "a", status: "fetched", seen: 3, written: 1 },
+      { id: "b", status: "fetched", seen: 2, written: 2 },
+    ]);
+    expect(run?.items).toBe(3);
   });
 });
 
