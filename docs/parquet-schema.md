@@ -19,7 +19,7 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 
 ## Items
 
-`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader (step 2b of the design, not built yet) will refuse a row that does.
+`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader refuses such a row on its own and applies the rest of the file. It also refuses a row whose `id` is not the SHA-256 of its `canonical_url`, whose `url` or `canonical_url` is empty, whose text contains U+0000, whose timestamps fall outside the years 1 to 9999, or whose optional column holds a value of another type.
 
 | Column | Parquet type | Required | Meaning |
 |---|---|---|---|
@@ -39,4 +39,4 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 | `raw` | BYTE_ARRAY (UTF8) | no | The item as the source produced it before normalisation, as JSON text (for a feed: `url`, `title`, `author`, `guid`, `publishedAtRaw`, `contentHtml`, `summary`) |
 
 - tsuzuri writes SNAPPY-compressed files. It reads SNAPPY, ZSTD, GZIP, BROTLI and LZ4 files and uncompressed ones.
-- The same `id` may appear in several files. When the copies differ, the one with the earliest `fetched_at` wins, ties broken by object key and then row position (applied by the loader, step 2b).
+- The same `id` may appear in several files. When the copies differ, the first one the loader applies wins: files apply in key order, which is write order, and within a file the row with the earliest `fetched_at` comes first, ties keeping the row position. An earlier file therefore wins over a later one even when the later one holds an earlier `fetched_at`.

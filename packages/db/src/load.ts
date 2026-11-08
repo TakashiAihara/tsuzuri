@@ -63,9 +63,10 @@ export async function loadedKeys(sql: postgres.Sql): Promise<Set<string>> {
  * source to point at, and the loaded_objects mark — one transaction, so a
  * failure anywhere leaves the object unmarked and fully unapplied.
  *
- * `rejected` is the count of rows the caller's validation refused; it is
- * recorded on the ledger so a reload does not silently change the tally.
- * Returns how many items and links were actually new.
+ * `rows` are applied in the order given and the first row for an id wins (the
+ * caller orders them). `rejected` is the count of rows the caller's
+ * validation refused, kept on the ledger for diagnosis; a reload recomputes
+ * it. Returns how many items and links were actually new.
  */
 export async function applyItemObject(
   sql: postgres.Sql,
@@ -73,12 +74,23 @@ export async function applyItemObject(
   rows: LoadRow[],
   rejected = 0,
 ): Promise<{ inserted: number; linked: number }> {
+  // Duplicates are dropped here rather than left to ON CONFLICT inside one
+  // statement: jsonb_to_recordset and a join promise no row order, so which
+  // copy reached the table first would be up to the planner.
+  const seenItems = new Set<string>();
+  const itemRows = rows.filter((row) => !seenItems.has(row.id) && seenItems.add(row.id));
+  const seenLinks = new Set<string>();
+  const linkRows = rows.filter((row) => {
+    const pair = `${row.id} ${row.sourceId}`;
+    return !seenLinks.has(pair) && seenLinks.add(pair);
+  });
+
   return sql.begin(async (tx) => {
     let inserted = 0;
     let linked = 0;
 
     if (rows.length > 0) {
-      const itemRows = await tx<{ id: string }[]>`
+      const insertedItems = await tx<{ id: string }[]>`
         INSERT INTO items (
           id, url, canonical_url, title, author, guid,
           published_at, published_at_estimated, content_html, summary,
@@ -87,7 +99,7 @@ export async function applyItemObject(
         SELECT id, url, canonical_url, title, author, guid,
                published_at, published_at_estimated, content_html, summary,
                search_text, fetched_at
-        FROM jsonb_to_recordset(${jsonb(tx, rows.map(itemRecord))}::jsonb)
+        FROM jsonb_to_recordset(${jsonb(tx, itemRows.map(itemRecord))}::jsonb)
           AS t(
             id text, url text, canonical_url text, title text, author text,
             guid text, published_at timestamptz, published_at_estimated boolean,
@@ -96,23 +108,23 @@ export async function applyItemObject(
         ON CONFLICT (id) DO NOTHING
         RETURNING id
       `;
-      inserted = itemRows.length;
+      inserted = insertedItems.length;
 
       // Links go in for every row whose source_id is a live subscription,
       // whether or not its item was new: an item that already existed still
       // gains the link it never got. source_id compares as text because the
       // column may hold an id that is not a uuid at all, which a ::uuid cast
       // would reject for the whole batch.
-      const linkRows = await tx<{ item_id: string }[]>`
+      const insertedLinks = await tx<{ item_id: string }[]>`
         INSERT INTO item_sources (item_id, source_id, first_seen_at)
         SELECT t.item_id, s.id, t.first_seen_at
-        FROM jsonb_to_recordset(${jsonb(tx, rows.map(linkRecord))}::jsonb)
+        FROM jsonb_to_recordset(${jsonb(tx, linkRows.map(linkRecord))}::jsonb)
           AS t(item_id text, source_id text, first_seen_at timestamptz)
         JOIN sources s ON s.id::text = t.source_id
         ON CONFLICT DO NOTHING
         RETURNING item_id
       `;
-      linked = linkRows.length;
+      linked = insertedLinks.length;
     }
 
     await tx`
@@ -166,7 +178,8 @@ export async function syncSourceFetchState(
         last_success_at = v.last_success_at,
         consecutive_failures = v.consecutive_failures,
         last_error = v.last_error,
-        status = CASE WHEN s.status = 'disabled' THEN s.status ELSE v.status END
+        status = CASE WHEN s.status = 'disabled' THEN s.status ELSE v.status END,
+        updated_at = now()
     FROM jsonb_to_recordset(${jsonb(sql, records)}::jsonb)
       AS v(
         id text, etag text, last_modified text, content_hash text,

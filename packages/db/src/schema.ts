@@ -290,8 +290,8 @@ export const itemTags = pgTable(
 /**
  * Which storage objects the loader has applied, from 0007_loaded_objects.sql.
  *
- * `rows` counts the rows handed to the loader and `rejected` the ones its
- * validation refused; both CHECKs live in the migration.
+ * `rows` counts the rows that passed validation and were applied, `rejected`
+ * the ones validation refused; both CHECKs live in the migration.
  */
 export const loadedObjects = pgTable("loaded_objects", {
   key: text("key").primaryKey(),

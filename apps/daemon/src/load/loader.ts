@@ -1,3 +1,4 @@
+import { sha256 } from "@tsuzuri/core";
 import {
   applyItemObject,
   forgetLoadedObjects,
@@ -19,10 +20,12 @@ import { toSearchText } from "../ingest/run.ts";
  *
  * loaded_objects is the ledger that makes loadPending cheap to repeat: a key
  * it records is skipped, and forgetLoadedObjects (reload) makes every object
- * pending again. Rows apply in the order the storage keys sort, which is
- * write order, and within an object by fetched_at — so when the same item id
- * shows up twice with different content, the earliest fetched copy is the
- * one items keeps (ON CONFLICT DO NOTHING), matching docs/parquet-schema.md.
+ * pending again. Objects apply in the order the storage keys sort, which is
+ * write order, and within an object by fetched_at. When the same item id
+ * shows up twice with different content, the first applied copy is the one
+ * items keeps (ON CONFLICT DO NOTHING), matching docs/parquet-schema.md. To
+ * keep that order, an object whose apply fails stops the run: applying the
+ * later keys first would let a later copy win.
  */
 
 export type LoadResult = {
@@ -32,12 +35,14 @@ export type LoadResult = {
   linked: number;
   /** Rows refused by validation, across all applied objects. */
   rejected: number;
+  /** Objects that could not be read; they stay pending for the next run. */
+  failed: number;
 };
 
 export type LoaderDeps = {
   sql: postgres.Sql;
   storage: Storage;
-  log?: (message: string) => void;
+  log: (message: string) => void;
 };
 
 const ITEMS_PREFIX = "items/";
@@ -45,7 +50,7 @@ const STATE_KEY = "_state/collector.json";
 const ITEM_ID = /^[0-9a-f]{64}$/;
 
 export function createLoader(deps: LoaderDeps) {
-  const log = deps.log ?? (() => {});
+  const { log } = deps;
 
   // A key that cannot be read — gone between list and get, or not parquet at
   // all — is reported and left out of loaded_objects, so the next
@@ -62,7 +67,7 @@ export function createLoader(deps: LoaderDeps) {
   };
 
   const loadPending = async (): Promise<LoadResult> => {
-    const result: LoadResult = { objects: 0, inserted: 0, linked: 0, rejected: 0 };
+    const result: LoadResult = { objects: 0, inserted: 0, linked: 0, rejected: 0, failed: 0 };
     const done = await loadedKeys(deps.sql);
     const keys = (await deps.storage.list(ITEMS_PREFIX)).filter(
       (key) => key.endsWith(".parquet") && !done.has(key),
@@ -70,32 +75,28 @@ export function createLoader(deps: LoaderDeps) {
 
     for (const key of keys) {
       const raw = await readObject(key);
-      if (raw === null) continue;
+      if (raw === null) {
+        result.failed += 1;
+        continue;
+      }
 
       let rejected = 0;
-      const valid: { row: LoadRow; index: number }[] = [];
+      const valid: LoadRow[] = [];
       raw.forEach((record, index) => {
         const checked = checkRow(record);
         if ("reason" in checked) {
           rejected += 1;
           log(`${key}: rejected row ${index}: ${checked.reason}`);
         } else {
-          valid.push({ row: checked.row, index });
+          valid.push(checked.row);
         }
       });
-      // Earliest fetched_at wins a duplicate id; a tie keeps the row's
-      // position in the file, which is the order the producer wrote them.
-      valid.sort(
-        (a, b) => a.row.fetchedAt.getTime() - b.row.fetchedAt.getTime() || a.index - b.index,
-      );
+      // Earliest fetched_at wins a duplicate id. Array.prototype.sort is
+      // stable, so a tie keeps the order the producer wrote the rows in.
+      valid.sort((a, b) => a.fetchedAt.getTime() - b.fetchedAt.getTime());
 
       try {
-        const applied = await applyItemObject(
-          deps.sql,
-          key,
-          valid.map((entry) => entry.row),
-          rejected,
-        );
+        const applied = await applyItemObject(deps.sql, key, valid, rejected);
         result.objects += 1;
         result.inserted += applied.inserted;
         result.linked += applied.linked;
@@ -103,7 +104,8 @@ export function createLoader(deps: LoaderDeps) {
       } catch (error) {
         // applyItemObject is one transaction, so a failure here committed
         // nothing and the key stays out of loaded_objects for the next run.
-        log(`${key}: apply failed: ${describe(error)}`);
+        log(`${key}: apply failed, stopping this run: ${describe(error)}`);
+        throw error;
       }
     }
 
@@ -128,17 +130,21 @@ export function createLoader(deps: LoaderDeps) {
       if (bytes === null) return 0;
       const entries: Record<string, SourceFetchStateRow> = {};
       for (const [id, entry] of Object.entries(parseState(bytes).subscriptions)) {
-        entries[id] = {
-          etag: entry.etag,
-          lastModified: entry.lastModified,
-          contentHash: entry.contentHash,
-          nextFetchAt: entry.nextFetchAt,
-          lastFetchedAt: entry.lastFetchedAt,
-          lastSuccessAt: entry.lastSuccessAt,
-          consecutiveFailures: entry.consecutiveFailures,
-          lastError: entry.lastError,
-          status: entry.status,
-        };
+        const bad = (["lastFetchedAt", "lastSuccessAt"] as const).find((field) => {
+          const value: unknown = entry[field];
+          return (
+            value !== null &&
+            value !== undefined &&
+            (typeof value !== "string" || Number.isNaN(Date.parse(value)))
+          );
+        });
+        if (bad) {
+          // parseState checks nextFetchAt only, and one bad timestamp would
+          // fail the whole UPDATE; skip that source.
+          log(`${STATE_KEY}: ${id}: ${bad} is not a timestamp, skipped`);
+          continue;
+        }
+        entries[id] = entry;
       }
       return syncSourceFetchState(deps.sql, entries);
     },
@@ -151,8 +157,12 @@ function isText(value: unknown): value is string {
   return typeof value === "string";
 }
 
+// Years 1..9999: PostgreSQL's timestamptz refuses dates far outside that, and
+// one such row would fail the object's transaction on every run.
 function isDate(value: unknown): value is Date {
-  return value instanceof Date && !Number.isNaN(value.getTime());
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) return false;
+  const year = value.getUTCFullYear();
+  return year >= 1 && year <= 9999;
 }
 
 function describe(error: unknown): string {
@@ -176,14 +186,25 @@ function checkRow(raw: Record<string, unknown>): CheckedRow {
   if (!isText(raw.id) || !ITEM_ID.test(raw.id)) {
     return refuse("id", "64 lowercase hex characters");
   }
-  if (!isText(raw.url)) return refuse("url", "text");
+  if (!isText(raw.url) || raw.url === "") return refuse("url", "non-empty text");
   if (!isText(raw.canonical_url)) return refuse("canonical_url", "text");
+  // Also refuses an empty canonical_url, whose hash no valid id can match.
+  if (sha256(raw.canonical_url) !== raw.id) return refuse("id", "sha256 of canonical_url");
   if (!isDate(raw.published_at)) return refuse("published_at", "a timestamp");
   if (typeof raw.published_at_estimated !== "boolean") {
     return refuse("published_at_estimated", "a boolean");
   }
   if (!isDate(raw.fetched_at)) return refuse("fetched_at", "a timestamp");
   if (!isText(raw.source_id)) return refuse("source_id", "text");
+
+  // PostgreSQL text cannot hold U+0000; one such row would fail the object's
+  // transaction on every run.
+  // `raw` is not loaded, so only the columns that reach the database count.
+  for (const [field, value] of Object.entries(raw)) {
+    if (field !== "raw" && typeof value === "string" && value.includes("\u0000")) {
+      return refuse(field, "text without U+0000");
+    }
+  }
 
   const optional: Partial<Record<(typeof OPTIONAL_TEXT)[number], string | null>> = {};
   for (const field of OPTIONAL_TEXT) {
