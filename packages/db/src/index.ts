@@ -87,6 +87,14 @@ export {
   signalledItems,
   writeInterestProfile,
 } from "./interest.ts";
+export {
+  applyItemObject,
+  forgetLoadedObjects,
+  type LoadRow,
+  loadedKeys,
+  type SourceFetchStateRow,
+  syncSourceFetchState,
+} from "./load.ts";
 export { type MigrationResult, migrate } from "./migrate.ts";
 export {
   clusters,
@@ -102,6 +110,7 @@ export {
   itemState,
   items,
   itemTags,
+  loadedObjects,
   type NewItemRow,
   type NewSourceRow,
   type SourceRow,

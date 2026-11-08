@@ -46,7 +46,11 @@ function backoffSeconds(intervalSeconds: number, consecutiveFailures: number): n
 }
 
 /** Strip markup down to the text pgroonga will index. */
-function toSearchText(title: string | null, html: string | null, summary: string | null): string {
+export function toSearchText(
+  title: string | null,
+  html: string | null,
+  summary: string | null,
+): string {
   const body = html ?? summary ?? "";
   const stripped = body
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
