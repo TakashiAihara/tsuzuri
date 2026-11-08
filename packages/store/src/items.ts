@@ -7,8 +7,9 @@ import type { Schema } from "./parquet.ts";
 export const ITEM_SCHEMA_VERSION = 1;
 
 /**
- * The public contract for one item row. Producers outside this repository
- * (the inbox) write the same columns, so the order and types are fixed.
+ * The public contract for one item row (docs/parquet-schema.md). Producers
+ * outside this repository write the same column names and types; readers match
+ * columns by name, so the order here is only the order tsuzuri writes.
  */
 export const ITEM_SCHEMA: Schema = {
   id: "STRING",
