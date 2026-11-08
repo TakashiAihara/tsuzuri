@@ -79,6 +79,10 @@
         "zod": "^4.4.3",
       },
     },
+    "packages/store": {
+      "name": "@tsuzuri/store",
+      "version": "0.0.0",
+    },
   },
   "packages": {
     "@biomejs/biome": ["@biomejs/biome@2.5.7", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.7", "@biomejs/cli-darwin-x64": "2.5.7", "@biomejs/cli-linux-arm64": "2.5.7", "@biomejs/cli-linux-arm64-musl": "2.5.7", "@biomejs/cli-linux-x64": "2.5.7", "@biomejs/cli-linux-x64-musl": "2.5.7", "@biomejs/cli-win32-arm64": "2.5.7", "@biomejs/cli-win32-x64": "2.5.7" }, "bin": { "biome": "bin/biome" } }, "sha512-zr8K/DcY5tYsQOQwqMJ0AWElo6QgmgNI7idXgXLhevVszlt8RGVpesEJPqx3ThazLaOwjJ5Y8fz3BtH5fGZNsw=="],
@@ -120,6 +124,8 @@
     "@tsuzuri/db": ["@tsuzuri/db@workspace:packages/db"],
 
     "@tsuzuri/mcp": ["@tsuzuri/mcp@workspace:apps/mcp"],
+
+    "@tsuzuri/store": ["@tsuzuri/store@workspace:packages/store"],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

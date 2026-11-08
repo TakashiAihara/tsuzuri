@@ -19,7 +19,8 @@
     "paths": {
       "@tsuzuri/api": ["./packages/api/src/index.ts"],
       "@tsuzuri/core": ["./packages/core/src/index.ts"],
-      "@tsuzuri/db": ["./packages/db/src/index.ts"]
+      "@tsuzuri/db": ["./packages/db/src/index.ts"],
+      "@tsuzuri/store": ["./packages/store/src/index.ts"]
     }
   },
   "include": ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts", "*.ts"]
