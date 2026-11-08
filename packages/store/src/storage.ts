@@ -1,10 +1,11 @@
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
- * The store of record: append-only objects addressed by "/"-separated keys.
- * `file://` and `s3://` implementations must behave identically, because the
- * collector, viewer and other producers share the same prefixes.
+ * The store of record: objects addressed by "/"-separated keys. `file://` and
+ * `s3://` implementations must behave identically, because the collector,
+ * viewer and other producers share the same prefixes. The store is not
+ * append-only: `put` overwrites, and `_state` documents rely on that.
  */
 export type Storage = {
   /** Short identifier for logs, e.g. "file:///data" or "s3://bucket". */
@@ -20,30 +21,54 @@ export type Storage = {
 
 type Env = Record<string, string | undefined>;
 
-const OUTSIDE_ROOT = "outside the storage root";
+// One key rule for both backends, applied with no normalisation: a key is
+// "/"-separated segments matching SEGMENT — ASCII only, no empty segment and
+// no leading dot, so "." and ".." cannot appear — and an object key does not
+// end in "/". A list prefix follows the same rule but may be empty and may end
+// in "/", its last segment being only a partial match.
+const SEGMENT = /^[A-Za-z0-9_=-][A-Za-z0-9._=-]*$/;
 
-function isENOENT(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === "ENOENT";
+function invalidKey(key: string): Error {
+  return new Error(`invalid storage key ${JSON.stringify(key)}`);
 }
 
-// fileStorage keeps one directory as the root; keys are relative paths inside it.
-// The root is resolved once so locate() always reports an absolute path.
+function assertKey(key: string): void {
+  // A trailing "/" leaves an empty last segment, which SEGMENT refuses.
+  for (const segment of key.split("/")) {
+    if (!SEGMENT.test(segment)) throw invalidKey(key);
+  }
+}
+
+function assertPrefix(prefix: string): void {
+  if (prefix === "") return;
+  const body = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
+  for (const segment of body.split("/")) {
+    if (!SEGMENT.test(segment)) throw invalidKey(prefix);
+  }
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+// fileStorage keeps one directory as the root; keys are paths inside it, and
+// the shared key rule is also what keeps them inside the root. The root is
+// resolved once so locate() always reports an absolute path. put writes a
+// temporary file and renames it over the target, so a reader sees the old or
+// the new object, never a partial one. Symlinks inside the root are followed,
+// not defended against.
 export function fileStorage(root: string): Storage {
   const rootDir = resolve(root);
 
-  const resolveKey = (key: string): string => {
-    const path = resolve(rootDir, key);
-    const rel = relative(rootDir, path);
-    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      throw new Error(`key ${JSON.stringify(key)} is ${OUTSIDE_ROOT}`);
-    }
-    return path;
-  };
+  const pathFor = (key: string): string => join(rootDir, key);
 
   const walk = async (dir: string): Promise<string[]> => {
     const names: string[] = [];
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
+      // Names outside the key rule (the dot-prefixed temporary files of an
+      // in-flight put, editor droppings) are not objects.
+      if (!SEGMENT.test(entry.name)) continue;
       if (entry.isDirectory()) {
         names.push(...(await walk(path)));
       } else if (entry.isFile()) {
@@ -56,73 +81,92 @@ export function fileStorage(root: string): Storage {
   return {
     describe: () => `file://${rootDir}`,
     put: async (key, data) => {
-      const path = resolveKey(key);
+      assertKey(key);
+      const path = pathFor(key);
       await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, data);
+      // The temporary file sits in the same directory so the rename stays on
+      // one filesystem and replaces the target atomically. Its leading dot
+      // breaks the key rule, so a concurrent list never returns it.
+      const tmp = join(dirname(path), `.${basename(path)}.${crypto.randomUUID()}.tmp`);
+      try {
+        await writeFile(tmp, data);
+        await rename(tmp, path);
+      } catch (error) {
+        await rm(tmp, { force: true }).catch(() => {});
+        throw error;
+      }
     },
     get: async (key) => {
+      assertKey(key);
       try {
-        const bytes = await readFile(resolveKey(key));
-        return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        return await readFile(pathFor(key));
       } catch (error) {
-        if (isENOENT(error)) return null;
+        const code = errnoCode(error);
+        if (code === "ENOENT" || code === "EISDIR" || code === "ENOTDIR") return null;
         throw error;
       }
     },
     list: async (prefix) => {
-      resolveKey(prefix);
-      // The scan starts at the prefix's directory part; the full prefix is
-      // still applied as a literal string filter so "items/" cannot match
-      // "itemsextra/..." while "items" can.
-      const scanDir = resolveKey(prefix.slice(0, prefix.lastIndexOf("/") + 1));
+      assertPrefix(prefix);
+      // Only the prefix's directory part is walked, which already keeps
+      // "items/" out of "itemsextra/". The string filter is what applies a
+      // partial last segment, as in "items/dt=2026-11-08/a".
+      const scanDir = join(rootDir, prefix.slice(0, prefix.lastIndexOf("/") + 1));
       let names: string[];
       try {
         names = await walk(scanDir);
       } catch (error) {
-        if (isENOENT(error)) return [];
+        const code = errnoCode(error);
+        if (code === "ENOENT" || code === "ENOTDIR") return [];
         throw error;
       }
       return names.filter((name) => name.startsWith(prefix)).sort();
     },
-    locate: (key) => resolveKey(key),
+    locate: (key) => {
+      assertKey(key);
+      return pathFor(key);
+    },
   };
 }
 
-// S3 keys have no filesystem semantics, so "." and ".." segments are resolved
-// by hand; a key is refused only when that resolution would leave the bucket.
-function assertS3Key(key: string): void {
-  if (key.startsWith("/")) {
-    throw new Error(`key ${JSON.stringify(key)} is ${OUTSIDE_ROOT}`);
-  }
-  let depth = 0;
-  for (const segment of key.split("/")) {
-    if (segment === "..") {
-      if (depth === 0) {
-        throw new Error(`key ${JSON.stringify(key)} is ${OUTSIDE_ROOT}`);
-      }
-      depth--;
-    } else if (segment !== "" && segment !== ".") {
-      depth++;
-    }
-  }
-}
+/**
+ * The slice of Bun.S3Client the backend uses, so tests can inject a fake.
+ */
+export type S3Like = {
+  write(key: string, data: Uint8Array | string): Promise<unknown>;
+  file(key: string): {
+    exists(): Promise<boolean>;
+    arrayBuffer(): Promise<ArrayBuffer>;
+  };
+  list(input: { prefix?: string; continuationToken?: string }): Promise<{
+    contents?: { key: string }[];
+    isTruncated?: boolean;
+    nextContinuationToken?: string;
+  }>;
+};
 
-function normalizeS3Key(key: string): string {
-  assertS3Key(key);
-  const parts: string[] = [];
-  for (const segment of key.split("/")) {
-    if (segment === "..") parts.pop();
-    else if (segment !== "" && segment !== ".") parts.push(segment);
-  }
-  return parts.join("/");
+/**
+ * The Bun.S3Client options for `bucket`, read from the standard AWS_* names in
+ * `env` rather than process.env. Any option left undefined falls back to Bun's
+ * own reading of process.env.
+ */
+export function s3ClientOptions(bucket: string, env: Env = process.env): Bun.S3Options {
+  return {
+    bucket,
+    accessKeyId: env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+    sessionToken: env.AWS_SESSION_TOKEN,
+    endpoint: env.AWS_ENDPOINT_URL_S3,
+    region: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
+  };
 }
 
 /**
- * Any S3-compatible bucket (R2 included) through Bun's built-in client.
- * Credentials come from the standard AWS_* names in `env`, not process.env,
- * so tests and callers can pass an explicit environment.
+ * Any S3-compatible bucket (R2 included) through Bun's built-in client, or an
+ * injected S3Like. Credentials come from the standard AWS_* names in `env`, not
+ * process.env, so tests and callers can pass an explicit environment.
  */
-export function s3Storage(bucket: string, env: Env = process.env): Storage {
+export function s3Storage(bucket: string, env: Env = process.env, client?: S3Like): Storage {
   const missing = (["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] as const).filter(
     (name) => !env[name],
   );
@@ -130,50 +174,50 @@ export function s3Storage(bucket: string, env: Env = process.env): Storage {
     throw new Error(`s3://${bucket} needs ${missing.join(", ")}`);
   }
 
-  const client = new Bun.S3Client({
-    bucket,
-    accessKeyId: env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-    endpoint: env.AWS_ENDPOINT_URL_S3,
-    region: env.AWS_REGION,
-  });
+  const s3: S3Like = client ?? new Bun.S3Client(s3ClientOptions(bucket, env));
 
   return {
     describe: () => `s3://${bucket}`,
     put: async (key, data) => {
-      await client.write(normalizeS3Key(key), data);
+      assertKey(key);
+      await s3.write(key, data);
     },
     get: async (key) => {
-      const file = client.file(normalizeS3Key(key));
+      assertKey(key);
+      const file = s3.file(key);
       if (!(await file.exists())) return null;
       return new Uint8Array(await file.arrayBuffer());
     },
     list: async (prefix) => {
-      assertS3Key(prefix);
+      assertPrefix(prefix);
       const keys: string[] = [];
+      const seenTokens = new Set<string>();
       let continuationToken: string | undefined;
-      let startAfter: string | undefined;
       for (;;) {
-        const page = await client.list({
+        const page = await s3.list({
           prefix,
           ...(continuationToken !== undefined ? { continuationToken } : {}),
-          ...(startAfter !== undefined ? { startAfter } : {}),
         });
         for (const object of page.contents ?? []) keys.push(object.key);
         if (!page.isTruncated) break;
-        if (page.nextContinuationToken) {
-          continuationToken = page.nextContinuationToken;
-          startAfter = undefined;
-        } else {
-          const last = page.contents?.at(-1)?.key;
-          if (last === undefined) break;
-          startAfter = last;
-          continuationToken = undefined;
+        const next = page.nextContinuationToken;
+        if (next === undefined) {
+          throw new Error(`s3://${bucket} list was truncated but returned no continuation token`);
         }
+        if (seenTokens.has(next)) {
+          throw new Error(
+            `s3://${bucket} list repeated continuation token ${JSON.stringify(next)}`,
+          );
+        }
+        seenTokens.add(next);
+        continuationToken = next;
       }
       return keys.sort();
     },
-    locate: (key) => `s3://${bucket}/${normalizeS3Key(key)}`,
+    locate: (key) => {
+      assertKey(key);
+      return `s3://${bucket}/${key}`;
+    },
   };
 }
 
@@ -199,6 +243,9 @@ export function storageFromEnv(
   }
   if (value.startsWith("file://")) {
     const dir = value.slice("file://".length);
+    if (dir === "") {
+      throw new Error(`TSUZURI_STORAGE ${JSON.stringify(value)} must be file://<dir>`);
+    }
     return fileStorage(isAbsolute(dir) ? dir : resolve(cwd, dir));
   }
   if (value.startsWith("s3://")) {

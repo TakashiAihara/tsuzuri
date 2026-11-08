@@ -146,6 +146,12 @@ describe("fileStorage edge cases", () => {
     expect(await storage.get("items")).toBeNull();
   });
 
+  test("get under a key that is a file on disk is null", async () => {
+    const storage = fileStorage(root);
+    await storage.put("items/a.parquet", "x");
+    expect(await storage.get("items/a.parquet/x")).toBeNull();
+  });
+
   test("list under a key that is a file on disk is empty", async () => {
     const storage = fileStorage(root);
     await storage.put("items/a.parquet", "x");
@@ -169,6 +175,13 @@ describe("fileStorage edge cases", () => {
 
     expect(after).not.toBe(before);
     expect(await readdir(join(root, "_state"))).toEqual(["collector.json"]);
+  });
+
+  test("list skips files outside the key rule, such as an in-flight put's temporary file", async () => {
+    const storage = fileStorage(root);
+    await storage.put("_state/collector.json", "x");
+    await Bun.write(join(root, "_state/.collector.json.0000.tmp"), "partial");
+    expect(await storage.list("_state/")).toEqual(["_state/collector.json"]);
   });
 
   test("a relative root is resolved to an absolute path", () => {
