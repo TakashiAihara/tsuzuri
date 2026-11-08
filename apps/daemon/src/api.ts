@@ -190,6 +190,9 @@ export function createApi(deps: ApiDeps) {
     // tick starts first, so fetching does not wait behind them.
     const earlier = loads.settled();
     const ticking = collector.tick(rows.map(toSubscription), { force: all });
+    // A tick that rejects while this waits must not be an unhandled
+    // rejection; `await ticking` below still throws it.
+    ticking.catch(() => undefined);
     await earlier;
     const before = loads.totals();
     const { subscriptions: outcomes, busy } = await ticking;
