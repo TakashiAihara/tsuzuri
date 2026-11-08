@@ -73,7 +73,7 @@ Names decided 2026-11-08. They are a public contract, because other producers wr
 | `derived/enrichments/`, `derived/embeddings/<model>/` | AI outputs (step 7) | enrichment and embedding workers | append |
 | `_state/collector.json` | Fetch state per subscription: ETag, Last-Modified, content hash, recent item ids, next due time, failures | collector | overwritten each run |
 
-- One file per collector run, not per subscription. With a few hundred subscriptions on a 30-minute to hourly cycle, a file per subscription is thousands of small objects a day; one per run is a few dozen. Compaction merges a day into one file.
+- One file per flush, not per subscription and not per scheduler tick. The scheduler keeps its 30-second tick and fetches whatever is due, but the collector buffers the normalised items and writes one Parquet file at most every five minutes (and on shutdown), followed by `_state` and `_runs`. That caps objects at 288 a day; a file per tick would be up to 2,880, and a file per subscription thousands. A "run" (`runId`) is one flush. Compaction merges a day into one file. A crash loses the buffer, but `_state` was not advanced for those items either, so the next fetch writes them again.
 - `items` carries `source_id` and `fetched_at` on every row, so the many-to-many `item_sources` table is derived from it. Rows whose `source_id` is not a current subscription still load as items, but get no `item_sources` row; this matches what unsubscribing does today (the `item_sources` rows cascade away, the items stay).
 - When the same item id arrives more than once with different content, the row with the earliest `fetched_at` wins, ties broken by object key and then row position. That is what ingest does today (the first stored copy is kept). The loader applies rows in that order, and compaction keeps only the winning row per id, so a normal load and a rebuild end with the same text.
 - The collector does not rewrite items it has already written. It keeps the ids of each subscription's recent items in `_state` and skips them. A duplicate that slips past the window (an old item reappearing in a feed) is harmless: the loader's insert is `ON CONFLICT DO NOTHING` today and stays so, and compaction drops exact duplicates.
@@ -81,7 +81,7 @@ Names decided 2026-11-08. They are a public contract, because other producers wr
 
 ### Item schema
 
-The Parquet columns are the existing `items` columns that ingest writes (`id`, `url`, `canonical_url`, `title`, `author`, `guid`, `published_at`, `published_at_estimated`, `content_html`, `summary`, `fetched_at`) plus `source_id`, a `schema_version` integer, and `raw`: the item as the source produced it before normalisation (for a feed, the entry's fields as strings, original date text included), serialised as JSON. `search_text` is not stored: the loader derives it, as ingest does now. The schema is documented in `docs/parquet-schema.md` as a public contract, because producers outside this repository write it.
+The Parquet columns are the existing `items` columns that ingest writes (`id`, `url`, `canonical_url`, `title`, `author`, `guid`, `published_at`, `published_at_estimated`, `content_html`, `summary`, `fetched_at`) plus `source_id`, a `schema_version` integer, and `raw`: the item as the source produced it before normalisation (for a feed, the entry's fields as strings, original date text included), serialised as JSON. JSON values (`raw` here, `payload` in events) are stored as STRING columns holding JSON text, not as Parquet MAP or STRUCT, so the column set does not change with what a source returns. `search_text` is not stored: the loader derives it, as ingest does now. Step 2 writes the schema down in `docs/parquet-schema.md` as a public contract, because producers outside this repository write it.
 
 ### Events
 
@@ -93,7 +93,7 @@ The Parquet columns are the existing `items` columns that ingest writes (`id`, `
 
 ## Steps
 
-Each step is one PR that leaves `main` working, with its own end-to-end check. The rebuild check introduced in step 2 is extended by every later step: perform the step's user actions through the API, discard what the step has made derived, run `tsuzuri rebuild`, and compare. In step 2 that is only the ingested rows (`items`, `item_sources` and what P2/P3 compute from them); subscriptions and item state are still only in PostgreSQL and are kept. From step 4 on nothing in PostgreSQL is primary, and the check drops the whole database.
+Each step is one PR that leaves `main` working, with its own end-to-end check. The rebuild check introduced in step 2 is extended by every later step: perform the step's user actions through the API, discard what the step has made derived, run `tsuzuri rebuild`, and compare. In step 2 that is only the ingested rows: the check deletes items no `item_state` row points at (with their `item_sources` and P2/P3 rows), clears the loaded-objects table, rebuilds, and compares; it never deletes items that have state, because `item_state` references `items` with `ON DELETE CASCADE` and state is still only in PostgreSQL. From step 4 on nothing in PostgreSQL is primary, and the check drops the whole database.
 
 ```mermaid
 flowchart LR
@@ -109,16 +109,17 @@ flowchart LR
 
 - `packages/store`: a `Storage` interface (`put`, `get`, `list`, `locate`) with `file://` and `s3://` implementations. Bun's built-in S3 client covers any S3-compatible endpoint, R2 included.
 - Configuration: `TSUZURI_STORAGE` is `file://<dir>` or `s3://<bucket>`. Credentials and endpoint are the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION`); R2 is selected by setting the endpoint. The default is `file://./data`, so a first run works with no configuration and the daemon reads what it wrote. The standalone `tsuzuri collect` (step 3) has no default and refuses to start without `TSUZURI_STORAGE`, because a cron job that lost its environment would otherwise write to a directory nobody reads.
-- Parquet write and read helpers on `hyparquet` and `hyparquet-writer` (pure JavaScript). Measured 2026-11-08 with Bun 1.4.3 on linux-x64: `@duckdb/node-api` does not survive `bun build --compile` (it requires every platform's binding at bundle time, and with those marked external the binary still fails with `libduckdb.so: cannot open shared object file`), which would rule out single-binary distribution (issue #17). A compiled binary using `hyparquet-writer` wrote and read back STRING, TIMESTAMP (with a null) and INT32 columns, and DuckDB read the same file with identical values, so users can still analyse it with DuckDB.
+- Parquet write and read helpers on `hyparquet` and `hyparquet-writer` (pure JavaScript). Measured 2026-11-08 with Bun 1.4.3 on linux-x64: `@duckdb/node-api` does not survive `bun build --compile` (it requires every platform's binding at bundle time, and with those marked external the binary still fails with `libduckdb.so: cannot open shared object file`), which would rule out single-binary distribution (issue #17). A compiled binary using `hyparquet-writer` wrote and read back STRING, TIMESTAMP (with a null) and INT32 columns, and DuckDB read the same file with identical values, so users can still analyse it with DuckDB. The step's tests also round-trip BOOLEAN and DOUBLE, nulls in every type, and long Japanese text; JSON goes in STRING columns, so these five types cover the schemas above.
 - No behaviour change. Covers issue #9 (object storage for original HTML) at the interface level; retained HTML can use the same provider later.
 
 ### 2. Collector writes Parquet, loader fills PostgreSQL, `rebuild`
 
 - `ingestSource` stops inserting into `items` and `item_sources`. A run collects the normalised items of every due subscription and appends one Parquet file, then writes `_state` and `_runs`.
-- Fetch state (`etag`, `last_modified`, `content_hash`, `next_fetch_at`, `consecutive_failures`, `last_error`) moves from `sources` columns to `_state`. The `sources` columns stay readable for `GET /sources` and `doctor`, filled by the loader from `_runs`.
-- The subscription list still comes from PostgreSQL in this step: the daemon reads the due subscriptions and passes them to the collector as arguments, so the collector code itself never opens a database connection. Step 3 moves the list to storage, after which the collector can run without the daemon.
-- New loader worker: lists objects it has not loaded, inserts items and item_sources, marks the objects loaded. Runs on the scheduler tick after the collector.
-- New `tsuzuri rebuild`: discards the derived rows and reloads them from storage. In this step that leaves `sources` and `item_state` alone, because storage does not have them yet.
+- Fetch state (`etag`, `last_modified`, `content_hash`, `next_fetch_at`, `consecutive_failures`, `last_error`, and the `degraded` status transition) moves from `sources` columns to `_state`, and the collector decides which subscriptions are due from it. The `sources` columns stay readable for `GET /sources` and `doctor`; the loader copies them back from `_state` after each flush. The `sources_due` index stops being used.
+- The subscription list still comes from PostgreSQL in this step: the daemon reads all subscriptions (not only due ones) and passes them to the collector as arguments, so the collector code itself never opens a database connection. Step 3 moves the list to storage, after which the collector can run without the daemon.
+- New loader worker: lists objects it has not loaded, and for each object inserts its items and item_sources and marks the object loaded in one transaction. Marking it loaded before the rows commit would skip that object's items for good after a crash; loading twice is harmless (row-level idempotency above), so nothing is gained by the other order. Runs after each flush.
+- New `tsuzuri rebuild`: clears the loaded-objects table and applies every object again. In this step it does not delete items first: deleting `items` would cascade into `item_state`, which storage does not have yet.
+- New `docs/parquet-schema.md`: the item schema, `schema_version` 1.
 - Migration `0007` adds the loaded-objects table. The `sources` fetch-state columns are dropped in step 3, not here, so this step is reversible.
 
 ### 3. Subscriptions as events
@@ -143,7 +144,8 @@ flowchart LR
 ### 6. Inbox for other producers
 
 - The loader also lists `inbox/*/`. Rows are validated against the published schema; a file that fails validation is recorded as rejected with the reason and skipped, never partially loaded, and the rest of the inbox continues.
-- Items from the inbox appear under a subscription of kind `inbox` per producer, so they can be unsubscribed, filtered and scored like any feed.
+- A producer is subscribed explicitly, like a feed: `tsuzuri subscribe inbox:<producer>` appends a `subscribe` event with kind `inbox`. The loader loads only producers with a current subscription; files from any other producer stay in storage unloaded, and subscribing later loads everything already there. Unsubscribing stops loading new files and removes the `item_sources` rows, as for feeds. Nothing subscribes automatically, so nothing besides the viewer writes events.
+- Migration adds `inbox` to the `sources.kind` CHECK constraint, and the zod enums in `packages/core` and `packages/api` gain the same value.
 - Changes on the producer side are out of scope for this repository.
 
 ### 7. AI outputs in storage
@@ -176,7 +178,7 @@ Checked before or during step 1, not assumed:
 
 - DuckDB reads R2 through a `TYPE s3` secret with a custom endpoint and `s3://` URLs. Another project found `TYPE r2` secrets apply only to `r2://` URLs; whether the generic S3 form works against R2 is not measured.
 - `hyparquet-writer` inside `bun build --compile` output on darwin and on arm64 (only linux-x64 was measured).
-- Listing cost: R2 counts `ListObjects` as a Class A operation. The loader lists on every tick; at a 30-second tick that is about 86,000 lists a month, under the free tier of one million, but it is an estimate, not a measurement.
+- Listing cost: R2 counts `ListObjects` as a Class A operation. The loader lists after each flush, at most every five minutes: about 8,600 lists a month for `items/`, plus the same again for `events/` and `inbox/` once those steps land. Under the free tier of one million, but an estimate, not a measurement.
 
 ## Open decisions
 
