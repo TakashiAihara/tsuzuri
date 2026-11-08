@@ -9,6 +9,7 @@
     "@tsuzuri/api": "workspace:*",
     "@tsuzuri/core": "workspace:*",
     "@tsuzuri/db": "workspace:*",
+    "@tsuzuri/store": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "fast-xml-parser": "^5.4.0",
     "hono": "^4.13.1",
