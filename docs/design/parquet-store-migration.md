@@ -13,7 +13,7 @@ Status: plan, not built. The open decisions listed at the end were settled on 20
 
 - Backups and durability move to the storage provider instead of being a PostgreSQL dump someone has to run.
 - The raw articles can be analysed directly with DuckDB or any Parquet reader, without going through the daemon.
-- The record is append-only. When extraction or enrichment changes, past items can be reprocessed from what was fetched rather than from what was derived.
+- The record is append-only and keeps each item as the source delivered it (the `raw` column below). When normalisation, extraction or enrichment changes, past items can be reprocessed from what was fetched rather than from what was derived. Retained original HTML pages are a separate matter, issue #9.
 - Other collectors can feed the reader by writing files, which a feed (latest run only, capped length) cannot do without losing items fetched between polls.
 
 PostgreSQL is kept rather than reading Parquet directly with DuckDB at view time: DuckDB's full-text search has no morphological analysis and handles Japanese poorly, and fetching from object storage on every page view is slow.
@@ -74,24 +74,26 @@ Names decided 2026-11-08. They are a public contract, because other producers wr
 | `_state/collector.json` | Fetch state per subscription: ETag, Last-Modified, content hash, recent item ids, next due time, failures | collector | overwritten each run |
 
 - One file per collector run, not per subscription. With a few hundred subscriptions on a 30-minute to hourly cycle, a file per subscription is thousands of small objects a day; one per run is a few dozen. Compaction merges a day into one file.
-- `items` carries `source_id` and `fetched_at` on every row, so the many-to-many `item_sources` table is derived from it.
+- `items` carries `source_id` and `fetched_at` on every row, so the many-to-many `item_sources` table is derived from it. Rows whose `source_id` is not a current subscription still load as items, but get no `item_sources` row; this matches what unsubscribing does today (the `item_sources` rows cascade away, the items stay).
+- When the same item id arrives more than once with different content, the row with the earliest `fetched_at` wins, ties broken by object key and then row position. That is what ingest does today (the first stored copy is kept). The loader applies rows in that order, and compaction keeps only the winning row per id, so a normal load and a rebuild end with the same text.
 - The collector does not rewrite items it has already written. It keeps the ids of each subscription's recent items in `_state` and skips them. A duplicate that slips past the window (an old item reappearing in a feed) is harmless: the loader's insert is `ON CONFLICT DO NOTHING` today and stays so, and compaction drops exact duplicates.
 - `_state` is written after the run's Parquet file, never before. A crash between the two refetches the same items next run, which the previous point makes harmless. The reverse order would advance the ETag past items never stored, which is the failure the current single-transaction ingest exists to prevent.
 
 ### Item schema
 
-The Parquet columns are the existing `items` columns that ingest writes (`id`, `url`, `canonical_url`, `title`, `author`, `guid`, `published_at`, `published_at_estimated`, `content_html`, `summary`, `fetched_at`) plus `source_id` and a `schema_version` integer. `search_text` is not stored: the loader derives it, as ingest does now. The schema is documented in `docs/parquet-schema.md` as a public contract, because producers outside this repository write it.
+The Parquet columns are the existing `items` columns that ingest writes (`id`, `url`, `canonical_url`, `title`, `author`, `guid`, `published_at`, `published_at_estimated`, `content_html`, `summary`, `fetched_at`) plus `source_id`, a `schema_version` integer, and `raw`: the item as the source produced it before normalisation (for a feed, the entry's fields as strings, original date text included), serialised as JSON. `search_text` is not stored: the loader derives it, as ingest does now. The schema is documented in `docs/parquet-schema.md` as a public contract, because producers outside this repository write it.
 
 ### Events
 
-- One event table, with a `kind` column: `subscribe`, `unsubscribe`, `update_subscription`, `read`, `unread`, `star`, `unstar`, `skip`, `save`. Columns: `event_id`, `kind`, `user_id`, `at`, `item_id` (item events), `source_id` and a JSON `payload` (subscription events: url, kind, config, title).
+- One event table, with a `kind` column: `subscribe`, `unsubscribe`, `update_subscription`, `read`, `unread`, `star`, `unstar`, `skip`, `unskip`, `approve_tag`, `reject_tag`. Columns: `event_id`, `kind`, `user_id`, `at`, `item_id` (item events), `source_id`, `tag` (tag events) and a JSON `payload` (subscription events: url, kind, config, title, site_url, fetch_interval_seconds — every column a subscription can be created or updated with today).
 - Subscriptions are events too, rather than one JSON object rewritten on change. A rewritten object needs a conditional write (`If-Match`) to stop the CLI and the Web UI from overwriting each other; appending events needs no coordination and reuses the item-state machinery. Whether the providers and Bun's client support conditional writes was not checked, because this choice does not depend on it.
-- Current state is the last event per (user, item) or per subscription. Daily compaction writes a snapshot of current state and drops the events it covers, so a rebuild reads one snapshot plus the days since.
-- The viewer buffers events and flushes them every few seconds and on shutdown. The buffer is spooled to a local file first, so a crash loses nothing that was acknowledged to the user. Without the spool, the PostgreSQL row would show an item as read until the next rebuild silently unread it.
+- Current state is folded per state, not per item: the last of `read`/`unread` sets `read_at`, the last of `star`/`unstar` sets `starred_at`, and the last of `skip`/`unskip` sets `skipped_at`, matching the separate columns of `item_state` (`saved_at` exists but nothing writes it yet; its events are added with whatever first does). Subscriptions fold to the last event per subscription, tags to the last decision per tag. Daily compaction writes a snapshot of current state and drops the events it covers, so a rebuild reads one snapshot plus the days since.
+- The viewer buffers events and flushes them every few seconds and on shutdown. The buffer is spooled to a local file first, so a process crash or restart loses nothing that was acknowledged to the user. Without the spool, the PostgreSQL row would show an item as read until the next rebuild silently unread it.
+- Losing the host's disk inside the flush window does lose those few seconds of actions. This is accepted: writing to storage before answering would put an object-storage round trip and one tiny object behind every click, and what is at risk is read and star marks, not articles.
 
 ## Steps
 
-Each step is one PR that leaves `main` working, with its own end-to-end check. The rebuild check introduced in step 2 is extended by every later step: perform the step's user actions through the API, drop the database, run `tsuzuri rebuild`, and compare.
+Each step is one PR that leaves `main` working, with its own end-to-end check. The rebuild check introduced in step 2 is extended by every later step: perform the step's user actions through the API, discard what the step has made derived, run `tsuzuri rebuild`, and compare. In step 2 that is only the ingested rows (`items`, `item_sources` and what P2/P3 compute from them); subscriptions and item state are still only in PostgreSQL and are kept. From step 4 on nothing in PostgreSQL is primary, and the check drops the whole database.
 
 ```mermaid
 flowchart LR
@@ -116,7 +118,7 @@ flowchart LR
 - Fetch state (`etag`, `last_modified`, `content_hash`, `next_fetch_at`, `consecutive_failures`, `last_error`) moves from `sources` columns to `_state`. The `sources` columns stay readable for `GET /sources` and `doctor`, filled by the loader from `_runs`.
 - The subscription list still comes from PostgreSQL in this step: the daemon reads the due subscriptions and passes them to the collector as arguments, so the collector code itself never opens a database connection. Step 3 moves the list to storage, after which the collector can run without the daemon.
 - New loader worker: lists objects it has not loaded, inserts items and item_sources, marks the objects loaded. Runs on the scheduler tick after the collector.
-- New `tsuzuri rebuild`: drops derived rows and reloads from storage.
+- New `tsuzuri rebuild`: discards the derived rows and reloads them from storage. In this step that leaves `sources` and `item_state` alone, because storage does not have them yet.
 - Migration `0007` adds the loaded-objects table. The `sources` fetch-state columns are dropped in step 3, not here, so this step is reversible.
 
 ### 3. Subscriptions as events
@@ -124,12 +126,14 @@ flowchart LR
 - `POST /sources`, `DELETE /sources/:id` and OPML import append subscription events and update `sources` in the same request. OPML export reads current state.
 - The collector reads the subscription list by folding events from storage, so it no longer needs the daemon. `tsuzuri collect --due` runs it standalone.
 - `sources` becomes derived: rebuild recreates it from events.
+- Subscriptions added while step 2 was deployed exist only in `sources`. On the first start after this step, if storage holds no subscription events yet, the daemon writes one `subscribe` event per existing `sources` row before the collector reads the list. Not a data export of old installations (none is needed); it carries the rows step 2 itself created across the switch.
 
 ### 4. Read and star as events
 
 - `POST /items/:id/state` appends item-state events through the spooled buffer and keeps updating `item_state` immediately.
 - Cluster-scope reads (D24 in the P3 design: reading a collapsed row reads its members) are written as one event per member item, not one per cluster. Cluster membership is derived and can change on rebuild; the event must record what the user actually marked.
 - Interest scoring reads `item_state` as before; its signals survive a rebuild because `item_state` does.
+- Same carry-over as step 3: on the first start, if storage holds no item-state events, the daemon writes events for the existing `item_state` rows.
 
 ### 5. Compaction
 
@@ -144,7 +148,7 @@ flowchart LR
 
 ### 7. AI outputs in storage
 
-Decided 2026-11-08: AI outputs are kept in storage. Enrichments (summary, translation, tags) and embeddings are appended to `derived/enrichments/` and `derived/embeddings/<model>/`, and rebuild loads them instead of recomputing. Clustering, SimHash and interest profiles are recomputed: they are cheap and depend on settings that may have changed.
+Decided 2026-11-08: AI outputs are kept in storage. Enrichments (summary, translation, tags) and embeddings are appended to `derived/enrichments/` and `derived/embeddings/<model>/`, and rebuild loads them instead of recomputing. Clustering, SimHash and interest profiles are recomputed: they are cheap and depend on settings that may have changed. Tag approvals and rejections are user decisions, not AI output, so `POST /tags/:slug/approve` and `/reject` append `approve_tag` / `reject_tag` events from this step, with the same first-start carry-over of existing decisions.
 
 ## Effect on existing issues
 
