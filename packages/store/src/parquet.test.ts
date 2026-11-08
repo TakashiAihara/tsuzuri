@@ -1,6 +1,55 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { parquetMetadata } from "hyparquet";
 
-import { readParquet, type Schema, writeParquet } from "./parquet.ts";
+import {
+  type ColumnType as ColumnTypeName,
+  readParquet,
+  type Schema,
+  writeParquet,
+} from "./parquet.ts";
+
+function metadataOf(bytes: Uint8Array) {
+  return parquetMetadata(bytes.slice().buffer);
+}
+
+describe("file format", () => {
+  test("pins SNAPPY compression and millisecond INT64 timestamps, because files are a public contract", () => {
+    const meta = metadataOf(
+      writeParquet([{ at: new Date(0), s: "x" }], { at: "TIMESTAMP", s: "STRING" }),
+    );
+    expect(meta.row_groups[0]?.columns.map((column) => column.meta_data?.codec)).toEqual([
+      "SNAPPY",
+      "SNAPPY",
+    ]);
+    const at = meta.schema.find((element) => element.name === "at");
+    expect(at?.type).toBe("INT64");
+    expect(at?.converted_type).toBe("TIMESTAMP_MILLIS");
+  });
+
+  test("a zero-row file still declares every schema column", () => {
+    const meta = metadataOf(writeParquet([], { id: "STRING", n: "INT32" }));
+    expect(meta.schema.slice(1).map((element) => element.name)).toEqual(["id", "n"]);
+  });
+
+  test("reads a zstd file written by another tool", async () => {
+    const bytes = new Uint8Array(
+      await Bun.file(join(import.meta.dir, "fixtures/zstd.parquet")).arrayBuffer(),
+    );
+    expect(await readParquet(bytes)).toEqual([
+      { id: "z-0", n: 0n },
+      { id: "z-1", n: 1n },
+      { id: "z-2", n: 2n },
+    ]);
+  });
+
+  test("reads from a view that does not start at the beginning of its buffer", async () => {
+    const file = writeParquet([{ id: "a" }], { id: "STRING" });
+    const padded = new Uint8Array(file.byteLength + 7);
+    padded.set(file, 7);
+    expect(await readParquet(padded.subarray(7))).toEqual([{ id: "a" }]);
+  });
+});
 
 const SCHEMA = {
   id: "STRING",
@@ -58,12 +107,37 @@ describe("writeParquet / readParquet", () => {
   });
 
   test("refuses a value of the wrong type instead of coercing it", () => {
-    expect(() => writeParquet([{ n: "12" }], { n: "INT32" })).toThrow('column "n"');
-    expect(() => writeParquet([{ n: 1.5 }], { n: "INT32" })).toThrow('column "n"');
-    expect(() => writeParquet([{ n: 2147483648 }], { n: "INT32" })).toThrow('column "n"');
-    expect(() => writeParquet([{ n: -2147483649 }], { n: "INT32" })).toThrow('column "n"');
-    expect(() => writeParquet([{ at: "2026-11-08" }], { at: "TIMESTAMP" })).toThrow('column "at"');
-    expect(() => writeParquet([{ ok: 1 }], { ok: "BOOLEAN" })).toThrow('column "ok"');
+    const refused: [ColumnTypeName, unknown][] = [
+      ["INT32", "12"],
+      ["INT32", 1.5],
+      ["INT32", 2147483648],
+      ["INT32", -2147483649],
+      ["TIMESTAMP", "2026-11-08"],
+      ["TIMESTAMP", 0],
+      ["TIMESTAMP", new Date(Number.NaN)],
+      ["BOOLEAN", 1],
+      ["STRING", 5],
+      ["DOUBLE", "1.5"],
+      ["DOUBLE", Number.NaN],
+      ["DOUBLE", Number.POSITIVE_INFINITY],
+    ];
+    for (const [type, value] of refused) {
+      expect(() => writeParquet([{ v: value }], { v: type }), `${type} ${String(value)}`).toThrow(
+        `column "v": expected ${type}`,
+      );
+    }
+  });
+
+  test("accepts both INT32 bounds", async () => {
+    const back = await readParquet(
+      writeParquet([{ n: 2147483647 }, { n: -2147483648 }], { n: "INT32" }),
+    );
+    expect(back).toEqual([{ n: 2147483647 }, { n: -2147483648 }]);
+  });
+
+  test("names the offending row, so a bad value in a large batch can be found", () => {
+    const rows = [{ n: 1 }, { n: 2 }, { n: 3 }, { n: "4" }, { n: 5 }];
+    expect(() => writeParquet(rows, { n: "INT32" })).toThrow('row 3, column "n"');
   });
 
   test("writes zero rows as a readable file with the declared columns", async () => {

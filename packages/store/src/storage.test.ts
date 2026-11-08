@@ -1,9 +1,24 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { fileStorage, s3Storage, storageFromEnv } from "./storage.ts";
+import { fileStorage, type S3Like, s3ClientOptions, s3Storage, storageFromEnv } from "./storage.ts";
+
+const BAD_KEYS = [
+  "",
+  ".",
+  "a/..",
+  "../x",
+  "/x",
+  "a//b",
+  "./a",
+  "items/",
+  "a b",
+  "é/x",
+  ".hidden/x",
+];
+const BAD_PREFIXES = [".", "../", "/x", "a//", "./", "a/../", "é/"];
 
 let root: string;
 
@@ -93,12 +108,173 @@ describe("fileStorage", () => {
 
   test("refuses keys that escape the root", async () => {
     const storage = fileStorage(join(root, "inner"));
-    await expect(storage.put("../escape.json", "x")).rejects.toThrow("outside the storage root");
-    await expect(storage.get("a/../../escape.json")).rejects.toThrow("outside the storage root");
-    await expect(storage.put("/etc/absolute.json", "x")).rejects.toThrow(
-      "outside the storage root",
+    await expect(storage.put("../escape.json", "x")).rejects.toThrow("invalid storage key");
+    await expect(storage.get("a/../../escape.json")).rejects.toThrow("invalid storage key");
+    await expect(storage.put("/etc/absolute.json", "x")).rejects.toThrow("invalid storage key");
+    await expect(storage.get("..")).rejects.toThrow("invalid storage key");
+  });
+});
+
+describe("keys", () => {
+  test("both backends refuse the same malformed keys with the same message", async () => {
+    const file = fileStorage(root);
+    const s3 = s3Storage("b", S3_ENV, fakeS3());
+    for (const storage of [file, s3]) {
+      for (const key of BAD_KEYS) {
+        await expect(storage.put(key, "x"), key).rejects.toThrow("invalid storage key");
+        await expect(storage.get(key), key).rejects.toThrow("invalid storage key");
+        expect(() => storage.locate(key), key).toThrow("invalid storage key");
+      }
+      for (const prefix of BAD_PREFIXES) {
+        await expect(storage.list(prefix), prefix).rejects.toThrow("invalid storage key");
+      }
+    }
+  });
+
+  test("an empty prefix lists everything", async () => {
+    const storage = fileStorage(root);
+    await storage.put("a/x.json", "1");
+    await storage.put("b.json", "2");
+    expect(await storage.list("")).toEqual(["a/x.json", "b.json"]);
+  });
+});
+
+describe("fileStorage edge cases", () => {
+  test("get of a key that is a directory on disk is null, like a missing S3 object", async () => {
+    const storage = fileStorage(root);
+    await storage.put("items/a.parquet", "x");
+    expect(await storage.get("items")).toBeNull();
+  });
+
+  test("list under a key that is a file on disk is empty", async () => {
+    const storage = fileStorage(root);
+    await storage.put("items/a.parquet", "x");
+    expect(await storage.list("items/a.parquet/")).toEqual([]);
+  });
+
+  test("get returns bytes that own their buffer", async () => {
+    const storage = fileStorage(root);
+    await storage.put("k.bin", new Uint8Array([9, 8, 7]));
+    const bytes = await storage.get("k.bin");
+    expect(bytes?.byteOffset).toBe(0);
+    expect(bytes?.buffer.byteLength).toBe(3);
+  });
+
+  test("an overwrite replaces the file by rename and leaves no temporary file behind", async () => {
+    const storage = fileStorage(root);
+    await storage.put("_state/collector.json", "old");
+    const before = (await stat(join(root, "_state/collector.json"))).ino;
+    await storage.put("_state/collector.json", "new");
+    const after = (await stat(join(root, "_state/collector.json"))).ino;
+
+    expect(after).not.toBe(before);
+    expect(await readdir(join(root, "_state"))).toEqual(["collector.json"]);
+  });
+
+  test("a relative root is resolved to an absolute path", () => {
+    const storage = fileStorage("relative/store");
+    expect(storage.locate("a.json")).toBe(join(process.cwd(), "relative/store/a.json"));
+  });
+});
+
+/** An in-memory stand-in for Bun.S3Client, paging list results in pages of `pageSize`. */
+function fakeS3(
+  objects: Record<string, Uint8Array> = {},
+  pageSize = 2,
+): S3Like & { lists: number } {
+  const fake = {
+    lists: 0,
+    write: async (key: string, data: Uint8Array | string) => {
+      objects[key] = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      return 0;
+    },
+    file: (key: string) => ({
+      exists: async () => key in objects,
+      arrayBuffer: async () => {
+        const bytes = objects[key];
+        if (!bytes) throw new Error("NoSuchKey");
+        return bytes.slice().buffer;
+      },
+    }),
+    list: async (input: { prefix?: string; continuationToken?: string }) => {
+      fake.lists += 1;
+      const keys = Object.keys(objects)
+        .filter((key) => key.startsWith(input.prefix ?? ""))
+        .sort();
+      const start = input.continuationToken ? Number(input.continuationToken) : 0;
+      const page = keys.slice(start, start + pageSize);
+      const next = start + pageSize;
+      return {
+        contents: page.map((key) => ({ key })),
+        isTruncated: next < keys.length,
+        ...(next < keys.length ? { nextContinuationToken: String(next) } : {}),
+      };
+    },
+  };
+  return fake;
+}
+
+describe("s3Storage with a fake client", () => {
+  test("put, get and a missing key", async () => {
+    const storage = s3Storage("b", S3_ENV, fakeS3());
+    await storage.put("_state/collector.json", "s");
+    expect(
+      new TextDecoder().decode((await storage.get("_state/collector.json")) ?? undefined),
+    ).toBe("s");
+    expect(await storage.get("_state/missing.json")).toBeNull();
+  });
+
+  test("list follows continuation tokens through every page", async () => {
+    const fake = fakeS3();
+    const storage = s3Storage("b", S3_ENV, fake);
+    for (const name of ["e", "a", "d", "b", "c"]) await storage.put(`items/${name}.parquet`, "x");
+    await storage.put("other/z.parquet", "x");
+
+    expect(await storage.list("items/")).toEqual([
+      "items/a.parquet",
+      "items/b.parquet",
+      "items/c.parquet",
+      "items/d.parquet",
+      "items/e.parquet",
+    ]);
+    expect(fake.lists).toBe(3);
+  });
+
+  test("list stops with an error when the server repeats a continuation token", async () => {
+    const stuck: S3Like = {
+      ...fakeS3(),
+      list: async () => ({
+        contents: [{ key: "items/a" }],
+        isTruncated: true,
+        nextContinuationToken: "same",
+      }),
+    };
+    await expect(s3Storage("b", S3_ENV, stuck).list("items/")).rejects.toThrow(
+      "continuation token",
     );
-    await expect(storage.get("..")).rejects.toThrow("outside the storage root");
+  });
+});
+
+describe("s3ClientOptions", () => {
+  test("passes endpoint, region and session token from the given env", () => {
+    const options = s3ClientOptions("b", {
+      ...S3_ENV,
+      AWS_REGION: "auto",
+      AWS_SESSION_TOKEN: "fake-session",
+    });
+    expect(options).toMatchObject({
+      bucket: "b",
+      accessKeyId: "test-key-id",
+      endpoint: "https://example.invalid",
+      region: "auto",
+      sessionToken: "fake-session",
+    });
+  });
+
+  test("falls back to AWS_DEFAULT_REGION", () => {
+    expect(s3ClientOptions("b", { ...S3_ENV, AWS_DEFAULT_REGION: "eu-west-1" }).region).toBe(
+      "eu-west-1",
+    );
   });
 });
 
@@ -118,8 +294,8 @@ describe("s3Storage", () => {
 
   test("refuses keys that escape the bucket prefix", async () => {
     const storage = s3Storage("b", S3_ENV);
-    await expect(storage.put("../x.json", "x")).rejects.toThrow("outside the storage root");
-    await expect(storage.put("/x.json", "x")).rejects.toThrow("outside the storage root");
+    await expect(storage.put("../x.json", "x")).rejects.toThrow("invalid storage key");
+    await expect(storage.put("/x.json", "x")).rejects.toThrow("invalid storage key");
   });
 });
 
@@ -150,6 +326,18 @@ describe("storageFromEnv", () => {
   test("refuses an s3:// URL without a bucket", () => {
     expect(() => storageFromEnv({ TSUZURI_STORAGE: "s3://", ...S3_ENV }, { cwd: root })).toThrow(
       "bucket",
+    );
+  });
+
+  test("refuses an s3:// URL with a path after the bucket", () => {
+    expect(() =>
+      storageFromEnv({ TSUZURI_STORAGE: "s3://news/prefix", ...S3_ENV }, { cwd: root }),
+    ).toThrow("s3://<bucket>");
+  });
+
+  test("refuses file:// with an empty path instead of using the working directory", () => {
+    expect(() => storageFromEnv({ TSUZURI_STORAGE: "file://" }, { cwd: root })).toThrow(
+      "file://<dir>",
     );
   });
 
