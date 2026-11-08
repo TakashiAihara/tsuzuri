@@ -106,7 +106,7 @@ flowchart LR
 
 - `packages/store`: a `Storage` interface (`put`, `get`, `list`, `locate`) with `file://` and `s3://` implementations. Bun's built-in S3 client covers any S3-compatible endpoint, R2 included.
 - Configuration: `TSUZURI_STORAGE` is `file://<dir>` or `s3://<bucket>`. Credentials and endpoint are the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION`); R2 is selected by setting the endpoint. The default is `file://./data`, so a first run works with no configuration and the daemon reads what it wrote. The standalone `tsuzuri collect` (step 3) has no default and refuses to start without `TSUZURI_STORAGE`, because a cron job that lost its environment would otherwise write to a directory nobody reads.
-- Parquet write and read helpers. Library choice is decided by a spike inside this step (see Unverified): DuckDB is the stronger reader and matches what users will analyse with, but it is a native module and may not survive `bun build --compile` (issue #17); a pure-JS writer is the fallback.
+- Parquet write and read helpers on `hyparquet` and `hyparquet-writer` (pure JavaScript). Measured 2026-11-08 with Bun 1.4.3 on linux-x64: `@duckdb/node-api` does not survive `bun build --compile` (it requires every platform's binding at bundle time, and with those marked external the binary still fails with `libduckdb.so: cannot open shared object file`), which would rule out single-binary distribution (issue #17). A compiled binary using `hyparquet-writer` wrote and read back STRING, TIMESTAMP (with a null) and INT32 columns, and DuckDB read the same file with identical values, so users can still analyse it with DuckDB.
 - No behaviour change. Covers issue #9 (object storage for original HTML) at the interface level; retained HTML can use the same provider later.
 
 ### 2. Collector writes Parquet, loader fills PostgreSQL, `rebuild`
@@ -170,7 +170,7 @@ Decided 2026-11-08: AI outputs are kept in storage. Enrichments (summary, transl
 Checked before or during step 1, not assumed:
 
 - DuckDB reads R2 through a `TYPE s3` secret with a custom endpoint and `s3://` URLs. Another project found `TYPE r2` secrets apply only to `r2://` URLs; whether the generic S3 form works against R2 is not measured.
-- `@duckdb/node-api` inside `bun build --compile` output on linux and darwin, amd64 and arm64.
+- `hyparquet-writer` inside `bun build --compile` output on darwin and on arm64 (only linux-x64 was measured).
 - Listing cost: R2 counts `ListObjects` as a Class A operation. The loader lists on every tick; at a 30-second tick that is about 86,000 lists a month, under the free tier of one million, but it is an estimate, not a measurement.
 
 ## Open decisions
