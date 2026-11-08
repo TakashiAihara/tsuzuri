@@ -54,6 +54,7 @@ flowchart LR
   PG --> W[embed / score / cluster / enrich workers]
 ```
 
+- Exactly one collector writes a given storage. `_state/collector.json` is overwritten by each run, so two collectors overlapping would each overwrite the other's ETags and recent ids and the next run would refetch everything. Step 3, which makes a standalone `tsuzuri collect` possible, also adds the daemon setting that turns the built-in collector off; its name is decided in that step.
 - The collector never reads or writes PostgreSQL. It reads the subscription list and its own fetch state from storage, so it can run inside the daemon (default, the existing 30-second scheduler) or alone from cron on another host.
 - The loader is the only writer of ingested rows into PostgreSQL. It records which storage objects it has loaded, in PostgreSQL; truncating that table makes it load everything again.
 - The viewer writes user actions (subscribe, unsubscribe, read, star) to PostgreSQL immediately so the UI reacts, and appends the same action as an event. The event in storage is the record; the PostgreSQL row is a cache of it.
@@ -133,7 +134,7 @@ flowchart LR
 ### 5. Compaction
 
 - Daily job: merge yesterday's `items` files into one, and fold events older than a day into a state snapshot.
-- Compaction writes the new file before deleting the old ones, and the loader treats an object it has already loaded under another key as loaded (by content, not by key), so a crash in the middle neither loses nor double-loads rows.
+- Compaction writes the new file before deleting the old ones, so a crash in the middle never loses rows. The merged file is a new object the loader has not seen, and it loads it again; that is harmless because loading is idempotent per row, not per object: items insert with `ON CONFLICT DO NOTHING` on the item id, and events carry a unique `event_id` and fold to the last event per key. The loaded-objects table only saves work, it is not what prevents duplicates.
 
 ### 6. Inbox for other producers
 
