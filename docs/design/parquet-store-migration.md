@@ -61,7 +61,7 @@ flowchart LR
 
 ## Storage layout
 
-Proposed names; the names themselves are open decision "storage layout names".
+Names decided 2026-11-08. They are a public contract, because other producers write to `inbox/`.
 
 | Prefix | Content | Written by | Mutability |
 |---|---|---|---|
@@ -69,6 +69,7 @@ Proposed names; the names themselves are open decision "storage layout names".
 | `inbox/<producer>/dt=YYYY-MM-DD/<id>.parquet` | Items in the same schema from another producer | other producers | append |
 | `events/dt=YYYY-MM-DD/<batchId>.parquet` | Subscription and item-state events | viewer | append, compacted |
 | `_runs/<runId>.json` | One record per collector run: requests, items, failures | collector | append |
+| `derived/enrichments/`, `derived/embeddings/<model>/` | AI outputs (step 7) | enrichment and embedding workers | append |
 | `_state/collector.json` | Fetch state per subscription: ETag, Last-Modified, content hash, recent item ids, next due time, failures | collector | overwritten each run |
 
 - One file per collector run, not per subscription. With a few hundred subscriptions on a 30-minute to hourly cycle, a file per subscription is thousands of small objects a day; one per run is a few dozen. Compaction merges a day into one file.
@@ -176,6 +177,6 @@ Checked before or during step 1, not assumed:
 Settled outside this document; recorded here when answered.
 
 - AI outputs in storage: decided 2026-11-08. Enrichments and embeddings are written to storage, because re-running a chat model over every item on each rebuild is not practical. Rejected: recomputing on rebuild, which keeps storage to fetched items and user actions but makes a rebuild cost a full model pass.
-- Storage layout names: the prefixes in the table above.
+- Storage layout names: decided 2026-11-08, the prefixes in the table above. Rejected: a `curated/<collector>/<table>/dt=` layout, which only adds a level for a second collector that does not exist.
 - Configuration names: the environment variables that select the storage provider and its credentials.
 - Existing data: whether any running instance has PostgreSQL data that needs a one-time export into storage. If none, no export tool is built.
