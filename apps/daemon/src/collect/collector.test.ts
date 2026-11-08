@@ -1658,6 +1658,23 @@ describe("a shutdown abort is not a failure (behaviour O)", () => {
   });
 });
 
+describe("a signal aborted before the fetch starts (behaviour O)", () => {
+  test("ends the wait at once even when the source ignores its signal", async () => {
+    const hang: Source = {
+      kind: "feed",
+      id: "hang",
+      fetchItems: () => new Promise<FetchResult>(() => {}),
+    };
+    const harness = { sources: new Map([["feed", hang]]), calls: [], results: {} };
+    const controller = new AbortController();
+    controller.abort();
+    const collector = make(harness, { signal: controller.signal, fetchTimeoutMs: 60_000 });
+    const result = await within(collector.tick([sub("a")]));
+    expect(result.subscriptions).toEqual([]);
+    expect((await collector.state()).subscriptions.a).toBeUndefined();
+  });
+});
+
 describe("the timeout bounds the fetch itself (behaviour P)", () => {
   test("a source that never settles and ignores its signal is a timed out failure and does not block a flush", async () => {
     const hang: Source = {

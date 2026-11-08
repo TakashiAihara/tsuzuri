@@ -61,9 +61,9 @@ export function writeParquet(rows: Record<string, unknown>[], schema: Schema): U
 export async function readParquet(bytes: Uint8Array): Promise<Record<string, unknown>[]> {
   const file = {
     byteLength: bytes.byteLength,
-    // Slice the backing buffer, not the view: Buffer.slice (what storage.get
-    // returns) is subarray semantics and .buffer on it would hand back the
-    // whole pool, while Uint8Array.slice copies and needs no offset math.
+    // Slice the backing buffer at byteOffset: this works whether bytes is a
+    // Buffer — whose slice is a view, so .buffer can be a larger pool — or
+    // any other Uint8Array view.
     slice: (start: number, end?: number) =>
       bytes.buffer.slice(
         bytes.byteOffset + start,
