@@ -19,7 +19,7 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 
 ## Items
 
-`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader refuses such a row on its own and applies the rest of the file. It also refuses a row whose `id` is not the SHA-256 of its `canonical_url`, whose `url` or `canonical_url` is empty, whose text contains U+0000, whose timestamps fall outside the years 1 to 9999, or whose optional column holds a value of another type.
+`schema_version` 1. Readers match columns by name; the order below is the order tsuzuri writes. Every column is written as OPTIONAL; "Required" means a producer must not leave it null. The loader refuses such a row on its own and applies the rest of the file. It also refuses a row whose `id` is not the SHA-256 of its `canonical_url`, whose `url` or `canonical_url` is empty, whose stored text columns contain U+0000, whose timestamps fall outside the years 1 to 9999, or whose optional text column holds a value of another type. `raw` is not loaded, so neither check applies to it.
 
 | Column | Parquet type | Required | Meaning |
 |---|---|---|---|
@@ -39,4 +39,5 @@ Every key is `/`-separated segments. Each segment matches `^[A-Za-z0-9_=-][A-Za-
 | `raw` | BYTE_ARRAY (UTF8) | no | The item as the source produced it before normalisation, as JSON text (for a feed: `url`, `title`, `author`, `guid`, `publishedAtRaw`, `contentHtml`, `summary`) |
 
 - tsuzuri writes SNAPPY-compressed files. It reads SNAPPY, ZSTD, GZIP, BROTLI and LZ4 files and uncompressed ones.
-- The same `id` may appear in several files. When the copies differ, the first one the loader applies wins: files apply in key order, which is write order, and within a file the row with the earliest `fetched_at` comes first, ties keeping the row position. An earlier file therefore wins over a later one even when the later one holds an earlier `fetched_at`.
+- The same `id` may appear in several files. When the copies differ, the first one the loader applies wins: files apply in key order, and within a file the row with the earliest `fetched_at` comes first, ties keeping the row position. A file that cannot be read or applied stops the loader there, so a later key never applies before an earlier one in the same run.
+- Key order is write order only for one collector whose clock does not step back: two flushes in the same second sort by their random suffix, and a key that sorts before files already applied is applied after them and loses.

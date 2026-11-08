@@ -76,7 +76,8 @@ export async function applyItemObject(
 ): Promise<{ inserted: number; linked: number }> {
   // Duplicates are dropped here rather than left to ON CONFLICT inside one
   // statement: jsonb_to_recordset and a join promise no row order, so which
-  // copy reached the table first would be up to the planner.
+  // copy reached the table first would be up to the planner. Defensive: no
+  // test can force the planner into another order, so nothing pins this.
   const seenItems = new Set<string>();
   const itemRows = rows.filter((row) => !seenItems.has(row.id) && seenItems.add(row.id));
   const seenLinks = new Set<string>();

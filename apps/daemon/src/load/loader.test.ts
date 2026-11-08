@@ -25,6 +25,7 @@ const ID_B = sha256(urlOf("b"));
 const ID_C = sha256(urlOf("c"));
 const ID_X = sha256(urlOf("x"));
 const URLS = new Map([ID_A, ID_B, ID_C, ID_X].map((id, i) => [id, urlOf("abcx"[i] as string)]));
+const KEY_0 = "items/dt=2026-11-08/20261108T000000Z-00000000.parquet";
 const KEY_1 = "items/dt=2026-11-08/20261108T000001Z-00000001.parquet";
 const KEY_2 = "items/dt=2026-11-08/20261108T000002Z-00000002.parquet";
 const KEY_3 = "items/dt=2026-11-09/20261109T000000Z-00000003.parquet";
@@ -105,7 +106,7 @@ describeIfDb("loader", () => {
 
       const result = await loader().loadPending();
 
-      expect(result).toEqual({ objects: 2, inserted: 3, linked: 3, rejected: 0, failed: 0 });
+      expect(result).toEqual({ objects: 2, inserted: 3, linked: 3, rejected: 0, stoppedAt: null });
       expect(await count("items")).toBe(3);
       expect(await count("loaded_objects")).toBe(2);
     });
@@ -116,7 +117,7 @@ describeIfDb("loader", () => {
         inserted: 0,
         linked: 0,
         rejected: 0,
-        failed: 0,
+        stoppedAt: null,
       });
     });
 
@@ -139,7 +140,7 @@ describeIfDb("loader", () => {
 
       const second = await loader().loadPending();
 
-      expect(second).toEqual({ objects: 0, inserted: 0, linked: 0, rejected: 0, failed: 0 });
+      expect(second).toEqual({ objects: 0, inserted: 0, linked: 0, rejected: 0, stoppedAt: null });
       expect(await count("items")).toBe(1);
       // Skipped up front, not re-read and refused by the ledger's key.
       expect(logs).toEqual([]);
@@ -152,7 +153,7 @@ describeIfDb("loader", () => {
 
       const second = await loader().loadPending();
 
-      expect(second).toEqual({ objects: 1, inserted: 1, linked: 1, rejected: 0, failed: 0 });
+      expect(second).toEqual({ objects: 1, inserted: 1, linked: 1, rejected: 0, stoppedAt: null });
     });
 
     test("skips an object the ledger already records", async () => {
@@ -232,7 +233,7 @@ describeIfDb("loader", () => {
 
       const result = await loader().loadPending();
 
-      expect(result).toEqual({ objects: 1, inserted: 2, linked: 1, rejected: 0, failed: 0 });
+      expect(result).toEqual({ objects: 1, inserted: 2, linked: 1, rejected: 0, stoppedAt: null });
       const links = await handle.sql<{ item_id: string }[]>`SELECT item_id FROM item_sources`;
       expect(links.map((l) => l.item_id)).toEqual([ID_A]);
     });
@@ -264,6 +265,7 @@ describeIfDb("loader", () => {
       ["an id that is not the sha256 of canonical_url", { id: ID_X }],
       ["an empty url", { url: "" }],
       ["an empty canonical_url", { canonical_url: "" }],
+      ["an empty canonical_url with the id hashed from it", { canonical_url: "", id: sha256("") }],
 
       ["a U+0000 in a text column", { title: "bad\u0000title" }],
       [
@@ -271,6 +273,9 @@ describeIfDb("loader", () => {
         { published_at: new Date("-005000-01-01T00:00:00Z") },
       ],
       ["a fetched_at PostgreSQL cannot store", { fetched_at: new Date("+010000-01-01T00:00:00Z") }],
+      ["a published_at in year 0", { published_at: new Date("0000-06-01T00:00:00Z") }],
+      ["a U+0000 in author", { author: `a${String.fromCharCode(0)}b` }],
+      ["a U+0000 in source_id", { source_id: `x${String.fromCharCode(0)}` }],
     ];
 
     for (const [name, overrides] of invalid) {
@@ -279,7 +284,13 @@ describeIfDb("loader", () => {
 
         const result = await loader().loadPending();
 
-        expect(result).toEqual({ objects: 1, inserted: 2, linked: 2, rejected: 1, failed: 0 });
+        expect(result).toEqual({
+          objects: 1,
+          inserted: 2,
+          linked: 2,
+          rejected: 1,
+          stoppedAt: null,
+        });
         expect(Object.keys(await titles())).toEqual([ID_A, ID_C].sort());
         const [ledger] = await handle.sql`SELECT rows, rejected FROM loaded_objects`;
         expect(ledger).toMatchObject({ rows: 2, rejected: 1 });
@@ -308,7 +319,7 @@ describeIfDb("loader", () => {
       const first = await loader().loadPending();
       const second = await loader().loadPending();
 
-      expect(first).toEqual({ objects: 1, inserted: 0, linked: 0, rejected: 1, failed: 0 });
+      expect(first).toEqual({ objects: 1, inserted: 0, linked: 0, rejected: 1, stoppedAt: null });
       expect(second.objects).toBe(0);
     });
 
@@ -323,13 +334,32 @@ describeIfDb("loader", () => {
 
       const result = await loader().loadPending();
 
-      expect(result).toEqual({ objects: 1, inserted: 2, linked: 2, rejected: 1, failed: 0 });
+      expect(result).toEqual({ objects: 1, inserted: 2, linked: 2, rejected: 1, stoppedAt: null });
       expect(Object.keys(await titles())).toEqual([ID_A, ID_C].sort());
       expect(logs.some((m) => m.includes("title must be text or null"))).toBe(true);
     });
 
     test("a U+0000 in raw is accepted, since raw is not loaded", async () => {
-      await put(KEY_1, [itemRow(ID_A, { raw: "{\"title\":\"a\u0000b\"}" })]);
+      await put(KEY_1, [itemRow(ID_A, { raw: '{"title":"a\u0000b"}' })]);
+
+      const result = await loader().loadPending();
+
+      expect(result.rejected).toBe(0);
+      expect(await count("items")).toBe(1);
+    });
+
+    test("a published_at in year 9999 is accepted", async () => {
+      await put(KEY_1, [itemRow(ID_A, { published_at: new Date("9999-12-31T00:00:00Z") })]);
+
+      const result = await loader().loadPending();
+
+      expect(result.rejected).toBe(0);
+      expect(await count("items")).toBe(1);
+    });
+
+    test("a U+0000 in a column the loader does not know is accepted", async () => {
+      const row = { ...itemRow(ID_A), extra: `a${String.fromCharCode(0)}b` };
+      await storage.put(KEY_1, writeParquet([row], { ...ITEM_SCHEMA, extra: "STRING" }));
 
       const result = await loader().loadPending();
 
@@ -348,25 +378,47 @@ describeIfDb("loader", () => {
   });
 
   describe("objects that cannot be applied", () => {
-    test("an unreadable object is reported, left unmarked and retried next time", async () => {
+    test("an unreadable object stops the run before later keys and is retried next time", async () => {
       await storage.put(KEY_1, "this is not parquet");
       await put(KEY_2, [itemRow(ID_A)]);
 
       const first = await loader().loadPending();
 
-      expect(first).toEqual({ objects: 1, inserted: 1, linked: 1, rejected: 0, failed: 1 });
-      expect(logs.some((m) => m.includes(KEY_1))).toBe(true);
-      const loaded = await handle.sql<{ key: string }[]>`SELECT key FROM loaded_objects`;
-      expect(loaded.map((r) => r.key)).toEqual([KEY_2]);
+      expect(first.objects).toBe(0);
+      expect(first.stoppedAt?.key).toBe(KEY_1);
+      expect(first.stoppedAt?.error).toContain("cannot read object");
+      expect(await count("loaded_objects")).toBe(0);
+      expect(logs.some((m) => m.includes(KEY_1) && m.includes("later keys wait"))).toBe(true);
 
       await put(KEY_1, [itemRow(ID_B)]);
       const second = await loader().loadPending();
 
-      expect(second).toEqual({ objects: 1, inserted: 1, linked: 1, rejected: 0, failed: 0 });
+      expect(second).toEqual({ objects: 2, inserted: 2, linked: 2, rejected: 0, stoppedAt: null });
       expect(Object.keys(await titles())).toEqual([ID_A, ID_B].sort());
     });
 
-    test("an object that disappears between list and get is not marked loaded", async () => {
+    test("an earlier key that cannot be read does not let a later copy win", async () => {
+      await put(KEY_1, [itemRow(ID_A, { title: "earlier" })]);
+      await put(KEY_2, [itemRow(ID_A, { title: "later" })]);
+      let failOnce = true;
+      const flaky: Storage = {
+        ...storage,
+        get: async (key) => {
+          if (key === KEY_1 && failOnce) {
+            failOnce = false;
+            throw new Error("transient");
+          }
+          return storage.get(key);
+        },
+      };
+
+      await loader(flaky).loadPending();
+      await loader(flaky).loadPending();
+
+      expect(await titles()).toEqual({ [ID_A]: "earlier" });
+    });
+
+    test("an object that disappears between list and get stops the run, the next run goes on", async () => {
       await put(KEY_1, [itemRow(ID_A)]);
       await put(KEY_2, [itemRow(ID_B)]);
       const vanishing: Storage = {
@@ -376,25 +428,26 @@ describeIfDb("loader", () => {
 
       const result = await loader(vanishing).loadPending();
 
-      expect(result.objects).toBe(1);
-      expect(result.failed).toBe(1);
-      expect(logs.some((m) => m.includes(KEY_1))).toBe(true);
-      const loaded = await handle.sql<{ key: string }[]>`SELECT key FROM loaded_objects`;
-      expect(loaded.map((r) => r.key)).toEqual([KEY_2]);
+      expect(result.objects).toBe(0);
+      expect(result.stoppedAt).toEqual({ key: KEY_1, error: "cannot read object: object is gone" });
+      expect(await count("loaded_objects")).toBe(0);
     });
 
     test("an object the database refuses commits nothing and stops the run before later keys", async () => {
+      await put(KEY_0, [itemRow(ID_X)]);
       // A constraint only this test adds stands in for any database refusal.
       await handle.sql`ALTER TABLE items ADD CONSTRAINT test_refuse CHECK (title <> 'refused')`;
       try {
         await put(KEY_1, [itemRow(ID_A), itemRow(ID_B, { title: "refused" })]);
         await put(KEY_2, [itemRow(ID_C)]);
 
-        const run = async () => loader().loadPending();
-        await expect(run()).rejects.toThrow("test_refuse");
+        const result = await loader().loadPending();
 
-        expect(await count("items")).toBe(0);
-        expect(await count("loaded_objects")).toBe(0);
+        expect(result).toMatchObject({ objects: 1, inserted: 1, linked: 1, rejected: 0 });
+        expect(result.stoppedAt?.key).toBe(KEY_1);
+        expect(result.stoppedAt?.error).toContain("test_refuse");
+        expect(Object.keys(await titles())).toEqual([ID_X]);
+        expect(await count("loaded_objects")).toBe(1);
         expect(logs.some((m) => m.includes(KEY_1) && m.includes("apply failed"))).toBe(true);
       } finally {
         await handle.sql`ALTER TABLE items DROP CONSTRAINT test_refuse`;
@@ -402,7 +455,7 @@ describeIfDb("loader", () => {
 
       const retried = await loader().loadPending();
 
-      expect(retried).toEqual({ objects: 2, inserted: 3, linked: 3, rejected: 0, failed: 0 });
+      expect(retried).toEqual({ objects: 2, inserted: 3, linked: 3, rejected: 0, stoppedAt: null });
     });
   });
 
@@ -418,7 +471,7 @@ describeIfDb("loader", () => {
 
       const result = await loader().reload();
 
-      expect(result).toEqual({ objects: 2, inserted: 0, linked: 0, rejected: 0, failed: 0 });
+      expect(result).toEqual({ objects: 2, inserted: 0, linked: 0, rejected: 0, stoppedAt: null });
       expect(await count("items")).toBe(3);
       expect(await count("item_sources")).toBe(3);
       expect(await count("loaded_objects")).toBe(2);
@@ -434,7 +487,7 @@ describeIfDb("loader", () => {
 
       const result = await loader().reload();
 
-      expect(result).toEqual({ objects: 1, inserted: 0, linked: 1, rejected: 0, failed: 0 });
+      expect(result).toEqual({ objects: 1, inserted: 0, linked: 1, rejected: 0, stoppedAt: null });
     });
 
     test("does not delete items whose objects are gone from storage", async () => {
@@ -490,17 +543,21 @@ describeIfDb("loader", () => {
       expect(new Date(String(source?.updated_at)).getUTCFullYear()).toBeGreaterThan(2000);
     });
 
-    for (const [name, value] of [
-      ["text that is not a timestamp", "yesterday"],
-      ["a number", 123],
+    for (const [field, value] of [
+      ["lastFetchedAt", "yesterday"],
+      ["lastFetchedAt", 123],
+      ["lastSuccessAt", "yesterday"],
+      ["nextFetchAt", "+010000-01-01T00:00:00.000Z"],
+      ["lastError", `bad${String.fromCharCode(0)}`],
+      ["etag", 7],
     ] as const) {
-      test(`skips a source whose lastFetchedAt is ${name} and syncs the rest`, async () => {
+      test(`skips a source whose ${field} is ${JSON.stringify(value)} and syncs the rest`, async () => {
         const [other] = await handle.sql<{ id: string }[]>`
           INSERT INTO sources (user_id, kind, url) VALUES (${USER}, 'feed', 'https://e.com/2.xml')
           RETURNING id
         `;
         const otherId = (other as { id: string }).id;
-        await putState({ [sourceId]: entry({ lastFetchedAt: value }), [otherId]: entry() });
+        await putState({ [sourceId]: entry({ [field]: value }), [otherId]: entry() });
 
         const updated = await loader().syncSourceState();
 
@@ -512,9 +569,17 @@ describeIfDb("loader", () => {
           [sourceId]: null,
           [otherId]: '"abc"',
         });
-        expect(logs.some((m) => m.includes(sourceId) && m.includes("lastFetchedAt"))).toBe(true);
+        expect(logs.some((m) => m.includes(sourceId) && m.includes(field))).toBe(true);
       });
     }
+
+    test("stores a timestamp Date.parse accepts in a form PostgreSQL would refuse", async () => {
+      await putState({ [sourceId]: entry({ lastFetchedAt: "2026" }) });
+
+      expect(await loader().syncSourceState()).toBe(1);
+      const [source] = await handle.sql`SELECT last_fetched_at FROM sources`;
+      expect(iso(source?.last_fetched_at)).toBe("2026-01-01T00:00:00.000Z");
+    });
 
     test("keeps a disabled source disabled and ignores unknown ids", async () => {
       await handle.sql`UPDATE sources SET status = 'disabled' WHERE id = ${sourceId}`;

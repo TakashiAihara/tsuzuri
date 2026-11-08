@@ -20,12 +20,12 @@ import { toSearchText } from "../ingest/run.ts";
  *
  * loaded_objects is the ledger that makes loadPending cheap to repeat: a key
  * it records is skipped, and forgetLoadedObjects (reload) makes every object
- * pending again. Objects apply in the order the storage keys sort, which is
- * write order, and within an object by fetched_at. When the same item id
- * shows up twice with different content, the first applied copy is the one
- * items keeps (ON CONFLICT DO NOTHING), matching docs/parquet-schema.md. To
- * keep that order, an object whose apply fails stops the run: applying the
- * later keys first would let a later copy win.
+ * pending again. Objects apply in the order the storage keys sort, and
+ * within an object by fetched_at. When the same item id shows up twice with
+ * different content, the first applied copy is the one items keeps (ON
+ * CONFLICT DO NOTHING), matching docs/parquet-schema.md. To keep that order,
+ * an object that cannot be read or applied stops the run there, and the
+ * result names it: applying the later keys first would let a later copy win.
  */
 
 export type LoadResult = {
@@ -35,8 +35,11 @@ export type LoadResult = {
   linked: number;
   /** Rows refused by validation, across all applied objects. */
   rejected: number;
-  /** Objects that could not be read; they stay pending for the next run. */
-  failed: number;
+  /**
+   * The object the run stopped at, because it could not be read or applied.
+   * It and every later key stay pending for the next run.
+   */
+  stoppedAt: { key: string; error: string } | null;
 };
 
 export type LoaderDeps = {
@@ -52,32 +55,26 @@ const ITEM_ID = /^[0-9a-f]{64}$/;
 export function createLoader(deps: LoaderDeps) {
   const { log } = deps;
 
-  // A key that cannot be read — gone between list and get, or not parquet at
-  // all — is reported and left out of loaded_objects, so the next
-  // loadPending tries it again. Its rows count nowhere.
-  const readObject = async (key: string): Promise<Record<string, unknown>[] | null> => {
-    try {
-      const bytes = await deps.storage.get(key);
-      if (bytes === null) throw new Error("object is gone");
-      return await readParquet(bytes);
-    } catch (error) {
-      log(`${key}: cannot read object: ${describe(error)}`);
-      return null;
-    }
+  const readObject = async (key: string): Promise<Record<string, unknown>[]> => {
+    const bytes = await deps.storage.get(key);
+    if (bytes === null) throw new Error("object is gone");
+    return readParquet(bytes);
   };
 
   const loadPending = async (): Promise<LoadResult> => {
-    const result: LoadResult = { objects: 0, inserted: 0, linked: 0, rejected: 0, failed: 0 };
+    const result: LoadResult = { objects: 0, inserted: 0, linked: 0, rejected: 0, stoppedAt: null };
     const done = await loadedKeys(deps.sql);
     const keys = (await deps.storage.list(ITEMS_PREFIX)).filter(
       (key) => key.endsWith(".parquet") && !done.has(key),
     );
 
     for (const key of keys) {
-      const raw = await readObject(key);
-      if (raw === null) {
-        result.failed += 1;
-        continue;
+      let raw: Record<string, unknown>[];
+      try {
+        raw = await readObject(key);
+      } catch (error) {
+        result.stoppedAt = { key, error: `cannot read object: ${describe(error)}` };
+        break;
       }
 
       let rejected = 0;
@@ -104,11 +101,14 @@ export function createLoader(deps: LoaderDeps) {
       } catch (error) {
         // applyItemObject is one transaction, so a failure here committed
         // nothing and the key stays out of loaded_objects for the next run.
-        log(`${key}: apply failed, stopping this run: ${describe(error)}`);
-        throw error;
+        result.stoppedAt = { key, error: `apply failed: ${describe(error)}` };
+        break;
       }
     }
 
+    if (result.stoppedAt) {
+      log(`${result.stoppedAt.key}: ${result.stoppedAt.error}; stopped, later keys wait`);
+    }
     return result;
   };
 
@@ -130,21 +130,30 @@ export function createLoader(deps: LoaderDeps) {
       if (bytes === null) return 0;
       const entries: Record<string, SourceFetchStateRow> = {};
       for (const [id, entry] of Object.entries(parseState(bytes).subscriptions)) {
-        const bad = (["lastFetchedAt", "lastSuccessAt"] as const).find((field) => {
-          const value: unknown = entry[field];
-          return (
-            value !== null &&
-            value !== undefined &&
-            (typeof value !== "string" || Number.isNaN(Date.parse(value)))
-          );
-        });
+        // One value PostgreSQL refuses would fail the whole UPDATE, so a bad
+        // entry is skipped alone. Timestamps are re-serialised: Date.parse
+        // accepts forms ("2026") that timestamptz does not.
+        const times = {
+          nextFetchAt: toTimestamp(entry.nextFetchAt),
+          lastFetchedAt: toTimestamp(entry.lastFetchedAt),
+          lastSuccessAt: toTimestamp(entry.lastSuccessAt),
+        };
+        const badTime = Object.entries(times).find(([, value]) => value === undefined);
+        const badText = (["etag", "lastModified", "contentHash", "lastError"] as const).find(
+          (field) => !isStorableText(entry[field]),
+        );
+        const bad = badTime?.[0] ?? badText;
         if (bad) {
-          // parseState checks nextFetchAt only, and one bad timestamp would
-          // fail the whole UPDATE; skip that source.
-          log(`${STATE_KEY}: ${id}: ${bad} is not a timestamp, skipped`);
+          log(`${STATE_KEY}: ${id}: ${bad} cannot be stored, skipped`);
           continue;
         }
-        entries[id] = entry;
+        entries[id] = {
+          ...entry,
+          // parseState guarantees nextFetchAt is a string, so it is not null here.
+          nextFetchAt: times.nextFetchAt as string,
+          lastFetchedAt: times.lastFetchedAt ?? null,
+          lastSuccessAt: times.lastSuccessAt ?? null,
+        };
       }
       return syncSourceFetchState(deps.sql, entries);
     },
@@ -157,12 +166,29 @@ function isText(value: unknown): value is string {
   return typeof value === "string";
 }
 
-// Years 1..9999: PostgreSQL's timestamptz refuses dates far outside that, and
-// one such row would fail the object's transaction on every run.
+// Years 1..9999: a later year serialises as "+010000-…", which PostgreSQL
+// reads as a zone offset, and year 0 or earlier fails too. One such row
+// would fail the object's transaction on every run.
 function isDate(value: unknown): value is Date {
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) return false;
   const year = value.getUTCFullYear();
   return year >= 1 && year <= 9999;
+}
+
+// null and missing stay null; undefined means "cannot be stored".
+function toTimestamp(value: unknown): string | null | undefined {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") return undefined;
+  const date = new Date(value);
+  return isDate(date) ? date.toISOString() : undefined;
+}
+
+function isStorableText(value: unknown): boolean {
+  return (
+    value === null ||
+    value === undefined ||
+    (typeof value === "string" && !value.includes(String.fromCharCode(0)))
+  );
 }
 
 function describe(error: unknown): string {
@@ -170,6 +196,13 @@ function describe(error: unknown): string {
 }
 
 const OPTIONAL_TEXT = ["title", "author", "guid", "content_html", "summary"] as const;
+const STORED_TEXT: ReadonlySet<string> = new Set([
+  "id",
+  "url",
+  "canonical_url",
+  "source_id",
+  ...OPTIONAL_TEXT,
+]);
 
 // The contract's required columns must be present and well-typed; an invalid
 // row is refused alone so its valid neighbours in the same object still
@@ -187,8 +220,9 @@ function checkRow(raw: Record<string, unknown>): CheckedRow {
     return refuse("id", "64 lowercase hex characters");
   }
   if (!isText(raw.url) || raw.url === "") return refuse("url", "non-empty text");
-  if (!isText(raw.canonical_url)) return refuse("canonical_url", "text");
-  // Also refuses an empty canonical_url, whose hash no valid id can match.
+  if (!isText(raw.canonical_url) || raw.canonical_url === "") {
+    return refuse("canonical_url", "non-empty text");
+  }
   if (sha256(raw.canonical_url) !== raw.id) return refuse("id", "sha256 of canonical_url");
   if (!isDate(raw.published_at)) return refuse("published_at", "a timestamp");
   if (typeof raw.published_at_estimated !== "boolean") {
@@ -199,9 +233,10 @@ function checkRow(raw: Record<string, unknown>): CheckedRow {
 
   // PostgreSQL text cannot hold U+0000; one such row would fail the object's
   // transaction on every run.
-  // `raw` is not loaded, so only the columns that reach the database count.
+  // Only the columns that reach the database count; `raw` and unknown
+  // columns are not loaded.
   for (const [field, value] of Object.entries(raw)) {
-    if (field !== "raw" && typeof value === "string" && value.includes("\u0000")) {
+    if (STORED_TEXT.has(field) && typeof value === "string" && value.includes("\u0000")) {
       return refuse(field, "text without U+0000");
     }
   }
