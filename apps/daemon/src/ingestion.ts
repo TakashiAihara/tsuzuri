@@ -19,8 +19,9 @@ export type IngestionDeps = {
 };
 
 /**
- * The collector and the loader as the daemon runs them: every flush is
- * followed by a load, on the runner's one chain. The tests build the same
+ * The collector and the loader as the daemon runs them: every flush that had
+ * something to write (an empty one does not call onFlush) is followed by a
+ * load, on the runner's one chain. The tests build the same
  * thing, so what they check is the daemon's wiring and not a copy of it.
  */
 export function createIngestion(deps: IngestionDeps) {

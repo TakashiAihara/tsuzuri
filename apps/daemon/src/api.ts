@@ -185,16 +185,21 @@ export function createApi(deps: ApiDeps) {
     // Every row goes in: which subscriptions are due is the collector's call,
     // so cutting the list short here could leave a due one out.
     const rows = await db.select().from(sources);
+    // Loads queued before this request (startup catch-up, an earlier flush,
+    // a rebuild) are not its own, so they finish before the count starts.
+    await loads.settled();
     const before = loads.totals();
     const { subscriptions: outcomes, busy } = await collector.tick(rows.map(toSubscription), {
       force: all,
     });
     if (busy) return c.json({ error: "a fetch is already running" }, 409);
 
-    // The tick (when its interval came round) and this flush each queue a
-    // load through their onFlush hook, so the items this request inserted are
-    // the runner's growth since it began. Only when no load ran at all (no
-    // hook, or the hook's load failed) is there still something to load here.
+    // A flush with something to write (this one, or the one the tick ran
+    // when its interval came round) queues a load through onFlush. When no
+    // load applied (none ran, or the hook's threw and was only logged), one
+    // more load here picks up what is pending. A sync that failed after an
+    // applied load is left to the next load. The items this request inserted
+    // are the runner's growth since the count started.
     await collector.flush();
     await loads.settled();
     if (loads.totals().runs === before.runs) await loads.load();

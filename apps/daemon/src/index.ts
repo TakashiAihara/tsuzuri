@@ -173,28 +173,40 @@ void scheduler();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
-    if (stopping) return;
+    // A second signal means the operator will not wait for the graceful path.
+    if (stopping) process.exit(1);
     stopping = true;
-    // No new /ingest/run or /rebuild while the last flush and load run.
-    await server.stop();
-    shutdown.abort();
-    await inFlight;
-    // A storage failure here loses only what this flush held, and the fetch
-    // state was not advanced for it, so the next start fetches it again.
-    // A flush that wrote has already loaded through its onFlush hook.
-    let flushed = null;
+    let code = 0;
     try {
-      flushed = await collector.flush();
+      // No new /ingest/run or /rebuild while the last flush and load run.
+      // stop() waits for requests in progress, so abort first: an
+      // /ingest/run waiting on a slow fetch then ends with it instead of
+      // holding stop().
+      const stopped = server.stop();
+      shutdown.abort();
+      await stopped;
+      await inFlight;
+      // A storage failure here loses only what this flush held, and the
+      // fetch state was not advanced for it, so the next start fetches it
+      // again. A flush that wrote has already queued its load.
+      let flushed = null;
+      try {
+        flushed = await collector.flush();
+      } catch (error) {
+        console.error("final flush failed:", error);
+      }
+      if (flushed === null) await loadAndLog();
+      await loads.settled();
+      await enrichment.stop();
+      await interest.stop();
+      await clustering.stop();
+      await embeddings.stop();
+      await close();
     } catch (error) {
-      console.error("final flush failed:", error);
+      console.error("shutdown failed:", error);
+      code = 1;
+    } finally {
+      process.exit(code);
     }
-    if (flushed === null) await loadAndLog();
-    await loads.settled();
-    await enrichment.stop();
-    await interest.stop();
-    await clustering.stop();
-    await embeddings.stop();
-    await close();
-    process.exit(0);
   });
 }

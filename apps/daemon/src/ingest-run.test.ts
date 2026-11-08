@@ -285,6 +285,42 @@ describeIfDb("ingest through the collector and the loader", () => {
       expect((await listed()).length).toBe(3);
     });
 
+    test("a load that is slow does not hold up the next flush or tick", async () => {
+      const real = storage;
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      storage = {
+        ...real,
+        list: async (prefix) => {
+          if (prefix === "items/") await gate;
+          return real.list(prefix);
+        },
+      };
+      app = build();
+      const sourceId = await subscribe(FEED);
+      const sub = {
+        id: sourceId,
+        kind: "feed" as const,
+        url: FEED,
+        config: {},
+        fetchIntervalSeconds: 3600,
+        status: "active" as const,
+      };
+
+      await within(collector.tick([sub]));
+      // The load this flush queues waits on the gate; the flush does not.
+      await within(collector.flush());
+      const second = await within(collector.tick([sub], { force: true }));
+
+      expect(second.busy).toBe(false);
+      expect(await listed()).toEqual([]);
+      release();
+      await loads.settled();
+      expect((await listed()).length).toBe(3);
+    });
+
     test("reports where the load stopped, and fetch keeps working", async () => {
       await subscribe(FEED);
       await storage.put("items/dt=2000-01-01/20000101T000000Z-00000000.parquet", "not parquet");
@@ -294,6 +330,43 @@ describeIfDb("ingest through the collector and the loader", () => {
       expect(body.stoppedAt?.key).toBe("items/dt=2000-01-01/20000101T000000Z-00000000.parquet");
       expect(body.stoppedAt?.error).toContain("cannot read object");
       expect(body.polled).toBe(1);
+    });
+
+    test("when the load a flush queued throws, the request loads again and reports the items", async () => {
+      const real = storage;
+      let failNextList = true;
+      storage = {
+        ...real,
+        list: async (prefix) => {
+          if (prefix === "items/" && failNextList) {
+            failNextList = false;
+            throw new Error("listing failed once");
+          }
+          return real.list(prefix);
+        },
+      };
+      app = build();
+      await subscribe(FEED);
+
+      const body = await ingest("?all=true");
+
+      expect(failNextList).toBe(false);
+      expect(body.inserted).toBe(3);
+      expect((await listed()).length).toBe(3);
+    });
+
+    test("a rebuild already running when the request starts is not counted as its inserts", async () => {
+      await subscribe(FEED);
+      await ingest("?all=true");
+      await handle.sql`DELETE FROM items`;
+      await handle.sql`TRUNCATE loaded_objects`;
+
+      const rebuilding = post("/rebuild");
+      const body = await ingest("");
+      const rebuilt = await json<LoadResultBody>(await rebuilding);
+
+      expect(rebuilt.inserted).toBe(3);
+      expect(body.inserted).toBe(0);
     });
 
     test("with nothing due it still loads an object left pending in storage", async () => {

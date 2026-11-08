@@ -40,7 +40,7 @@ export function createLoadRunner(
     load: () => enqueue(() => loader.loadPending()),
     rebuild: () => enqueue(() => loader.reload()),
     last: () => last,
-    /** Finished runs and the items they inserted since the runner started. */
+    /** Runs that applied (a run that throws before applying is not counted) and the items they inserted. */
     totals: () => ({ ...totals }),
     /** Resolves once every run queued so far has finished, failed or not. */
     settled: (): Promise<void> => chain.then(() => undefined),
