@@ -61,9 +61,14 @@ export function writeParquet(rows: Record<string, unknown>[], schema: Schema): U
 export async function readParquet(bytes: Uint8Array): Promise<Record<string, unknown>[]> {
   const file = {
     byteLength: bytes.byteLength,
-    // TypedArray.slice is relative to the view and returns a fresh buffer, so
-    // a non-zero byteOffset needs no special handling.
-    slice: (start: number, end?: number) => bytes.slice(start, end).buffer,
+    // Slice the backing buffer at byteOffset: this works whether bytes is a
+    // Buffer — whose slice is a view, so .buffer can be a larger pool — or
+    // any other Uint8Array view.
+    slice: (start: number, end?: number) =>
+      bytes.buffer.slice(
+        bytes.byteOffset + start,
+        bytes.byteOffset + (end ?? bytes.byteLength),
+      ) as ArrayBuffer,
   };
   return parquetReadObjects({ file, compressors });
 }

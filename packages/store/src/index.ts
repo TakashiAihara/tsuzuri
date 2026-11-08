@@ -1,3 +1,4 @@
+export { ITEM_SCHEMA, ITEM_SCHEMA_VERSION, type ItemRow } from "./items.ts";
 export { type ColumnType, readParquet, type Schema, writeParquet } from "./parquet.ts";
 export {
   fileStorage,

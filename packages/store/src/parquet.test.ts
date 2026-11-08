@@ -45,6 +45,12 @@ describe("file format", () => {
     ]);
   });
 
+  // storage.get on file:// returns a Buffer, whose slice() is a view, not a copy.
+  test("reads from a Buffer, as storage.get returns it", async () => {
+    const file = writeParquet([{ id: "a" }, { id: "b" }], { id: "STRING" });
+    expect(await readParquet(Buffer.from(file))).toEqual([{ id: "a" }, { id: "b" }]);
+  });
+
   test("reads from a view that does not start at the beginning of its buffer", async () => {
     const file = writeParquet([{ id: "a" }], { id: "STRING" });
     const padded = new Uint8Array(file.byteLength + 7);
