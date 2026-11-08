@@ -302,15 +302,18 @@ export const importOpmlResponseSchema = z.strictObject({
   sources: z.array(z.strictObject({ id: z.string(), url: z.string() })),
 });
 
+/** An object the loader stopped at; it and every later key stay pending. */
+const loadStoppedAtSchema = z.strictObject({ key: z.string(), error: z.string() });
+
 export const ingestRunResponseSchema = z.strictObject({
   polled: z.number(),
   inserted: z.number(),
   failed: z.number(),
   outcomes: z.array(z.unknown()),
+  /** Where the last load stopped, when it did; later objects wait for it. */
+  stoppedAt: loadStoppedAtSchema.nullable(),
 });
-
-/** An object the loader stopped at; it and every later key stay pending. */
-const loadStoppedAtSchema = z.strictObject({ key: z.string(), error: z.string() });
+export type IngestRunResponse = z.infer<typeof ingestRunResponseSchema>;
 
 export const rebuildResponseSchema = z.strictObject({
   objects: z.number(),
@@ -322,10 +325,12 @@ export const rebuildResponseSchema = z.strictObject({
 export type RebuildResponse = z.infer<typeof rebuildResponseSchema>;
 
 /** GET /doctor's `storage`: the last loader run, null until one has finished. */
-export const doctorStorageSchema = z.strictObject({
-  at: z.string(),
-  ...rebuildResponseSchema.shape,
-});
+export const doctorStorageSchema = z
+  .strictObject({
+    at: z.string(),
+    ...rebuildResponseSchema.shape,
+  })
+  .nullable();
 export type DoctorStorage = z.infer<typeof doctorStorageSchema>;
 
 /** Every error the API returns has this shape, whatever the status. */

@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { doctorStorageSchema } from "@tsuzuri/api";
 import { sha256 } from "@tsuzuri/core";
 import { createDatabase, migrate } from "@tsuzuri/db";
 import { fileStorage, type Storage } from "@tsuzuri/store";
@@ -17,31 +18,11 @@ import type { Fetcher } from "./ingest/fetcher.ts";
 import { createIngestion } from "./ingestion.ts";
 
 /**
- * Step 2c: the API fetches through the collector and fills PostgreSQL through
- * the loader. Real PostgreSQL, a real file store in a temp dir, and a fake
- * fetcher serving RSS.
- *
- * Interface assumed for createApi (the implementation does not exist yet):
- *
- *   createApi({ db, sql, fetcher, config, embeddings, interest, clustering,
- *               enrichment, collector, loads })
- *
- * - `collector` and `loads` come from createIngestion, the daemon's own
- *   wiring: each flush that wrote a file is followed by a load, and `loads`
- *   serialises every loader run and remembers the last one.
- *
- * Response shapes assumed:
- *
- * - POST /ingest/run: { polled, inserted, failed, outcomes } where polled and
- *   outcomes are the collector's TickResult.subscriptions, inserted is the
- *   loader's count and failed counts the outcomes with status "failed".
- * - POST /rebuild: the loader's LoadResult, { objects, inserted, linked,
- *   rejected, stoppedAt }.
- * - GET /doctor: `storage` is the last loader run, whoever started it,
- *   { at, objects, inserted, stoppedAt }, with `at` an ISO timestamp.
- * - "The loader" in /ingest/run means loadPending() and then
- *   syncSourceState(), as the To-Be section of the spec describes the
- *   daemon's loader step; /rebuild runs reload() and then syncSourceState().
+ * The API fetching through the collector and filling PostgreSQL through the
+ * loader. Real PostgreSQL, a real file store in a temp dir, and a fake fetcher
+ * serving RSS. The collector and the load runner come from createIngestion,
+ * the daemon's own wiring, so each flush is followed by a load as in
+ * production.
  */
 const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
@@ -105,13 +86,9 @@ type IngestBody = {
   inserted: number;
   failed: number;
   outcomes: { id: string; status: string; seen: number; written: number; error?: string }[];
-};
-type DoctorStorage = {
-  at: string;
-  objects: number;
-  inserted: number;
   stoppedAt: { key: string; error: string } | null;
 };
+type DoctorStorage = { at: string } & LoadResultBody;
 
 describeIfDb("ingest through the collector and the loader", () => {
   let handle: ReturnType<typeof createDatabase>;
@@ -125,6 +102,8 @@ describeIfDb("ingest through the collector and the loader", () => {
   let dir: string;
   let storage: Storage;
   let app: ReturnType<typeof createApi>;
+  let collector: ReturnType<typeof createIngestion>["collector"];
+  let loads: ReturnType<typeof createIngestion>["loads"];
   /** Every URL the fake fetcher was asked for, in order. */
   let fetched: string[];
   /** While set, every fetch waits for it before answering. */
@@ -170,23 +149,31 @@ describeIfDb("ingest through the collector and the loader", () => {
     fetched = [];
     hold = null;
 
-    const { collector, loads } = createIngestion({
+    app = build();
+  });
+
+  // flushIntervalMs 0 makes every tick flush what an earlier tick left
+  // pending, which is what the scheduler does every five minutes.
+  function build(flushIntervalMs?: number) {
+    const ingestion = createIngestion({
       sql: handle.sql,
       storage,
       fetcher,
       config: { ...config, DEGRADE_AFTER_FAILURES: 3 },
       log: () => {},
+      flushIntervalMs,
     });
-    app = createApi({
+    collector = ingestion.collector;
+    loads = ingestion.loads;
+    return createApi({
       db: handle.db,
       sql: handle.sql,
-      fetcher,
       config,
       ...services,
-      collector,
-      loads,
+      collector: ingestion.collector,
+      loads: ingestion.loads,
     });
-  });
+  }
 
   afterEach(async () => {
     hold = null;
@@ -247,12 +234,80 @@ describeIfDb("ingest through the collector and the loader", () => {
         inserted: 3,
         failed: 0,
         outcomes: [{ id: sourceId, status: "fetched", seen: 3, written: 3 }],
+        stoppedAt: null,
       });
       expect((await listed()).map((item) => item.title)).toEqual([
         "Ferrets of the Andes",
         "Numbat migration",
         "Okapi sighting",
       ]);
+    });
+
+    test("inserted includes the items a flush inside the tick loaded, not only the request's own flush", async () => {
+      app = build(0);
+      const sourceId = await subscribe(FEED);
+      // A scheduler tick buffers the feed; nothing is written yet.
+      await collector.tick([
+        {
+          id: sourceId,
+          kind: "feed",
+          url: FEED,
+          config: {},
+          fetchIntervalSeconds: 3600,
+          status: "active",
+        },
+      ]);
+      expect(await listed()).toEqual([]);
+
+      const body = await ingest("?all=true");
+
+      expect(body.inserted).toBe(3);
+      expect((await listed()).length).toBe(3);
+    });
+
+    test("a scheduler tick and flush load into PostgreSQL without any API call", async () => {
+      app = build();
+      const sourceId = await subscribe(FEED);
+
+      await collector.tick([
+        {
+          id: sourceId,
+          kind: "feed",
+          url: FEED,
+          config: {},
+          fetchIntervalSeconds: 3600,
+          status: "active",
+        },
+      ]);
+      await collector.flush();
+      await loads.settled();
+
+      expect((await listed()).length).toBe(3);
+    });
+
+    test("reports where the load stopped, and fetch keeps working", async () => {
+      await subscribe(FEED);
+      await storage.put("items/dt=2000-01-01/20000101T000000Z-00000000.parquet", "not parquet");
+
+      const body = await ingest("?all=true");
+
+      expect(body.stoppedAt?.key).toBe("items/dt=2000-01-01/20000101T000000Z-00000000.parquet");
+      expect(body.stoppedAt?.error).toContain("cannot read object");
+      expect(body.polled).toBe(1);
+    });
+
+    test("with nothing due it still loads an object left pending in storage", async () => {
+      await subscribe(FEED);
+      await ingest("?all=true");
+      // The object is in storage but PostgreSQL no longer has it applied.
+      await handle.sql`DELETE FROM items`;
+      await handle.sql`TRUNCATE loaded_objects`;
+
+      const body = await ingest("");
+
+      expect(body.polled).toBe(0);
+      expect(body.inserted).toBe(3);
+      expect((await listed()).length).toBe(3);
     });
 
     test("PostgreSQL gets its items from the Parquet object the loader applied, not from the fetch", async () => {
@@ -295,7 +350,7 @@ describeIfDb("ingest through the collector and the loader", () => {
       expect(fetched).toEqual([FEED]);
 
       const second = await ingest("");
-      expect(second).toEqual({ polled: 0, inserted: 0, failed: 0, outcomes: [] });
+      expect(second).toEqual({ polled: 0, inserted: 0, failed: 0, outcomes: [], stoppedAt: null });
       expect(fetched).toEqual([FEED]);
     });
 
@@ -497,6 +552,13 @@ describeIfDb("ingest through the collector and the loader", () => {
       expect(response.status).toBe(200);
       return (await json<{ storage: DoctorStorage }>(response)).storage;
     }
+
+    test("is null before any loader run has finished", async () => {
+      const response = await get("/doctor");
+      const body = await json<{ storage: unknown }>(response);
+      expect(body.storage).toBeNull();
+      expect(doctorStorageSchema.parse(body.storage)).toBeNull();
+    });
 
     test("reports the last loader run: when, how many objects, how many items", async () => {
       await subscribe(FEED);

@@ -80,7 +80,6 @@ describeIfDb("api", () => {
     app = createApi({
       db: handle.db,
       sql: handle.sql,
-      fetcher: fetch,
       config,
       embeddings,
       interest,

@@ -29,12 +29,17 @@ const fetcher = createFetcher({
 });
 
 const storage = storageFromEnv();
+console.error(`storage: ${process.env.TSUZURI_STORAGE ?? "file://./data"} (cwd ${process.cwd()})`);
+// Aborted on shutdown, so in-flight fetches end at once; an aborted fetch
+// leaves its subscription's state untouched and it is fetched next start.
+const shutdown = new AbortController();
 const { collector, loads } = createIngestion({
   sql,
   storage,
   fetcher,
   config,
   log: (message) => console.error(message),
+  signal: shutdown.signal,
 });
 
 async function loadAndLog(): Promise<void> {
@@ -46,14 +51,13 @@ async function loadAndLog(): Promise<void> {
 }
 
 // Switching from direct ingest: without this every feed is refetched with no
-// validators. Objects written before a restart are then caught up.
+// validators.
 try {
   const seeded = await seedState(storage, toSeedEntries(await db.select().from(sources)));
   if (seeded) console.error("seeded _state/collector.json from the sources table");
 } catch (error) {
   console.error("collector state could not be seeded:", error);
 }
-await loadAndLog();
 
 /**
  * Polling loop.
@@ -150,7 +154,6 @@ try {
 const app = createApi({
   db,
   sql,
-  fetcher,
   config,
   embeddings,
   interest,
@@ -162,21 +165,31 @@ const app = createApi({
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
+// Objects written before a restart are caught up after the server is up, so
+// /health answers during a long backlog; the runner orders it before any
+// load a flush queues.
+void loadAndLog();
 void scheduler();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
+    if (stopping) return;
     stopping = true;
+    // No new /ingest/run or /rebuild while the last flush and load run.
+    await server.stop();
+    shutdown.abort();
     await inFlight;
     // A storage failure here loses only what this flush held, and the fetch
     // state was not advanced for it, so the next start fetches it again.
+    // A flush that wrote has already loaded through its onFlush hook.
+    let flushed = null;
     try {
-      await collector.flush();
+      flushed = await collector.flush();
     } catch (error) {
       console.error("final flush failed:", error);
     }
-    await loadAndLog();
-    await server.stop();
+    if (flushed === null) await loadAndLog();
+    await loads.settled();
     await enrichment.stop();
     await interest.stop();
     await clustering.stop();

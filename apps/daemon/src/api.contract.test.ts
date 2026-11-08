@@ -2,11 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-// A namespace import for the schemas step 2c adds (rebuildResponseSchema and
-// doctorStorageSchema, the schema of GET /doctor's `storage` field): a missing
-// named export would fail every test in this file at load.
-import * as contract from "@tsuzuri/api";
 import {
+  doctorStorageSchema,
   embeddingStatusSchema,
   enrichPruneResponseSchema,
   enrichRunSchema,
@@ -19,6 +16,7 @@ import {
   itemsResponseSchema,
   llmStatusSchema,
   rankedItemsResponseSchema,
+  rebuildResponseSchema,
   searchResponseSchema,
   sourcesResponseSchema,
   tagStatusResponseSchema,
@@ -154,7 +152,6 @@ describeIfDb("api contract", () => {
     deps = {
       db: handle.db,
       sql: handle.sql,
-      fetcher: fetch,
       config,
       embeddings,
       interest,
@@ -494,7 +491,7 @@ describeIfDb("api contract", () => {
   });
 
   test("POST /rebuild", async () => {
-    const body = await parsed(contract.rebuildResponseSchema, "/rebuild", { method: "POST" });
+    const body = await parsed(rebuildResponseSchema, "/rebuild", { method: "POST" });
     expect(body.stoppedAt).toBeNull();
     expect(typeof body.objects).toBe("number");
   });
@@ -503,9 +500,9 @@ describeIfDb("api contract", () => {
     // The ingest test above ran the loader, so there is a run to report.
     const response = await app.fetch(new Request("http://test/doctor"));
     const body = (await response.json()) as { storage: unknown };
-    const report = contract.doctorStorageSchema.parse(body.storage);
-    expect(report.stoppedAt).toBeNull();
-    expect(report.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    const report = doctorStorageSchema.parse(body.storage);
+    expect(report?.stoppedAt).toBeNull();
+    expect(report?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   test("POST /sources/import-opml", async () => {
@@ -598,7 +595,6 @@ describeIfDb("api contract with a stuck object", () => {
     app = createApi({
       db: handle.db,
       sql: handle.sql,
-      fetcher: fetch,
       config,
       embeddings,
       interest,
@@ -620,7 +616,7 @@ describeIfDb("api contract with a stuck object", () => {
 
   test("POST /rebuild names the stuck key in the contract's shape", async () => {
     const response = await app.fetch(new Request("http://test/rebuild", { method: "POST" }));
-    const body = contract.rebuildResponseSchema.parse(await response.json());
+    const body = rebuildResponseSchema.parse(await response.json());
     expect(body.objects).toBe(0);
     expect(body.stoppedAt?.key).toBe(STUCK);
     expect(body.stoppedAt?.error).toMatch(/^cannot read object: /);
@@ -630,7 +626,7 @@ describeIfDb("api contract with a stuck object", () => {
     await app.fetch(new Request("http://test/rebuild", { method: "POST" }));
     const response = await app.fetch(new Request("http://test/doctor"));
     const body = (await response.json()) as { storage: unknown };
-    const report = contract.doctorStorageSchema.parse(body.storage);
-    expect(report.stoppedAt?.key).toBe(STUCK);
+    const report = doctorStorageSchema.parse(body.storage);
+    expect(report?.stoppedAt?.key).toBe(STUCK);
   });
 });

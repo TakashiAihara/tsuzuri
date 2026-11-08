@@ -177,6 +177,8 @@ export async function seedState(
   storage: Storage,
   entries: Record<string, Omit<SubscriptionFetchState, "recentIds">>,
 ): Promise<boolean> {
+  // With nothing to seed, the first flush writes the state anyway.
+  if (Object.keys(entries).length === 0) return false;
   if ((await storage.get(STATE_KEY)) !== null) return false;
   const subscriptions: Record<string, SubscriptionFetchState> = {};
   for (const [id, entry] of Object.entries(entries)) {

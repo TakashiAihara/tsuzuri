@@ -17,14 +17,19 @@ export function createLoadRunner(
 ) {
   const now = opts.now ?? (() => new Date());
   let last: ({ at: string } & LoadResult) | null = null;
+  const totals = { runs: 0, inserted: 0 };
   let chain: Promise<unknown> = Promise.resolve();
 
   // A run that throws rejects to its caller only; the chain carries on.
   const enqueue = (apply: () => Promise<LoadResult>): Promise<LoadResult> => {
     const run = chain.then(async () => {
       const result = await apply();
-      await loader.syncSourceState();
+      // Recorded before the sync: the rows are committed whether or not the
+      // sync that follows succeeds.
       last = { at: now().toISOString(), ...result };
+      totals.runs += 1;
+      totals.inserted += result.inserted;
+      await loader.syncSourceState();
       return result;
     });
     chain = run.catch(() => undefined);
@@ -35,5 +40,9 @@ export function createLoadRunner(
     load: () => enqueue(() => loader.loadPending()),
     rebuild: () => enqueue(() => loader.reload()),
     last: () => last,
+    /** Finished runs and the items they inserted since the runner started. */
+    totals: () => ({ ...totals }),
+    /** Resolves once every run queued so far has finished, failed or not. */
+    settled: (): Promise<void> => chain.then(() => undefined),
   };
 }

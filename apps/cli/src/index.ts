@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import type {
   EmbeddingStatus,
   EnrichRunResponse,
+  IngestRunResponse,
   Item,
   ItemEnrichment,
   ItemSummary,
@@ -156,13 +157,16 @@ program
   .description("poll subscriptions now")
   .option("--all", "ignore schedules and poll everything")
   .action(async (opts: { all?: boolean }) => {
-    const result = await call<{ polled: number; inserted: number; failed: number }>(
+    const result = await call<IngestRunResponse>(
       globals(),
       `/ingest/run${opts.all ? "?all=true" : ""}`,
       { method: "POST" },
     );
     if (globals().json) return printJson(result);
     log(`polled ${result.polled}, new items ${result.inserted}, failed ${result.failed}`);
+    if (result.stoppedAt) {
+      log(`loading stopped at ${result.stoppedAt.key}: ${result.stoppedAt.error}`);
+    }
   });
 
 program

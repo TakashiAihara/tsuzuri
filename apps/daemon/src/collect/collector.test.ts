@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FetchResult, RawItem, Source, SourceContext } from "@tsuzuri/core";
 import { fileStorage, readParquet, type Storage } from "@tsuzuri/store";
-// A namespace import: a missing named export would fail every test in this file at load.
-import * as collectorModule from "./collector.ts";
 import {
   type CollectorState,
   type CollectorSubscription,
@@ -14,6 +12,7 @@ import {
   parseState,
   type SubscriptionFetchState,
   type SubscriptionResult,
+  seedState,
 } from "./collector.ts";
 
 const T0 = new Date("2026-11-08T12:34:56.000Z");
@@ -2258,7 +2257,7 @@ describe("seedState (step 2c)", () => {
       lastError: "HTTP 503",
       status: "degraded",
     });
-    const wrote = await collectorModule.seedState(storage, { a: seedEntry(), b: degraded });
+    const wrote = await seedState(storage, { a: seedEntry(), b: degraded });
     expect(wrote).toBe(true);
     expect(await storedState()).toEqual({
       version: 1,
@@ -2272,24 +2271,25 @@ describe("seedState (step 2c)", () => {
   test("leaves an existing _state/collector.json untouched and returns false", async () => {
     await seed({ kept: entry({ recentIds: [P_A], etag: "kept-etag" }) });
     const before = await storage.get(STATE_KEY);
-    const wrote = await collectorModule.seedState(storage, { a: seedEntry() });
+    const wrote = await seedState(storage, { a: seedEntry() });
     expect(wrote).toBe(false);
     expect(await storage.get(STATE_KEY)).toEqual(before);
     expect((await storedState()).subscriptions.a).toBeUndefined();
   });
 
+  test("with no subscriptions to seed it writes nothing and returns false", async () => {
+    expect(await seedState(storage, {})).toBe(false);
+    expect(await storage.get(STATE_KEY)).toBeNull();
+  });
+
   test("a second seed does not overwrite the first", async () => {
-    expect(await collectorModule.seedState(storage, { a: seedEntry({ etag: "first" }) })).toBe(
-      true,
-    );
-    expect(await collectorModule.seedState(storage, { a: seedEntry({ etag: "second" }) })).toBe(
-      false,
-    );
+    expect(await seedState(storage, { a: seedEntry({ etag: "first" }) })).toBe(true);
+    expect(await seedState(storage, { a: seedEntry({ etag: "second" }) })).toBe(false);
     expect((await storedState()).subscriptions.a?.etag).toBe("first");
   });
 
   test("a collector treats a seeded subscription as not due until its nextFetchAt, then sends its validators", async () => {
-    await collectorModule.seedState(storage, { a: seedEntry() });
+    await seedState(storage, { a: seedEntry() });
     const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
     const collector = make(harness);
 
@@ -2313,7 +2313,7 @@ describe("seedState (step 2c)", () => {
   });
 
   test("the first fetch after seeding writes the feed's items again, since recentIds starts empty", async () => {
-    await collectorModule.seedState(storage, {
+    await seedState(storage, {
       a: seedEntry({ nextFetchAt: "2026-11-08T12:00:00.000Z" }),
     });
     const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a"), post("b")]) });

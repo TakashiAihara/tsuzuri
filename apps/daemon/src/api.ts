@@ -27,7 +27,7 @@ import type { EmbeddingService } from "./enrich/embeddings.ts";
 import { EnrichmentPreconditionError, type EnrichmentService } from "./enrich/enrichment.ts";
 import { InterestPreconditionError, type InterestService } from "./enrich/interest.ts";
 import { checkFetchTarget } from "./ingest/fetch-target.ts";
-import type { Fetcher } from "./ingest/fetcher.ts";
+
 import type { LoadRunner } from "./load/runner.ts";
 import { parseOpml } from "./opml.ts";
 import { parseSince } from "./search-params.ts";
@@ -44,7 +44,7 @@ export type ApiDeps = {
   db: Database;
   /** Raw driver handle. Search is written in SQL that Drizzle cannot express. */
   sql: postgres.Sql;
-  fetcher: Fetcher;
+
   config: Config;
   embeddings: EmbeddingService;
   interest: InterestService;
@@ -181,24 +181,27 @@ export function createApi(deps: ApiDeps) {
    */
   app.post("/ingest/run", async (c) => {
     const all = c.req.query("all") === "true";
-    const limit = Number(c.req.query("limit") ?? 500);
 
-    const rows = await db.select().from(sources).limit(limit);
+    // Every row goes in: which subscriptions are due is the collector's call,
+    // so cutting the list short here could leave a due one out.
+    const rows = await db.select().from(sources);
+    const before = loads.totals();
     const { subscriptions: outcomes, busy } = await collector.tick(rows.map(toSubscription), {
       force: all,
     });
     if (busy) return c.json({ error: "a fetch is already running" }, 409);
 
-    // flush() waits for the load its onFlush hook runs, so when this flush
-    // wrote a file, that load already applied it and a second one would
-    // report 0. Without a hook (or when its load failed) load here.
-    const before = loads.last();
+    // The tick (when its interval came round) and this flush each queue a
+    // load through their onFlush hook, so the items this request inserted are
+    // the runner's growth since it began. Only when no load ran at all (no
+    // hook, or the hook's load failed) is there still something to load here.
     await collector.flush();
-    const after = loads.last();
-    const load = after !== null && after !== before ? after : await loads.load();
+    await loads.settled();
+    if (loads.totals().runs === before.runs) await loads.load();
     return c.json({
       polled: outcomes.length,
-      inserted: load.inserted,
+      inserted: loads.totals().inserted - before.inserted,
+      stoppedAt: loads.last()?.stoppedAt ?? null,
       failed: outcomes.filter((o) => o.status === "failed").length,
       outcomes,
     });

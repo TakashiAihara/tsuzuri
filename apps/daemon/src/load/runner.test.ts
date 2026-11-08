@@ -86,6 +86,33 @@ describe("createLoadRunner", () => {
     expect(runner.last()).toEqual({ at: "2026-11-08T07:05:00.000Z", ...result(7, 1) });
   });
 
+  test("a sync that fails after a committed load still records the load", async () => {
+    const fake = fakeLoader();
+    const runner = createLoadRunner({
+      ...fake.loader,
+      syncSourceState: async () => {
+        throw new Error("sync failed");
+      },
+    });
+
+    const failing = async () => runner.load();
+    await expect(failing()).rejects.toThrow("sync failed");
+    expect(runner.last()).toMatchObject(result(2, 5));
+    expect(runner.totals()).toEqual({ runs: 1, inserted: 5 });
+  });
+
+  test("settled resolves once every queued run has finished, failed ones included", async () => {
+    const fake = fakeLoader();
+    const runner = createLoadRunner(fake.loader);
+    void runner.load();
+    void runner.rebuild();
+
+    await runner.settled();
+
+    expect(fake.calls.at(-1)).toBe("sync:end");
+    expect(runner.totals()).toEqual({ runs: 2, inserted: 6 });
+  });
+
   test("a run that throws is reported to its caller and does not block the next one", async () => {
     const fake = fakeLoader();
     const runner = createLoadRunner({
