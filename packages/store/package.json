@@ -1,0 +1,15 @@
+{
+  "name": "@tsuzuri/store",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "hyparquet": "^1.32.0",
+    "hyparquet-compressors": "^1.1.3",
+    "hyparquet-writer": "^0.18.0"
+  }
+}
