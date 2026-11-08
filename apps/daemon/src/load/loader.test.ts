@@ -11,6 +11,9 @@ import { createLoader } from "./loader.ts";
  * The loader against a real PostgreSQL and a real file store: what it applies,
  * in which order, what it refuses, and that running it again changes nothing.
  */
+// The drizzle-wrapped client hands timestamptz back as text, so compare through Date.
+const iso = (value: unknown): string => new Date(String(value)).toISOString();
+
 const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
 
@@ -126,11 +129,14 @@ describeIfDb("loader", () => {
     test("a second run applies nothing", async () => {
       await put(KEY_1, [itemRow(ID_A)]);
       await loader().loadPending();
+      logs.length = 0;
 
       const second = await loader().loadPending();
 
       expect(second).toEqual({ objects: 0, inserted: 0, linked: 0, rejected: 0 });
       expect(await count("items")).toBe(1);
+      // Skipped up front, not re-read and refused by the ledger's key.
+      expect(logs).toEqual([]);
     });
 
     test("an object that arrives later is the only one the next run applies", async () => {
@@ -175,7 +181,7 @@ describeIfDb("loader", () => {
       expect(result.inserted).toBe(1);
       expect(await titles()).toEqual({ [ID_A]: "early" });
       const [stored] = await handle.sql`SELECT fetched_at FROM items`;
-      expect(stored?.fetched_at.toISOString()).toBe("2026-11-08T01:00:00.000Z");
+      expect(iso(stored?.fetched_at)).toBe("2026-11-08T01:00:00.000Z");
     });
 
     test("when fetched_at ties, the first row of the object stays", async () => {
@@ -231,7 +237,7 @@ describeIfDb("loader", () => {
       await loader().loadPending();
 
       const [link] = await handle.sql`SELECT first_seen_at FROM item_sources`;
-      expect(link?.first_seen_at.toISOString()).toBe("2026-11-08T02:00:00.000Z");
+      expect(iso(link?.first_seen_at)).toBe("2026-11-08T02:00:00.000Z");
     });
   });
 
@@ -371,8 +377,8 @@ describeIfDb("loader", () => {
       expect(await count("item_sources")).toBe(3);
       expect(await count("loaded_objects")).toBe(2);
       const [state] = await handle.sql`SELECT read_at, starred_at FROM item_state`;
-      expect(state?.read_at.toISOString()).toBe("2026-11-08T03:00:00.000Z");
-      expect(state?.starred_at.toISOString()).toBe("2026-11-08T04:00:00.000Z");
+      expect(iso(state?.read_at)).toBe("2026-11-08T03:00:00.000Z");
+      expect(iso(state?.starred_at)).toBe("2026-11-08T04:00:00.000Z");
     });
 
     test("restores a link that was lost", async () => {
@@ -432,7 +438,7 @@ describeIfDb("loader", () => {
       expect(source?.consecutive_failures).toBe(2);
       expect(source?.last_error).toBe("boom");
       expect(source?.status).toBe("degraded");
-      expect(source?.next_fetch_at.toISOString()).toBe("2026-11-09T00:00:00.000Z");
+      expect(iso(source?.next_fetch_at)).toBe("2026-11-09T00:00:00.000Z");
     });
 
     test("keeps a disabled source disabled and ignores unknown ids", async () => {

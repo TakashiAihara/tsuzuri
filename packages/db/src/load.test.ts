@@ -14,6 +14,9 @@ import { migrate } from "./migrate.ts";
  * The SQL half of the loader against a real PostgreSQL: one transaction per
  * storage object, and the loaded_objects ledger that makes loading repeatable.
  */
+// The drizzle-wrapped client hands timestamptz back as text, so compare through Date.
+const iso = (value: unknown): string => new Date(String(value)).toISOString();
+
 const DATABASE_URL = process.env.TSUZURI_TEST_DATABASE_URL;
 const describeIfDb = DATABASE_URL ? describe : describe.skip;
 
@@ -113,8 +116,8 @@ describeIfDb("loader SQL", () => {
     expect(stored?.summary).toBe("short");
     expect(stored?.search_text).toBe("Hello body");
     expect(stored?.published_at_estimated).toBe(true);
-    expect(stored?.published_at.toISOString()).toBe("2026-11-07T00:00:00.000Z");
-    expect(stored?.fetched_at.toISOString()).toBe("2026-11-08T01:02:03.000Z");
+    expect(iso(stored?.published_at)).toBe("2026-11-07T00:00:00.000Z");
+    expect(iso(stored?.fetched_at)).toBe("2026-11-08T01:02:03.000Z");
 
     const [ledger] = await handle.sql`SELECT key, rows, rejected FROM loaded_objects`;
     expect(ledger).toMatchObject({ key: KEY, rows: 2, rejected: 3 });
@@ -153,7 +156,7 @@ describeIfDb("loader SQL", () => {
     expect(links).toHaveLength(1);
     expect(links[0]?.item_id).toBe(ID_A);
     expect(links[0]?.source_id).toBe(sourceId);
-    expect(links[0]?.first_seen_at.toISOString()).toBe("2026-11-08T05:00:00.000Z");
+    expect(iso(links[0]?.first_seen_at)).toBe("2026-11-08T05:00:00.000Z");
   });
 
   test("a link that already exists is not duplicated or counted again", async () => {
@@ -169,7 +172,7 @@ describeIfDb("loader SQL", () => {
     expect(result).toEqual({ inserted: 0, linked: 0 });
     const links = await handle.sql`SELECT first_seen_at FROM item_sources`;
     expect(links).toHaveLength(1);
-    expect(links[0]?.first_seen_at.toISOString()).toBe("2026-11-08T05:00:00.000Z");
+    expect(iso(links[0]?.first_seen_at)).toBe("2026-11-08T05:00:00.000Z");
   });
 
   test("a row that fails the insert commits nothing of the object", async () => {
@@ -181,7 +184,7 @@ describeIfDb("loader SQL", () => {
         row(ID_A, { sourceId }),
         row(ID_B, { sourceId, title: "bad\u0000title" }),
       ]),
-    ).rejects.toThrow();
+    ).rejects.toThrow("unsupported Unicode escape sequence");
 
     expect(await count("items")).toBe(0);
     expect(await count("item_sources")).toBe(0);
@@ -192,7 +195,9 @@ describeIfDb("loader SQL", () => {
   test("applying a key that is already recorded fails and leaves its new rows out", async () => {
     await applyItemObject(handle.sql, KEY, [row(ID_A)]);
 
-    await expect(applyItemObject(handle.sql, KEY, [row(ID_B)])).rejects.toThrow();
+    await expect(applyItemObject(handle.sql, KEY, [row(ID_B)])).rejects.toThrow(
+      "duplicate key value",
+    );
 
     const ids = await handle.sql<{ id: string }[]>`SELECT id FROM items`;
     expect(ids.map((r) => r.id)).toEqual([ID_A]);
@@ -217,12 +222,15 @@ describeIfDb("loader SQL", () => {
   });
 
   test("the ledger enforces non-negative counts", async () => {
+    // postgres.js queries are thenables, not Promises; bun's `rejects` waits on
+    // them forever, so each is awaited inside an async function.
     await expect(
-      handle.sql`INSERT INTO loaded_objects (key, rows) VALUES ('k1', -1)`,
-    ).rejects.toThrow();
+      (async () => await handle.sql`INSERT INTO loaded_objects (key, rows) VALUES ('k1', -1)`)(),
+    ).rejects.toThrow("violates check constraint");
     await expect(
-      handle.sql`INSERT INTO loaded_objects (key, rows, rejected) VALUES ('k2', 0, -1)`,
-    ).rejects.toThrow();
+      (async () =>
+        await handle.sql`INSERT INTO loaded_objects (key, rows, rejected) VALUES ('k2', 0, -1)`)(),
+    ).rejects.toThrow("violates check constraint");
   });
 
   describe("syncSourceFetchState", () => {
@@ -248,9 +256,9 @@ describeIfDb("loader SQL", () => {
       expect(source?.etag).toBe('"abc"');
       expect(source?.last_modified).toBe("Sun, 08 Nov 2026 00:00:00 GMT");
       expect(source?.content_hash).toBe("hash-1");
-      expect(source?.next_fetch_at.toISOString()).toBe("2026-11-09T00:00:00.000Z");
-      expect(source?.last_fetched_at.toISOString()).toBe("2026-11-08T12:00:00.000Z");
-      expect(source?.last_success_at.toISOString()).toBe("2026-11-08T11:00:00.000Z");
+      expect(iso(source?.next_fetch_at)).toBe("2026-11-09T00:00:00.000Z");
+      expect(iso(source?.last_fetched_at)).toBe("2026-11-08T12:00:00.000Z");
+      expect(iso(source?.last_success_at)).toBe("2026-11-08T11:00:00.000Z");
       expect(source?.consecutive_failures).toBe(3);
       expect(source?.last_error).toBe("timeout");
       expect(source?.status).toBe("degraded");

@@ -9,6 +9,7 @@ import {
   type CollectorState,
   type CollectorSubscription,
   createCollector,
+  parseState,
   type SubscriptionFetchState,
   type SubscriptionResult,
 } from "./collector.ts";
@@ -1993,3 +1994,24 @@ async function idOf(url: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+
+describe("parseState (exported for the loader)", () => {
+  const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+
+  test("returns the valid entries and drops a malformed one", () => {
+    const parsed = parseState(
+      bytes({ version: 1, subscriptions: { a: entry(), b: { nextFetchAt: "garbage" } } }),
+    );
+    expect(Object.keys(parsed.subscriptions)).toEqual(["a"]);
+    expect(parsed.subscriptions.a).toEqual(entry());
+  });
+
+  test("refuses a file that is not version 1 or not JSON", () => {
+    expect(() => parseState(bytes({ version: 2, subscriptions: {} }))).toThrow(
+      "invalid _state/collector.json",
+    );
+    expect(() => parseState(new TextEncoder().encode("{not json"))).toThrow(
+      "invalid _state/collector.json",
+    );
+  });
+});
