@@ -32,6 +32,8 @@ describe("file format", () => {
     expect(meta.schema.slice(1).map((element) => element.name)).toEqual(["id", "n"]);
   });
 
+  // fixtures/zstd.parquet was written by DuckDB:
+  // COPY (SELECT 'z-' || i::VARCHAR AS id, i AS n FROM range(3) t(i)) TO 'zstd.parquet' (FORMAT parquet, COMPRESSION zstd)
   test("reads a zstd file written by another tool", async () => {
     const bytes = new Uint8Array(
       await Bun.file(join(import.meta.dir, "fixtures/zstd.parquet")).arrayBuffer(),
@@ -120,6 +122,7 @@ describe("writeParquet / readParquet", () => {
       ["DOUBLE", "1.5"],
       ["DOUBLE", Number.NaN],
       ["DOUBLE", Number.POSITIVE_INFINITY],
+      ["DOUBLE", Number.NEGATIVE_INFINITY],
     ];
     for (const [type, value] of refused) {
       expect(() => writeParquet([{ v: value }], { v: type }), `${type} ${String(value)}`).toThrow(
@@ -135,7 +138,7 @@ describe("writeParquet / readParquet", () => {
     expect(back).toEqual([{ n: 2147483647 }, { n: -2147483648 }]);
   });
 
-  test("names the offending row, so a bad value in a large batch can be found", () => {
+  test("names the offending row by its 0-based index in the input array", () => {
     const rows = [{ n: 1 }, { n: 2 }, { n: 3 }, { n: "4" }, { n: 5 }];
     expect(() => writeParquet(rows, { n: "INT32" })).toThrow('row 3, column "n"');
   });

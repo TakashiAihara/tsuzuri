@@ -106,7 +106,7 @@ describe("fileStorage", () => {
     expect(fileStorage(root).describe()).toBe(`file://${root}`);
   });
 
-  test("refuses keys that escape the root", async () => {
+  test("refuses traversal and absolute keys", async () => {
     const storage = fileStorage(join(root, "inner"));
     await expect(storage.put("../escape.json", "x")).rejects.toThrow("invalid storage key");
     await expect(storage.get("a/../../escape.json")).rejects.toThrow("invalid storage key");
@@ -128,6 +128,35 @@ describe("keys", () => {
       for (const prefix of BAD_PREFIXES) {
         await expect(storage.list(prefix), prefix).rejects.toThrow("invalid storage key");
       }
+    }
+  });
+
+  test("both backends accept every key shape the design's storage layout uses", async () => {
+    const keys = [
+      "items/dt=2026-11-08/20261108T013000Z.parquet",
+      "inbox/my-producer/dt=2026-11-08/0001.parquet",
+      "events/dt=2026-11-08/20261108T013000Z-3f2a.parquet",
+      "_runs/20261108T013000Z.json",
+      "_state/collector.json",
+      "derived/enrichments/dt=2026-11-08/a.parquet",
+      "derived/embeddings/bge-m3/dt=2026-11-08/a.parquet",
+    ];
+    const file = fileStorage(root);
+    const s3 = s3Storage("b", S3_ENV, fakeS3());
+    for (const storage of [file, s3]) {
+      for (const key of keys) await storage.put(key, "x");
+      expect(await storage.list("")).toEqual([...keys].sort());
+    }
+  });
+
+  test("segments are capped at 200 characters on both backends", async () => {
+    const ok = `a/${"x".repeat(200)}`;
+    const tooLong = `a/${"x".repeat(201)}`;
+    const file = fileStorage(root);
+    const s3 = s3Storage("b", S3_ENV, fakeS3());
+    for (const storage of [file, s3]) {
+      await storage.put(ok, "x");
+      await expect(storage.put(tooLong, "x")).rejects.toThrow("invalid storage key");
     }
   });
 
@@ -202,7 +231,7 @@ function fakeS3(
       return 0;
     },
     file: (key: string) => ({
-      exists: async () => key in objects,
+      exists: async () => Object.hasOwn(objects, key),
       arrayBuffer: async () => {
         const bytes = objects[key];
         if (!bytes) throw new Error("NoSuchKey");
@@ -254,17 +283,40 @@ describe("s3Storage with a fake client", () => {
   });
 
   test("list stops with an error when the server repeats a continuation token", async () => {
+    let calls = 0;
     const stuck: S3Like = {
       ...fakeS3(),
-      list: async () => ({
-        contents: [{ key: "items/a" }],
-        isTruncated: true,
-        nextContinuationToken: "same",
-      }),
+      list: async () => {
+        // Bounded, so a broken guard fails this test instead of hanging the run.
+        calls += 1;
+        if (calls > 5) throw new Error("fake: guard did not stop the loop");
+        return { contents: [{ key: "items/a" }], isTruncated: true, nextContinuationToken: "same" };
+      },
     };
     await expect(s3Storage("b", S3_ENV, stuck).list("items/")).rejects.toThrow(
-      "continuation token",
+      'repeated continuation token "same"',
     );
+  });
+
+  test("list stops with an error when a truncated page carries no continuation token", async () => {
+    const truncated: S3Like = {
+      ...fakeS3(),
+      list: async () => ({ contents: [{ key: "items/a" }], isTruncated: true }),
+    };
+    await expect(s3Storage("b", S3_ENV, truncated).list("items/")).rejects.toThrow(
+      "truncated but returned no continuation token",
+    );
+  });
+
+  test("list leaves out objects outside the key rule, as the file backend does", async () => {
+    const objects: Record<string, Uint8Array> = {
+      "items/": new Uint8Array(),
+      "items/a b.parquet": new Uint8Array(),
+      "items/ok.parquet": new Uint8Array(),
+    };
+    expect(await s3Storage("b", S3_ENV, fakeS3(objects)).list("items/")).toEqual([
+      "items/ok.parquet",
+    ]);
   });
 });
 
@@ -282,6 +334,13 @@ describe("s3ClientOptions", () => {
       region: "auto",
       sessionToken: "fake-session",
     });
+  });
+
+  test("AWS_REGION wins over AWS_DEFAULT_REGION", () => {
+    expect(
+      s3ClientOptions("b", { ...S3_ENV, AWS_REGION: "auto", AWS_DEFAULT_REGION: "eu-west-1" })
+        .region,
+    ).toBe("auto");
   });
 
   test("falls back to AWS_DEFAULT_REGION", () => {
@@ -305,7 +364,7 @@ describe("s3Storage", () => {
     expect(() => s3Storage("b", { AWS_ACCESS_KEY_ID: "k" })).toThrow("needs AWS_SECRET_ACCESS_KEY");
   });
 
-  test("refuses keys that escape the bucket prefix", async () => {
+  test("refuses traversal and absolute keys", async () => {
     const storage = s3Storage("b", S3_ENV);
     await expect(storage.put("../x.json", "x")).rejects.toThrow("invalid storage key");
     await expect(storage.put("/x.json", "x")).rejects.toThrow("invalid storage key");
