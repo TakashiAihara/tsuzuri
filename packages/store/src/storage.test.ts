@@ -63,6 +63,18 @@ describe("fileStorage", () => {
     ]);
   });
 
+  test("treats a prefix as a string, not a directory, like S3 does", async () => {
+    const storage = fileStorage(root);
+    await storage.put("items/dt=2026-11-08/a1.parquet", "x");
+    await storage.put("items/dt=2026-11-08/a2.parquet", "x");
+    await storage.put("items/dt=2026-11-08/b1.parquet", "x");
+
+    expect(await storage.list("items/dt=2026-11-08/a")).toEqual([
+      "items/dt=2026-11-08/a1.parquet",
+      "items/dt=2026-11-08/a2.parquet",
+    ]);
+  });
+
   test("lists an absent prefix as empty", async () => {
     expect(await fileStorage(root).list("events/")).toEqual([]);
   });
@@ -86,6 +98,7 @@ describe("fileStorage", () => {
     await expect(storage.put("/etc/absolute.json", "x")).rejects.toThrow(
       "outside the storage root",
     );
+    await expect(storage.get("..")).rejects.toThrow("outside the storage root");
   });
 });
 
@@ -106,6 +119,7 @@ describe("s3Storage", () => {
   test("refuses keys that escape the bucket prefix", async () => {
     const storage = s3Storage("b", S3_ENV);
     await expect(storage.put("../x.json", "x")).rejects.toThrow("outside the storage root");
+    await expect(storage.put("/x.json", "x")).rejects.toThrow("outside the storage root");
   });
 });
 

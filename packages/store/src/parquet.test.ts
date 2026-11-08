@@ -59,6 +59,9 @@ describe("writeParquet / readParquet", () => {
 
   test("refuses a value of the wrong type instead of coercing it", () => {
     expect(() => writeParquet([{ n: "12" }], { n: "INT32" })).toThrow('column "n"');
+    expect(() => writeParquet([{ n: 1.5 }], { n: "INT32" })).toThrow('column "n"');
+    expect(() => writeParquet([{ n: 2147483648 }], { n: "INT32" })).toThrow('column "n"');
+    expect(() => writeParquet([{ n: -2147483649 }], { n: "INT32" })).toThrow('column "n"');
     expect(() => writeParquet([{ at: "2026-11-08" }], { at: "TIMESTAMP" })).toThrow('column "at"');
     expect(() => writeParquet([{ ok: 1 }], { ok: "BOOLEAN" })).toThrow('column "ok"');
   });
