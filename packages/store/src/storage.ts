@@ -5,8 +5,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
  * The store of record: objects addressed by "/"-separated keys. The collector,
  * viewer and other producers share the same prefixes, so both backends apply
  * one key rule — but they are not identical: file:// cannot hold both "p" and
- * "p/q" where S3 can, and file:// follows symlinks on get/put while its list
- * does not report them. The store is not append-only: `put` overwrites, and
+ * "p/q" where S3 can, and symlinks inside a file:// root are not supported
+ * (see fileStorage). The store is not append-only: `put` overwrites, and
  * `_state` documents rely on that.
  */
 export type Storage = {
@@ -59,8 +59,10 @@ function errnoCode(error: unknown): string | undefined {
 
 // fileStorage keeps one directory as the root; keys are paths inside it. The
 // shared key rule refuses traversal and absolute keys, which is what keeps
-// them inside the root; it does not defend against symlinks — get/put follow
-// them, while list does not report them. The root is resolved once so
+// them inside the root. Symlinks inside the root are not supported and not
+// defended against: a symlinked directory is followed by get/put and by a
+// list that starts inside it, skipped by a list that walks past it, and a
+// symlink at the key itself is replaced by put's rename. The root is resolved once so
 // locate() always reports an absolute path. put writes a temporary file and
 // renames it over the target, so a reader sees the old or the new object,
 // never a partial one.
