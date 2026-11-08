@@ -1,15 +1,17 @@
 import { createChatProvider } from "@tsuzuri/core";
-import { createDatabase, migrate } from "@tsuzuri/db";
-import PQueue from "p-queue";
+import { createDatabase, migrate, sources } from "@tsuzuri/db";
+import { storageFromEnv } from "@tsuzuri/store";
 
 import { createApi } from "./api.ts";
+import { seedState } from "./collect/collector.ts";
+import { toSeedEntries, toSubscription } from "./collect/subscriptions.ts";
 import { loadConfig } from "./config.ts";
 import { createClusteringService } from "./enrich/clustering.ts";
 import { createEmbeddingService } from "./enrich/embeddings.ts";
 import { createEnrichmentService } from "./enrich/enrichment.ts";
 import { createInterestService } from "./enrich/interest.ts";
 import { createFetcher } from "./ingest/fetcher.ts";
-import { dueSources, ingestSource } from "./ingest/run.ts";
+import { createIngestion } from "./ingestion.ts";
 
 const config = loadConfig();
 const { db, sql, close } = createDatabase({ url: config.DATABASE_URL });
@@ -26,45 +28,63 @@ const fetcher = createFetcher({
   allowPrivateTargets: config.FETCH_ALLOW_PRIVATE_TARGETS,
 });
 
+const storage = storageFromEnv();
+console.error(`storage: ${process.env.TSUZURI_STORAGE ?? "file://./data"} (cwd ${process.cwd()})`);
+// Aborted on shutdown, so in-flight fetches end at once; an aborted fetch
+// leaves its subscription's state untouched and it is fetched next start.
+const shutdown = new AbortController();
+const { collector, loads } = createIngestion({
+  sql,
+  storage,
+  fetcher,
+  config,
+  log: (message) => console.error(message),
+  signal: shutdown.signal,
+});
+
+async function loadAndLog(): Promise<boolean> {
+  try {
+    await loads.load();
+    return true;
+  } catch (error) {
+    console.error("load failed:", error);
+    return false;
+  }
+}
+
+// Switching from direct ingest: without this every feed is refetched with no
+// validators.
+try {
+  const seeded = await seedState(storage, toSeedEntries(await db.select().from(sources)));
+  if (seeded) console.error("seeded _state/collector.json from the sources table");
+} catch (error) {
+  console.error("collector state could not be seeded:", error);
+}
+
 /**
  * Polling loop.
  *
- * Due times live in the database rather than in an in-memory cron, so a restart
- * does not reset every subscription's schedule and re-poll all of them at once.
+ * Which subscriptions are due is the collector's call, from its own state in
+ * storage, so a restart does not reset every schedule and re-poll all of them
+ * at once. The loop waits for each tick before sleeping, so ticks never overlap.
  */
 const SCHEDULER_TICK_MS = 30_000;
 let stopping = false;
+let inFlight: Promise<void> = Promise.resolve();
 
 async function tick(): Promise<void> {
-  const rows = await dueSources(db, config.FETCH_CONCURRENCY * 5);
-  if (rows.length === 0) return;
-
-  const queue = new PQueue({ concurrency: config.FETCH_CONCURRENCY });
-  await Promise.all(
-    rows.map((row) =>
-      queue.add(async () => {
-        try {
-          await ingestSource(row, {
-            db,
-            fetcher,
-            degradeAfterFailures: config.DEGRADE_AFTER_FAILURES,
-          });
-        } catch (error) {
-          // One broken subscription must not stop the loop for the rest.
-          console.error(`ingest failed for ${row.url}:`, error);
-        }
-      }),
-    ),
-  );
+  try {
+    const rows = await db.select().from(sources);
+    await collector.tick(rows.map(toSubscription));
+  } catch (error) {
+    console.error("scheduler tick failed:", error);
+  }
 }
 
 async function scheduler(): Promise<void> {
   while (!stopping) {
-    try {
-      await tick();
-    } catch (error) {
-      console.error("scheduler tick failed:", error);
-    }
+    inFlight = tick();
+    await inFlight;
     await Bun.sleep(SCHEDULER_TICK_MS);
   }
 }
@@ -136,27 +156,60 @@ try {
 const app = createApi({
   db,
   sql,
-  fetcher,
   config,
   embeddings,
   interest,
   clustering,
   enrichment,
+  collector,
+  loads,
 });
 const server = Bun.serve({ hostname: config.HOST, port: config.PORT, fetch: app.fetch });
 
 console.error(`tsuzuri daemon listening on http://${config.HOST}:${config.PORT}`);
+// Objects written before a restart are caught up after the server is up, so
+// /health answers during a long backlog; the runner orders it before any
+// load a flush queues.
+void loadAndLog();
 void scheduler();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
+    // A second signal means the operator will not wait for the graceful path.
+    if (stopping) process.exit(1);
     stopping = true;
-    await server.stop();
-    await enrichment.stop();
-    await interest.stop();
-    await clustering.stop();
-    await embeddings.stop();
-    await close();
-    process.exit(0);
+    let code = 0;
+    try {
+      // No new /ingest/run or /rebuild while the last flush and load run.
+      // stop() waits for requests in progress, so abort first: an
+      // /ingest/run waiting on a slow fetch then ends with it instead of
+      // holding stop().
+      const stopped = server.stop();
+      shutdown.abort();
+      await stopped;
+      await inFlight;
+      // A storage failure here loses only what this flush held, and the
+      // fetch state was not advanced for it, so the next start fetches it
+      // again. A flush that wrote has already queued its load.
+      let flushed = null;
+      try {
+        flushed = await collector.flush();
+      } catch (error) {
+        console.error("final flush failed:", error);
+        code = 1;
+      }
+      if (flushed === null && !(await loadAndLog())) code = 1;
+      await loads.settled();
+      await enrichment.stop();
+      await interest.stop();
+      await clustering.stop();
+      await embeddings.stop();
+      await close();
+    } catch (error) {
+      console.error("shutdown failed:", error);
+      code = 1;
+    } finally {
+      process.exit(code);
+    }
   });
 }

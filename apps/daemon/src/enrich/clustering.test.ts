@@ -1,8 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDatabase, DEFAULT_USER_ID, migrate } from "@tsuzuri/db";
+import { fileStorage } from "@tsuzuri/store";
 
 import { createApi } from "../api.ts";
+import { createCollector } from "../collect/collector.ts";
 import { loadConfig } from "../config.ts";
+import { createLoader } from "../load/loader.ts";
+import { createLoadRunner } from "../load/runner.ts";
 import { createClusteringService } from "./clustering.ts";
 import { createEmbeddingService } from "./embeddings.ts";
 import { createEnrichmentService } from "./enrichment.ts";
@@ -106,6 +112,8 @@ describeIfDb("clustering", () => {
     await embeddings.start();
     const interest = createInterestService({ sql: handle.sql, config, embeddings });
     clustering = createClusteringService({ sql: handle.sql, config, embeddings });
+    // Nothing here ticks or loads, so this storage is never touched.
+    const storage = fileStorage(join(tmpdir(), "tsuzuri-unused-storage"));
     const enrichment = createEnrichmentService({
       sql: handle.sql,
       config,
@@ -115,12 +123,13 @@ describeIfDb("clustering", () => {
     app = createApi({
       db: handle.db,
       sql: handle.sql,
-      fetcher: fetch,
       config,
       embeddings,
       interest,
       clustering,
       enrichment,
+      collector: createCollector({ storage, fetcher: fetch, degradeAfterFailures: 3 }),
+      loads: createLoadRunner(createLoader({ sql: handle.sql, storage, log: () => {} })),
     });
   });
 

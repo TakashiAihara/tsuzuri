@@ -3,10 +3,12 @@ import { readFile } from "node:fs/promises";
 import type {
   EmbeddingStatus,
   EnrichRunResponse,
+  IngestRunResponse,
   Item,
   ItemEnrichment,
   ItemSummary,
   RankedItem,
+  RebuildResponse,
   ScoringState,
   SearchResponse,
   Source,
@@ -155,13 +157,31 @@ program
   .description("poll subscriptions now")
   .option("--all", "ignore schedules and poll everything")
   .action(async (opts: { all?: boolean }) => {
-    const result = await call<{ polled: number; inserted: number; failed: number }>(
+    const result = await call<IngestRunResponse>(
       globals(),
       `/ingest/run${opts.all ? "?all=true" : ""}`,
       { method: "POST" },
     );
     if (globals().json) return printJson(result);
     log(`polled ${result.polled}, new items ${result.inserted}, failed ${result.failed}`);
+    if (result.stoppedAt) {
+      log(`loading stopped at ${result.stoppedAt.key}: ${result.stoppedAt.error}`);
+    }
+  });
+
+program
+  .command("rebuild")
+  .description("re-apply every object in storage to PostgreSQL")
+  .action(async () => {
+    const result = await call<RebuildResponse>(globals(), "/rebuild", { method: "POST" });
+    if (globals().json) return printJson(result);
+    log(
+      `${result.objects} objects, ${result.inserted} inserted, ` +
+        `${result.linked} linked, ${result.rejected} rejected`,
+    );
+    if (result.stoppedAt) {
+      log(`stopped at ${result.stoppedAt.key}: ${result.stoppedAt.error}`);
+    }
   });
 
 program

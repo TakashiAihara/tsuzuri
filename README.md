@@ -56,6 +56,7 @@ tsuzuri read --by score                   # ranked by what you actually read (op
 tsuzuri show <id>
 tsuzuri mark <id>
 tsuzuri doctor                            # what is enabled, what is not
+tsuzuri rebuild                           # re-apply everything in storage to PostgreSQL
 ```
 
 Every command takes `--json` for scripting. Data goes to stdout, logs to stderr.
@@ -67,6 +68,7 @@ All settings are environment variables. Only `DATABASE_URL` is required.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | — | PostgreSQL connection string |
+| `TSUZURI_STORAGE` | `file://./data` | Where fetched items are kept: `file://<dir>` or `s3://<bucket>` (credentials from the `AWS_*` variables). PostgreSQL is rebuilt from it with `tsuzuri rebuild` |
 | `HOST` | `127.0.0.1` | Daemon bind address |
 | `PORT` | `8787` | Daemon port |
 | `USER_AGENT` | `tsuzuri/0.1 (+…)` | Sent on every request so site owners can identify the crawler |

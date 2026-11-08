@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FetchResult, RawItem, Source, SourceContext } from "@tsuzuri/core";
 import { fileStorage, readParquet, type Storage } from "@tsuzuri/store";
-
 import {
   type CollectorState,
   type CollectorSubscription,
   createCollector,
+  type FlushResult,
   parseState,
   type SubscriptionFetchState,
   type SubscriptionResult,
+  seedState,
 } from "./collector.ts";
 
 const T0 = new Date("2026-11-08T12:34:56.000Z");
@@ -1746,7 +1747,7 @@ describe("overlapping ticks (behaviour Q)", () => {
       const first = collector.tick([sub("a")]);
       await until(() => gated.started.length === 1);
       const second = await within(collector.tick([sub("b")]));
-      expect(second).toEqual({ subscriptions: [] });
+      expect(second).toEqual({ subscriptions: [], busy: true });
       await sleep(30);
       expect(gated.started).toEqual(["https://a.example/feed.xml"]);
 
@@ -2013,5 +2014,313 @@ describe("parseState (exported for the loader)", () => {
     expect(() => parseState(new TextEncoder().encode("{not json"))).toThrow(
       "invalid _state/collector.json",
     );
+  });
+});
+
+describe("force (step 2c)", () => {
+  test("force fetches a subscription that is not due yet, and a plain tick does not", async () => {
+    await seed({ a: entry({ nextFetchAt: "2026-11-08T13:00:00.000Z", etag: "e-saved" }) });
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+
+    await collector.tick([sub("a")]);
+    await collector.tick([sub("a")], { force: false });
+    expect(harness.calls).toHaveLength(0);
+
+    const forced = await collector.tick([sub("a")], { force: true });
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.calls[0]?.state.etag).toBe("e-saved");
+    expect(forced.subscriptions).toEqual([{ id: "a", status: "fetched", seen: 1, written: 1 }]);
+    // The forced fetch reschedules from now, not from the old nextFetchAt.
+    expect((await collector.state()).subscriptions.a?.nextFetchAt).toBe("2026-11-08T13:34:56.000Z");
+  });
+
+  test("force fetches a subscription whose saved backoff has not elapsed, and success clears it", async () => {
+    await seed({
+      a: entry({
+        nextFetchAt: "2026-11-09T12:34:56.000Z",
+        consecutiveFailures: 2,
+        lastError: "HTTP 503",
+      }),
+    });
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+    await collector.tick([sub("a")], { force: true });
+    expect(harness.calls).toHaveLength(1);
+    const saved = (await collector.state()).subscriptions.a;
+    expect(saved?.consecutiveFailures).toBe(0);
+    expect(saved?.lastError).toBeNull();
+  });
+
+  test("a disabled subscription is skipped even under force, and its saved state is left alone", async () => {
+    const savedOff = entry({ nextFetchAt: "2026-11-08T13:00:00.000Z", etag: "off-etag" });
+    // b is not due either, so only force can make the collector fetch it.
+    await seed({ off: savedOff, b: entry({ nextFetchAt: "2026-11-08T15:00:00.000Z" }) });
+    const harness = fakeSources({
+      "https://off.example/feed.xml": fetched([post("off")]),
+      "https://b.example/feed.xml": fetched([post("b")]),
+    });
+    const collector = make(harness);
+    const result = await collector.tick([sub("off", { status: "disabled" }), sub("b")], {
+      force: true,
+    });
+    expect(harness.calls.map((ctx) => ctx.url)).toEqual(["https://b.example/feed.xml"]);
+    expect(result.subscriptions.map((r) => r.id)).toEqual(["b"]);
+    expect((await collector.state()).subscriptions.off).toEqual(savedOff);
+  });
+});
+
+describe("busy (step 2c)", () => {
+  test("a tick that ran reports busy false, with or without results", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+    expect((await collector.tick([sub("a")])).busy).toBe(false);
+    expect(await collector.tick([])).toEqual({ subscriptions: [], busy: false });
+  });
+
+  test("a tick called while another is in flight reports busy true, and the running one reports false", async () => {
+    const gated = gatedSources();
+    const collector = make(gated);
+    try {
+      const first = collector.tick([sub("a")]);
+      await until(() => gated.started.length === 1);
+      const second = await within(collector.tick([sub("b")]));
+      expect(second.busy).toBe(true);
+      expect(second.subscriptions).toEqual([]);
+
+      gated.open("https://a.example/feed.xml");
+      const finished = await within(first);
+      expect(finished.busy).toBe(false);
+      expect(finished.subscriptions).toHaveLength(1);
+
+      // Once the first is done the collector is free again.
+      expect((await within(collector.tick([]))).busy).toBe(false);
+    } finally {
+      gated.openAll();
+    }
+  });
+
+  test("a tick queued behind a flush is not busy", async () => {
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+    const flushing = collector.flush();
+    const ticking = collector.tick([sub("a")]);
+    await within(flushing);
+    expect((await within(ticking)).busy).toBe(false);
+  });
+});
+
+describe("onFlush (step 2c)", () => {
+  test("a flush that wrote an items file calls onFlush once with the FlushResult it returns", async () => {
+    const seen: FlushResult[] = [];
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a"), post("b")]) });
+    const collector = make(harness, { onFlush: (result) => void seen.push(result) });
+    await collector.tick([sub("a")]);
+    expect(seen).toEqual([]);
+
+    const run = await collector.flush();
+    expect(run?.items).toBe(2);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual(run as FlushResult);
+  });
+
+  test("onFlush runs after the items file, the _runs record and _state are all written", async () => {
+    const observed: { items: string[]; runs: string[]; state: boolean }[] = [];
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, {
+      onFlush: async () => {
+        observed.push({
+          items: await storage.list("items/"),
+          runs: await storage.list("_runs/"),
+          state: (await storage.get(STATE_KEY)) !== null,
+        });
+      },
+    });
+    await collector.tick([sub("a")]);
+    const run = await collector.flush();
+    expect(observed).toEqual([
+      {
+        items: [`items/dt=2026-11-08/${run?.runId}.parquet`],
+        runs: [`_runs/${run?.runId}.json`],
+        state: true,
+      },
+    ]);
+  });
+
+  test("an empty flush does not call onFlush", async () => {
+    let calls = 0;
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, {
+      onFlush: () => {
+        calls += 1;
+      },
+    });
+    expect(await collector.flush()).toBeNull();
+    expect(calls).toBe(0);
+    await collector.tick([sub("a")]);
+    await collector.flush();
+    expect(calls).toBe(1);
+    expect(await collector.flush()).toBeNull();
+    expect(calls).toBe(1);
+  });
+
+  test("a flush with no new items, only an unchanged fetch, still calls onFlush", async () => {
+    const seen: FlushResult[] = [];
+    const harness = fakeSources({
+      "https://a.example/feed.xml": { status: "unchanged", reason: "not-modified" },
+    });
+    const collector = make(harness, { onFlush: (result) => void seen.push(result) });
+
+    await collector.tick([sub("a")]);
+    await collector.flush();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.items).toBe(0);
+    expect(seen[0]?.subscriptions.map((s) => s.status)).toEqual(["unchanged"]);
+  });
+
+  test("a flush the interval triggers inside a tick calls onFlush as well", async () => {
+    const seen: FlushResult[] = [];
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, {
+      flushIntervalMs: 1000,
+      onFlush: (result) => void seen.push(result),
+    });
+    await collector.tick([sub("a")]);
+    expect(seen).toEqual([]);
+    advance(2000);
+    await collector.tick([]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.items).toBe(1);
+    expect(seen[0]?.subscriptions.map((r) => r.id)).toEqual(["a"]);
+  });
+
+  test("flush resolves only after an asynchronous onFlush has finished", async () => {
+    let finished = false;
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness, {
+      onFlush: async () => {
+        await sleep(50);
+        finished = true;
+      },
+    });
+    await collector.tick([sub("a")]);
+    await collector.flush();
+    expect(finished).toBe(true);
+  });
+
+  test("a flush whose items write fails does not call onFlush", async () => {
+    let calls = 0;
+    const flaky: Storage = {
+      ...storage,
+      put: async (key, data) => {
+        if (key.startsWith("items/")) throw new Error("disk full");
+        await storage.put(key, data);
+      },
+    };
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = createCollector({
+      storage: flaky,
+      fetcher,
+      sources: harness.sources,
+      now: () => clock,
+      random: () => 0.5,
+      degradeAfterFailures: 3,
+      onFlush: () => {
+        calls += 1;
+      },
+    });
+    await collector.tick([sub("a")]);
+    await expect(collector.flush()).rejects.toThrow("disk full");
+    expect(calls).toBe(0);
+  });
+});
+
+describe("seedState (step 2c)", () => {
+  // The fetch-state columns of a sources row, as the daemon passes them.
+  const seedEntry = (extra: Partial<Omit<SubscriptionFetchState, "recentIds">> = {}) => ({
+    etag: "seed-etag",
+    lastModified: "Mon, 02 Nov 2026 00:00:00 GMT",
+    contentHash: "seed-hash",
+    nextFetchAt: "2026-11-08T14:00:00.000Z",
+    lastFetchedAt: "2026-11-08T13:00:00.000Z",
+    lastSuccessAt: "2026-11-08T13:00:00.000Z",
+    consecutiveFailures: 0,
+    lastError: null,
+    status: "active" as const,
+    ...extra,
+  });
+
+  test("writes _state/collector.json when it is absent, with empty recentIds, and returns true", async () => {
+    const degraded = seedEntry({
+      consecutiveFailures: 4,
+      lastError: "HTTP 503",
+      status: "degraded",
+    });
+    const wrote = await seedState(storage, { a: seedEntry(), b: degraded });
+    expect(wrote).toBe(true);
+    expect(await storedState()).toEqual({
+      version: 1,
+      subscriptions: {
+        a: { ...seedEntry(), recentIds: [] },
+        b: { ...degraded, recentIds: [] },
+      },
+    });
+  });
+
+  test("leaves an existing _state/collector.json untouched and returns false", async () => {
+    await seed({ kept: entry({ recentIds: [P_A], etag: "kept-etag" }) });
+    const before = await storage.get(STATE_KEY);
+    const wrote = await seedState(storage, { a: seedEntry() });
+    expect(wrote).toBe(false);
+    expect(await storage.get(STATE_KEY)).toEqual(before);
+    expect((await storedState()).subscriptions.a).toBeUndefined();
+  });
+
+  test("with no subscriptions to seed it writes nothing and returns false", async () => {
+    expect(await seedState(storage, {})).toBe(false);
+    expect(await storage.get(STATE_KEY)).toBeNull();
+  });
+
+  test("a second seed does not overwrite the first", async () => {
+    expect(await seedState(storage, { a: seedEntry({ etag: "first" }) })).toBe(true);
+    expect(await seedState(storage, { a: seedEntry({ etag: "second" }) })).toBe(false);
+    expect((await storedState()).subscriptions.a?.etag).toBe("first");
+  });
+
+  test("a collector treats a seeded subscription as not due until its nextFetchAt, then sends its validators", async () => {
+    await seedState(storage, { a: seedEntry() });
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a")]) });
+    const collector = make(harness);
+
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(0);
+
+    // 12:34:56 + 24 min 4 s = 12:59:00, still before 14:00.
+    advance(24 * 60_000 + 4_000);
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(0);
+
+    // 14:00:00 exactly.
+    advance(61 * 60_000);
+    await collector.tick([sub("a")]);
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.calls[0]?.state).toEqual({
+      etag: "seed-etag",
+      lastModified: "Mon, 02 Nov 2026 00:00:00 GMT",
+      contentHash: "seed-hash",
+    });
+  });
+
+  test("the first fetch after seeding writes the feed's items again, since recentIds starts empty", async () => {
+    await seedState(storage, {
+      a: seedEntry({ nextFetchAt: "2026-11-08T12:00:00.000Z" }),
+    });
+    const harness = fakeSources({ "https://a.example/feed.xml": fetched([post("a"), post("b")]) });
+    const collector = make(harness);
+    await collector.tick([sub("a")]);
+    const run = await collector.flush();
+    expect(run?.items).toBe(2);
+    expect((await storedState()).subscriptions.a?.recentIds).toEqual([P_A, P_B]);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { toSearchText } from "./run.ts";
+import { toSearchText } from "./search-text.ts";
 
 describe("toSearchText", () => {
   test("joins the title and the body with markup, scripts and styles stripped", () => {

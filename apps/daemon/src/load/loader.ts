@@ -11,12 +11,12 @@ import { ITEM_SCHEMA_VERSION, readParquet, type Storage } from "@tsuzuri/store";
 import type postgres from "postgres";
 
 import { parseState } from "../collect/collector.ts";
-import { toSearchText } from "../ingest/run.ts";
+import { toSearchText } from "./search-text.ts";
 
 /**
  * The loader: derives PostgreSQL's items, item_sources and sources fetch
- * state from what the collector wrote to storage. Nothing calls it yet —
- * wiring into the daemon and `tsuzuri rebuild` is a later step.
+ * state from what the collector wrote to storage. The daemon runs it through
+ * createLoadRunner, which keeps runs from overlapping.
  *
  * loaded_objects is the ledger that makes loadPending cheap to repeat: a key
  * it records is skipped, and forgetLoadedObjects (reload) makes every object
