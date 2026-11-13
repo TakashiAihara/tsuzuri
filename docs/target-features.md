@@ -30,11 +30,11 @@ The bar tsuzuri has to clear. tsuzuri aims to feel like Inoreader, and the owner
 | --- | --- | --- |
 | Article | J / K | Next / previous article, opened |
 | Article | N / P | Move focus to next / previous article without opening |
-| Article | Space / arrows | Scroll the list / move one item |
+| Article | Space / arrows | Scroll the list (unverified, see below) / move one item |
 | Article | O / V / B | Toggle open / open in new tab / open in background tab |
-| Article | W / Q | Load full content / embed the article |
+| Article | W / Q | Load full content / translate the article |
 | Article | M / Shift+A / Shift+M / Ctrl+M | Toggle read / mark all read / mark below read / mark above read |
-| Article | F / L / T / E | Star / like / tag / email |
+| Article | F / L / T / E | Read later / like / tag / email |
 | Tree | Shift+J / Shift+K / Shift+O / Shift+X | Next / previous feed or folder, open it, expand or collapse folder |
 | Tree | Shift+D / Shift+R | Delete / rename feed or folder |
 | Go to | G→D / G→A / G→F / G→U / G→T | Dashboard / all articles / starred / a feed / a folder or tag |
@@ -43,11 +43,14 @@ The bar tsuzuri has to clear. tsuzuri aims to feel like Inoreader, and the owner
 | Global | A / R / \ / . / H | Add subscription / refresh / search / quick access (jump to a feed or folder by name) / shortcut list |
 
 - This table comes from a third-party summary updated 2025-10. The authoritative list is the one Inoreader shows when you press H; compare against it before copying any key.
+- Checked against Inoreader's current help (the reading panel page): F is Read later, W loads full content, Q translates, J / K move through the list, O or Enter opens and closes, V opens the original page, + / − / 0 change text size.
+- Space is not on that help page. A 2015 Inoreader post says it scrolls the list; another source says it now opens the next article. Check the H list before implementing it.
 - Opening with J/K and reading on with Space comes from Google Reader. FreshRSS and Miniflux have similar keys; their exact lists have not been checked.
 
 ## Sources
 
 - Feature list: <https://www.inoreader.com/pricing> (rendered 2026-11-12)
+- Reading panel: <https://www.inoreader.com/help/basic/getting-started/what-is-the-reading-panel> (official, current help; checked 2026-11-13)
 - Display settings: <https://www.inoreader.com/blog/2024/11/organize-your-content-and-customize-your-account.html> (official, 2024-11)
 - Shortcuts: <https://tutorialtactic.com/blog/inoreader-shortcuts/> (third party, 2025-10) and <https://www.inoreader.com/blog/2015/05/inoreader-how-to-save-time-with.html> (official, 2015)
 - Magazine view: <https://www.inoreader.com/blog/2015/04/presenting-magazine-view-clear-all.html> (official, 2015)
