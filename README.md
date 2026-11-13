@@ -391,6 +391,8 @@ This narrows the exposure rather than eliminating it. The address is checked by 
 | P5 | Source plugins: declarative YAML rules (CSS/XPath), TypeScript plugins, external generators | |
 | P6 | Headless rendering, LLM-based extraction and rule repair | |
 
+[docs/target-features.md](docs/target-features.md) lists the eight features that decide whether tsuzuri is good enough, and where each one stands.
+
 Not planned: a mobile app (the web UI can become a PWA), multi-user accounts, hosting for other people, bot-detection evasion.
 
 ## Development
