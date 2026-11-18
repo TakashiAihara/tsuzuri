@@ -1,6 +1,6 @@
 name: opencode-review
 
-# Reviews each PR with opencode on a free Zen model. The workflow, its model and its
+# Reviews each PR with opencode on the free Zen model named below. The workflow and its
 # permissions live in TakashiAihara/opencode-review; @main follows changes made there.
 on:
   pull_request:
@@ -16,5 +16,9 @@ jobs:
       pull-requests: write
       issues: write
     uses: TakashiAihara/opencode-review/.github/workflows/review.yml@main
+    with:
+      # Zen free tier, zero retention and not used for training (opencode Zen docs, 2026-11-19).
+      # Free models are withdrawn without notice; that shows as this job failing.
+      model: opencode/deepseek-v4.1-flash-free
     secrets:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
